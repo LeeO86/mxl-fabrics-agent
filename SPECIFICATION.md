@@ -1,0 +1,674 @@
+# mxl-fabrics-agent — Specification
+
+Status: Draft v0.1 (for implementation by Claude Code in a new, empty repository)
+Working name: `mxl-fabrics-agent` (final repository name still open)
+Sibling projects this spec aligns with: `LeeO86/mxl-decklink`, `LeeO86/mxl-st2110-gateway`
+
+The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in RFC 2119.
+
+---
+
+## 1. Purpose and scope
+
+`mxl-fabrics-agent` is a per-host infrastructure container that makes MXL flows
+produced on one host available to MXL readers on other hosts, using the MXL 1.1
+Fabrics API (libfabric; `verbs` for RoCEv2, `tcp` as fallback).
+
+It is driven entirely by standard NMOS state:
+
+- Media functions (e.g. mxl-decklink, mxl-st2110-gateway, Strom) keep their own
+  NMOS nodes and their own BCP-007-03 senders and receivers. The agent does not
+  own, proxy, or modify any media function's NMOS resources.
+- A controller connects a receiver to a sender with plain IS-05
+  (`mxl_domain_id`, `mxl_flow_id`). When the receiver lives on a different host
+  than the source domain, the agent on the receiver's host detects that and
+  arranges replication from the source host.
+- Media functions do not link libfabric or the Fabrics API and need no changes,
+  apart from the generic MXL behaviours listed in §11 (domain scanning and
+  retry when a flow is not yet present).
+
+Design principles:
+
+1. **Standards only on the control surface.** IS-04 v1.3, IS-05 v1.2,
+   BCP-007-03. No proprietary extension is required of controllers or media
+   functions.
+2. **The agent is read-only towards NMOS.** It never PATCHes any IS-05 endpoint
+   and never registers senders or receivers. It registers exactly one minimal
+   Node of its own (§6.3) for peer discovery.
+3. **The FlowWriter API of media functions is never intercepted.** Replication
+   happens beneath MXL: the agent is an ordinary MXL reader on the source host
+   and an ordinary MXL writer on the destination host.
+4. **Separation of metadata and data.** Flow structure is mirrored early;
+   grain data moves only while a receiver needs it (§7).
+
+Out of scope for v1: compressed formats, NAT traversal, more than one fabric
+provider per peer link at the same time, authentication (IS-10).
+
+---
+
+## 2. Terminology
+
+| Term | Meaning |
+| --- | --- |
+| Host | One physical machine with one MXL tmpfs root and one agent instance. |
+| MXL root | The tmpfs mount containing all MXL domains of the host (e.g. `/Volumes/mxl`). |
+| Local domain | A domain created by a media function on this host. |
+| Mirror domain | A domain created by the agent on this host that carries the identity of a domain on another host. |
+| Origin flow | A flow in a local domain, written by a media function. |
+| Mirror flow | A flow in a mirror domain, written by the agent, with the same flow id and geometry as the origin flow. |
+| Replication | An active Fabrics transfer of one origin flow to one or more mirror flows on other hosts. |
+| Source agent | The agent on the host that holds the origin flow (runs the Fabrics initiator). |
+| Destination agent | The agent on the host that needs the flow (runs the Fabrics target). |
+| Demand | The set of (domain id, flow id) pairs that enabled receivers on this host need and that are not in a local domain. |
+
+---
+
+## 3. Architecture overview
+
+```
+ Host A (source)                                Host B (destination)
+ ┌───────────────────────────────┐              ┌───────────────────────────────┐
+ │ media function (NMOS sender)  │              │ media function (NMOS receiver)│
+ │   └─ MXL writer ─┐            │              │            ┌─ MXL reader ─┘   │
+ │                  ▼            │              │            ▼                  │
+ │ /Volumes/mxl/<local domain>   │              │ /Volumes/mxl/mirror-<A-domain>│
+ │                  │            │              │            ▲                  │
+ │ mxl-fabrics-agent│            │   RDMA       │ mxl-fabrics-agent             │
+ │   MXL reader ─► Initiator ════╪══════════════╪══► Target ─► MXL writer       │
+ │   control API ◄───────────────┼── REST/SSE ──┼───────────── control API      │
+ └───────────────┬───────────────┘              └──────────────┬────────────────┘
+                 │                IS-04 Query API (WebSocket)  │
+                 └──────────────────► NMOS registry ◄──────────┘
+```
+
+Internal components (one process, C++):
+
+1. **Domain scanner** — watches the MXL root with inotify, maintains the local
+   inventory (§5).
+2. **NMOS observer** — subscribes to the IS-04 Query API, tracks MXL receivers
+   on local nodes, reads their IS-05 `/active`, derives demand (§6).
+3. **Peer manager** — discovers peer agents, exchanges inventories, holds the
+   peer link map (§8).
+4. **Mirror manager** — creates, updates and removes mirror domains and mirror
+   flows (§7).
+5. **Replication engine** — owns all Fabrics instances, initiators and targets,
+   runs the progress and completion loops (§9).
+6. **Control API** — agent-to-agent REST + SSE (§8.3).
+7. **Web/ops server** — health, status, metrics, admin UI (§12).
+8. **NMOS node** — minimal nmos-cpp Node for discovery (§6.3).
+
+A single reconciliation loop combines scanner, observer and peer state into a
+desired state and drives mirror manager and replication engine towards it. All
+event sources (inotify, WebSocket, SSE) only trigger an earlier reconciliation;
+correctness MUST NOT depend on any single event being received.
+
+---
+
+## 4. Technology and build
+
+- Language: C++20. Build: CMake ≥ 3.24, Ninja. Compilers: GCC ≥ 12 or Clang ≥ 16.
+- MXL: `dmf-mxl/mxl` pinned to an exact tag/commit of the v1.1 line, built with
+  `-DMXL_ENABLE_FABRICS_OFI=ON`. The pin MUST be a single variable in the
+  Dockerfile and CI. Before choosing the pin, check upstream for fixes of these
+  known issues and prefer a revision that contains them:
+  - colliding endpoint ids when many targets are set up concurrently;
+  - completion-queue overflow on targets that drain one completion per call
+    (on `verbs` this tears down the queue pair).
+- libfabric ≥ 2.3 (needed for `FI_SOCKADDR_IP` with the `tcp` provider), with
+  the `verbs` and `tcp` providers enabled; rdma-core userspace (libibverbs,
+  librdmacm, irdma provider).
+- NMOS: Sony nmos-cpp, pinned commit (same approach as mxl-decklink), used for
+  the agent's own Node and for IS-04 Query API / IS-05 client access where its
+  client utilities fit; otherwise the C++ REST SDK that nmos-cpp already depends on.
+- Web UI: Vue 3 SPA built with Node.js ≥ 20, embedded into the binary
+  (same pattern as mxl-decklink).
+- Tests: doctest (vendored), shell integration tests.
+- Follow the actual headers of the pinned MXL version. Where this spec
+  paraphrases an MXL or Fabrics API and the real API differs, follow the real
+  API and record the deviation in `IMPLEMENTATION_PLAN.md` (same convention as
+  mxl-decklink).
+
+Repository layout (mirrors the sibling repos):
+
+```
+.github/workflows/   CI and image publishing
+cmake/               find modules, helpers
+deploy/              Kubernetes manifests, Grafana dashboard, Prometheus examples
+docker/              Dockerfile, docker-compose demo
+src/                 C++ sources
+tests/               unit + integration
+third_party/         doctest
+web/                 Vue SPA
+AGENTS.md
+IMPLEMENTATION_PLAN.md
+README.md
+SPECIFICATION.md     (this file)
+LICENSE              MIT
+```
+
+---
+
+## 5. Local inventory (domain scanner)
+
+### 5.1 Scanning
+
+- The agent MUST mount the whole MXL root read-write (`MXL_ROOT`, default
+  `/Volumes/mxl`). Startup MUST fail with exit 78 if `MXL_ROOT` does not exist,
+  and SHOULD warn if it is not a tmpfs.
+- It discovers domains as direct subdirectories of `MXL_ROOT` that contain a
+  `domain_def.json`. The domain identity is the `id` in `domain_def.json`, not
+  the directory name (same convention as mxl-decklink and Strom).
+- For each domain it reads `options.json` (in particular `history_duration`,
+  which defines ring depth domain-wide) and enumerates flows with their
+  `flow_def.json`.
+- A flow is **active** if its writer lock is held (use the MXL API for this
+  where available; otherwise the advisory `flock` convention MXL uses for stale
+  flow detection). Inactive flows are listed but never replicated.
+- inotify on `MXL_ROOT` and each domain directory triggers re-scans; a full
+  re-scan also runs every `SCAN_INTERVAL_MS` (default 2000).
+
+### 5.2 Classification
+
+Each domain is classified as:
+
+- **local** — no mirror marker (see §7.2);
+- **mirror** — carries the agent's mirror marker; these are never exported in
+  the inventory (loop prevention);
+- **conflict** — a local domain whose id is also held by a local domain on
+  another host, or a mirror marker that does not belong to this agent. Conflicts
+  are reported (status, metric, log) and excluded from replication.
+
+### 5.3 Inventory record
+
+Per local domain: `domain_id`, `path`, `options` (verbatim `options.json`),
+and per flow: `flow_id`, `flow_def` (verbatim JSON), `format`
+(discrete/continuous), `media_type`, `active`, `grain_rate` or `sample_rate`,
+`ring_depth`, `payload_size`.
+
+---
+
+## 6. NMOS observation and demand
+
+### 6.1 Identifying local nodes
+
+A Node registered in the registry is considered local to this host if any of:
+
+1. the host part of any of its `api.endpoints` matches an IP address of this
+   host (default and expected with host networking);
+2. its `hostname` matches the host's hostname;
+3. its `id` or `hostname` is listed in `LOCAL_NODE_IDS` / `LOCAL_NODE_HOSTNAMES`.
+
+The agent's own Node is excluded.
+
+### 6.2 Observing receivers
+
+- The agent opens an IS-04 Query API WebSocket subscription on `/receivers`
+  filtered by `transport=urn:x-nmos:transport:mxl`, plus subscriptions on
+  `/devices` and `/nodes` to resolve receiver → device → node and the device's
+  IS-05 control href (`urn:x-nmos:control:sr-ctrl/v1.2`, falling back to v1.1).
+- For every MXL receiver on a local node it reads IS-05
+  `GET .../single/receivers/{id}/active` when:
+  - the receiver's IS-04 `subscription` changes, or its `version` changes;
+  - on every reconciliation tick (`NMOS_POLL_INTERVAL_MS`, default 1000),
+    because a controller may change transport params without the IS-04
+    subscription changing.
+- The registry is found via `NMOS_REGISTRY_ADDRESS`/`NMOS_REGISTRY_PORT`, else
+  via DNS-SD (`_nmos-query._tcp`), with the same Avahi requirements as
+  mxl-decklink.
+
+### 6.3 The agent's own Node
+
+- The agent registers one IS-04 v1.3 Node with no devices, senders or receivers.
+- Its `services` array contains one entry:
+  `{"href": "http://<host-ip>:<WEB_PORT>/api/v1", "type": "urn:x-leeo86:service:mxl-fabrics-agent/v1.0", "authorization": false}`.
+- Its `tags` include `urn:x-leeo86:mxl-fabrics-agent:host-id: ["<HOST_ID>"]`.
+- This Node is the discovery mechanism for peer agents (§8.1). It is optional
+  only if `PEERS` is fully specified statically.
+
+### 6.4 Deriving demand
+
+A receiver contributes to demand if, in its IS-05 `/active`:
+
+- `master_enable` is `true`, and
+- `transport_params[0].mxl_domain_id` is set and is **not** a local domain on
+  this host, and
+- `transport_params[0].mxl_flow_id` is set.
+
+`sender_id` is informational only and MAY be null. The source host is resolved
+by looking up `mxl_domain_id` in the peer inventories (§8). If no peer holds the
+domain, the demand entry is `unresolved` (status + metric), and resolution is
+retried on every tick.
+
+Demand entries carry the set of local receiver ids that need them (for
+reference counting and the UI).
+
+---
+
+## 7. Mirror domains and mirror flows
+
+### 7.1 Purpose
+
+A mirror flow lets a receiver on the destination host open the flow
+successfully before any grain data has arrived. The reader then simply sees no
+new grains yet, which every MXL reader already has to handle. This removes the
+activation race between IS-05 activation and replication start.
+
+### 7.2 Layout and identity
+
+- Mirror domain path: `<MXL_ROOT>/mirror-<source-domain-id>/` — a sibling of the
+  local domains, so media functions scanning `MXL_ROOT` find it.
+- `domain_def.json` carries the **source** domain id, plus a marker object:
+  `"x-mxl-fabrics-agent": {"mirror": true, "source_host_id": "...", "owner_host_id": "<HOST_ID>"}`.
+  Readers ignore unknown fields; the agent uses the marker for classification.
+- `options.json` is copied verbatim from the source domain, so ring geometry
+  (`history_duration`) is identical.
+- Mirror flows are created with the source's `flow_def.json` verbatim (same
+  flow id, format, rate, geometry) and are owned by an MXL FlowWriter held by
+  the agent for as long as the mirror exists. Holding the writer keeps the lock
+  so stale-flow garbage collection does not remove it.
+
+### 7.3 Mirror modes
+
+`MIRROR_MODE`:
+
+- `eager` (default): mirror every active origin flow of every peer, without
+  transferring data. Costs tmpfs memory (one ring per flow per mirroring host).
+- `on-demand`: create a mirror flow only when a demand entry exists. Readers
+  may then briefly see "flow not found" and rely on their retry path.
+- `MIRROR_INCLUDE` / `MIRROR_EXCLUDE` (comma-separated domain ids or flow ids)
+  restrict eager mirroring.
+
+Before creating a mirror flow the agent checks free tmpfs space (`statvfs`) and
+keeps at least `TMPFS_RESERVE_MB` (default 512) free. If not possible, the
+mirror is not created, and status/metric/log report `insufficient_space`.
+
+### 7.4 Lifecycle
+
+- Origin flow appears/becomes active on a peer → mirror flow created (eager) or
+  on demand.
+- Origin flow becomes inactive or disappears → replication stopped, mirror flow
+  kept for `MIRROR_GRACE_S` (default 10) to bridge writer restarts, then
+  removed. Removal MUST NOT happen while a local reader is known to be enabled
+  on it; in that case the mirror stays and is reported as `orphaned`.
+- Peer unreachable → mirrors stay (readers see no new grains), status `peer_down`,
+  replication resumes automatically when the peer returns.
+- Format change at the source (mxl-decklink mints a new flow UUID): the new flow
+  is mirrored like any new flow; the old one follows the "disappears" rule.
+  Receivers still pointing at the old flow id are reported as `stale_reference`
+  (status + metric). The agent does not reconnect them; that is the
+  controller's job.
+- On agent startup, existing mirror domains with this agent's marker are
+  adopted (re-opened as writer) or removed if no longer wanted. Mirror domains
+  with a foreign `owner_host_id` are left untouched and reported as conflict.
+- On clean shutdown (SIGTERM) the agent stops replications and, if
+  `CLEANUP_MIRRORS_ON_EXIT=true` (default false), removes its mirrors.
+
+---
+
+## 8. Peers
+
+### 8.1 Discovery
+
+Peers are the agents on other hosts. They are found by:
+
+1. IS-04 Nodes with the service type from §6.3 (default), and/or
+2. static entries in `PEERS` (config file), which take precedence.
+
+Each peer is identified by `host_id`.
+
+### 8.2 Peer link map (full mesh without switch)
+
+In a switchless full mesh, every host pair has its own direct link and subnet.
+The config therefore maps each peer to the local and remote fabric addresses:
+
+```json
+"peers": [
+  { "host_id": "node-b", "control_url": "http://10.0.0.12:8095/api/v1",
+    "local_fabric_addr": "192.168.12.1", "remote_fabric_addr": "192.168.12.2",
+    "provider": "verbs" },
+  { "host_id": "node-c",
+    "local_fabric_addr": "192.168.13.1", "remote_fabric_addr": "192.168.13.3",
+    "provider": "verbs" }
+]
+```
+
+- `control_url` MAY be omitted when discovered via NMOS.
+- If a peer has no static entry, the agent uses `DEFAULT_PROVIDER` and the
+  fabric interface selected by `FABRIC_INTERFACE` (name or IP); this suits
+  switched networks.
+- Provider per link: `verbs` (RoCEv2) or `tcp`. `PROVIDER_FALLBACK=tcp` (default
+  off) allows a link to fall back to `tcp` if `verbs` setup fails; the fallback
+  is reported prominently.
+
+### 8.3 Control API (agent-to-agent, also used by the UI)
+
+Base path `/api/v1` on `WEB_PORT`. JSON. Unauthenticated by design (same
+posture as the siblings: protected networks only).
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/info` | `host_id`, version, MXL/libfabric versions, providers available |
+| GET | `/inventory` | local domains and flows (§5.3), monotonically increasing `revision` |
+| GET | `/events` | SSE stream: `inventory`, `replication`, `peer` events |
+| POST | `/replications` | destination asks source to add a target: `{flow_id, domain_id, dest_host_id, target_info}` → `201 {replication_id}` |
+| DELETE | `/replications/{id}/targets/{dest_host_id}` | destination releases its target |
+| GET | `/replications` | active replications (both roles) |
+| GET | `/mirrors` | local mirrors and their state |
+| GET | `/demand` | local demand entries and the receivers behind them |
+
+Inventory exchange: each agent polls peers' `/inventory` every
+`PEER_POLL_INTERVAL_MS` (default 2000) and additionally reacts to `/events`.
+
+### 8.4 Replication handshake (pull model, destination-driven)
+
+1. Destination agent has a demand entry `(domain_id, flow_id)` resolved to a
+   source peer and a mirror flow (creating it if needed).
+2. Destination sets up a Fabrics **target** on the mirror flow's writer, bound to
+   `local_fabric_addr` for that peer, and serialises its TargetInfo.
+3. Destination `POST /replications` to the source with the serialised TargetInfo.
+4. Source opens (or reuses) one MXL reader and one Fabrics **initiator** per
+   origin flow, and adds the target. One initiator serves all destinations of a
+   flow (fan-out).
+5. Data flows. Destination drains completions (§9).
+6. When demand disappears (receiver disabled, switched to another flow, or
+   deleted) the destination waits `RELEASE_GRACE_MS` (default 2000, to absorb
+   quick re-switches), then `DELETE`s its target at the source and tears down
+   its target. The source removes the target from the initiator and destroys
+   the initiator when no targets remain.
+7. Both sides treat the handshake as idempotent: repeated POSTs for the same
+   `(flow_id, dest_host_id)` return the existing replication; the destination
+   re-POSTs on every reconciliation tick while its replication is not
+   confirmed active by the source.
+
+If the source restarts, the destination detects it (inventory `revision` reset
+or `/info` boot id change) and repeats the handshake with a fresh target.
+
+---
+
+## 9. Replication engine
+
+- One Fabrics instance per provider in use. The Fabrics API is not assumed to
+  be thread-safe: all calls on one instance are serialised on one dedicated
+  thread per instance (the "fabric thread"), which runs progress for initiators
+  and drains target completions.
+- Initiator side: for each new grain index available in the origin reader
+  (blocking wait with short timeout), transfer that grain to all targets.
+  Continuous (audio) flows use the corresponding sample-transfer API if the
+  pinned MXL provides it; if not, audio replication is listed as a known
+  deviation in `IMPLEMENTATION_PLAN.md`.
+- Target side: drain completions with the batch/non-blocking read where
+  available; never let the completion queue grow past its depth. Each received
+  grain is committed to the mirror flow at the **same grain index** as the
+  origin (indices, flow ids and ring geometry are preserved by the Fabrics API).
+- Optional real-time scheduling for the fabric thread: `RT_PRIORITY` (0 = off,
+  default), `CPU_AFFINITY` (list).
+- Error handling per replication: on error, tear down only that replication,
+  back off exponentially (`250 ms` → `10 s`), retry. Never affect other
+  replications.
+- Timing: grain indices are TAI-based. All hosts MUST be TAI-disciplined
+  (PTP/chrony with correct kernel TAI offset). The agent checks `CLOCK_TAI`
+  offset sanity at startup and exposes it as a metric; replicated readers on
+  the destination will otherwise read the wrong grains or none.
+- The agent measures replication lag as `origin head index − mirror head index`
+  (from the source's reported head and the local mirror head) and transfer
+  latency per grain where possible.
+
+---
+
+## 10. Configuration
+
+Same model as mxl-decklink: environment variables layered over an optional JSON
+config file (`AGENT_CONFIG_FILE`). Precedence env > file > default. Env-set keys
+are shown read-only in the UI. Invalid configuration exits 78. Changes to
+global keys in the UI are flagged `restart_required`; peer entries and mirror
+include/exclude lists apply at runtime.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `HOST_ID` | hostname | stable identity of this host/agent |
+| `MXL_ROOT` | `/Volumes/mxl` | MXL tmpfs root |
+| `SCAN_INTERVAL_MS` | 2000 | full re-scan interval |
+| `MIRROR_MODE` | `eager` | `eager` or `on-demand` |
+| `MIRROR_INCLUDE` / `MIRROR_EXCLUDE` | empty | domain/flow id filters |
+| `MIRROR_GRACE_S` | 10 | keep mirror after origin disappears |
+| `TMPFS_RESERVE_MB` | 512 | minimum free tmpfs |
+| `CLEANUP_MIRRORS_ON_EXIT` | false | remove own mirrors on SIGTERM |
+| `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |
+| `PROVIDER_FALLBACK` | empty | `tcp` to allow fallback |
+| `FABRIC_INTERFACE` | empty | default local fabric interface/IP |
+| `FABRIC_PORT_BASE` | 23500 | first data port for targets |
+| `FABRIC_PORT_COUNT` | 100 | size of the target port pool |
+| `PEERS` | empty | peer link map (§8.2), file only or JSON in env |
+| `PEER_POLL_INTERVAL_MS` | 2000 | inventory poll interval |
+| `RELEASE_GRACE_MS` | 2000 | delay before releasing a target |
+| `NMOS_ENABLE` | true | register own Node and observe registry |
+| `NMOS_REGISTRY_ADDRESS` / `NMOS_REGISTRY_PORT` | empty / 3210 | unicast registry; empty = DNS-SD |
+| `NMOS_QUERY_ADDRESS` / `NMOS_QUERY_PORT` | registry / 3211 | Query API if separate |
+| `NMOS_POLL_INTERVAL_MS` | 1000 | IS-05 `/active` reconciliation |
+| `NMOS_PORT` | 3232 | own Node API (WebSocket listener on `NMOS_PORT+1`) |
+| `LOCAL_NODE_IDS` / `LOCAL_NODE_HOSTNAMES` | empty | extra local-node rules (§6.1) |
+| `WEB_PORT` | 8095 | UI, REST, health, metrics |
+| `WEB_ENABLE` | true | UI + REST (health/metrics always on) |
+| `RT_PRIORITY` / `CPU_AFFINITY` | 0 / empty | fabric thread scheduling |
+| `LOG_LEVEL` | `info` | structured JSON logs |
+
+Port defaults are chosen so they do not collide with mxl-decklink
+(8080, 3212/3213) when all containers share host networking. The gateway's
+defaults MUST be checked and documented in the README port table.
+
+---
+
+## 11. Requirements on media functions (documented, not implemented here)
+
+The README MUST document what a media function needs to work with the agent:
+
+1. Receivers resolve `mxl_domain_id` by scanning domains under the MXL root
+   (mxl-decklink: `MXL_DOMAIN_SCAN_PATH`). Mirror domains are siblings of
+   local domains.
+2. If a flow is not (yet) present, the reader retries with backoff instead of
+   failing permanently (mxl-decklink already does this on `FLOW_NOT_FOUND`).
+3. Readers tolerate a flow that exists but has no new grains yet.
+4. Media functions do not need `MXL_ENABLE_FABRICS_OFI`.
+5. Readers on a destination host should read with a small latency offset
+   (≥ replication lag, see metrics) to avoid "too early" reads.
+
+The same list SHOULD be added to the mxl-st2110-gateway spec.
+
+---
+
+## 12. Web, operations and monitoring
+
+### 12.1 HTTP endpoints on `WEB_PORT`
+
+- `/livez`, `/readyz` (ready = MXL root mounted, scanner running, NMOS
+  registration done or disabled, fabric instance(s) initialised), `/statusz`
+  (full JSON state).
+- `/metrics` — Prometheus text format.
+- `/api/v1/...` — §8.3.
+- `/` — admin UI (when `WEB_ENABLE=true`).
+
+### 12.2 Admin UI (Vue SPA)
+
+Tabs:
+
+- **Overview**: host id, versions, providers, TAI offset, registry status,
+  peers (up/down, link, provider), counts.
+- **Domains & Flows**: local domains and flows (active/inactive), mirror
+  domains and mirror flows with state (`idle`, `replicating`, `orphaned`,
+  `insufficient_space`, `peer_down`, `conflict`).
+- **Replications**: per replication role, peer, provider, grains/s, Gbit/s,
+  lag (grains), errors, restarts, last error.
+- **Demand**: receivers on this host (node, label, active `mxl_domain_id` /
+  `mxl_flow_id`), resolved source host, state (`local`, `replicating`,
+  `unresolved`, `stale_reference`).
+- **Peers**: peer link map editing, test-connect button (sets up a dummy
+  target/initiator pair and reports result).
+- **Settings**: effective configuration, import/export of the config file,
+  `KEY=value` export (as in mxl-decklink).
+
+### 12.3 Prometheus metrics (prefix `mxl_fabrics_agent_`)
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `info` | gauge (1) | host_id, version, mxl_version, libfabric_version |
+| `domains` | gauge | kind (local/mirror/conflict) |
+| `flows` | gauge | kind (origin/mirror), state |
+| `tmpfs_free_bytes` / `tmpfs_size_bytes` | gauge | — |
+| `peers_up` | gauge | — |
+| `peer_up` | gauge | peer |
+| `demand_entries` | gauge | state |
+| `replications_active` | gauge | role (source/destination), provider |
+| `replication_grains_total` | counter | flow_id, peer, role |
+| `replication_bytes_total` | counter | flow_id, peer, role |
+| `replication_errors_total` | counter | flow_id, peer, role, kind |
+| `replication_restarts_total` | counter | flow_id, peer |
+| `replication_lag_grains` | gauge | flow_id, peer |
+| `grain_transfer_seconds` | histogram | provider |
+| `setup_seconds` | histogram | phase (target_setup, handshake, first_grain) |
+| `nmos_registry_up` | gauge | — |
+| `nmos_poll_errors_total` | counter | — |
+| `tai_offset_seconds` | gauge | — |
+| `completion_queue_depth` | gauge | flow_id |
+
+Label cardinality: `flow_id` labels are allowed (PoC scale); a config switch
+`METRICS_PER_FLOW=false` drops per-flow labels.
+
+### 12.4 Grafana dashboard
+
+`deploy/grafana/mxl-fabrics-agent.json`: importable dashboard with a
+`host_id` variable, panels for peers, replications, throughput per flow, lag,
+errors/restarts, setup time, tmpfs usage, TAI offset. Plus
+`deploy/prometheus/prometheus.yml` example scrape config for all hosts.
+
+### 12.5 Logging
+
+Structured JSON logs, one event per line, with `replication_id`, `flow_id`,
+`peer` fields where relevant.
+
+### 12.6 Exit codes (aligned with siblings)
+
+| Code | Meaning |
+| --- | --- |
+| 0 | clean shutdown |
+| 75 | startup failed after retries (`EX_TEMPFAIL`), e.g. no fabric provider |
+| 78 | invalid configuration (`EX_CONFIG`) |
+| 143 | shutdown grace exceeded |
+
+---
+
+## 13. Container and host requirements
+
+- Base image and multi-stage build like mxl-decklink (build MXL with Fabrics,
+  libfabric, nmos-cpp in builder stages; slim runtime stage).
+- Runtime requirements:
+  - host networking (RDMA, peer addressing, NMOS DNS-SD);
+  - `/dev/infiniband` devices (`uverbs*`, `rdma_cm`);
+  - capability `IPC_LOCK` and `memlock` ulimit unlimited (memory registration);
+  - MXL root bind-mounted read-write;
+  - runs as the uid/gid owning the MXL root (e.g. `1000:1000`);
+  - optional: `/run/dbus`, `/run/avahi-daemon` for DNS-SD.
+- Host prerequisites (documented in README): rdma-core, irdma loaded with
+  RoCEv2 enabled on the E810 ports used for the mesh (verify the irdma RoCE
+  mode setting), IP addresses on the direct links, MTU consistent per link,
+  PTP/TAI discipline, tmpfs sized for local flows plus mirrors (sizing table
+  in README: bytes per grain × ring depth × number of mirrored flows).
+
+---
+
+## 14. CI and releases
+
+Same as the siblings:
+
+- GitHub Actions: build, unit tests, integration tests (§15.2, `tcp` provider),
+  build and push to GHCR `ghcr.io/leeo86/<repo-name>`.
+- Tags: `vX.Y.Z` → `X.Y.Z`, `X.Y`, `X`, `latest` + GitHub Release;
+  `main` → `nightly-dev`; every build → `git-<sha>`.
+
+---
+
+## 15. Testing
+
+### 15.1 Unit tests
+
+Inventory parsing and classification, demand derivation from IS-05 `/active`
+fixtures, local-node matching, mirror lifecycle state machine, config
+precedence and validation, handshake idempotency.
+
+### 15.2 Integration tests without RDMA hardware
+
+Single machine, `tcp` provider over loopback, two simulated hosts:
+
+- two MXL roots (`/dev/shm/mxl-a`, `/dev/shm/mxl-b`), two agent instances with
+  different `HOST_ID`, ports, and static `PEERS`;
+- a test writer (small tool in `tests/`, or mxl-decklink with
+  `MXL_DECKLINK_BACKEND=mock`) on root A;
+- an nmos-cpp registry and a fake receiver node (or mxl-decklink mock output
+  channel) on root B;
+- test steps: IS-05 PATCH of the receiver → mirror exists before activation
+  (eager) → grains arrive with identical indices → disable receiver → target
+  released after grace → kill source agent → `peer_down` → restart →
+  replication resumes → format change at source → `stale_reference` reported.
+
+### 15.3 NMOS checks
+
+The agent's own Node passes the IS-04 node tests of the AMWA NMOS Testing tool
+(no senders/receivers). Media functions are tested separately.
+
+### 15.4 Pre-go-live checks (hardware)
+
+- `verbs` on E810-XXVDA2 over the direct-link full mesh, 3 hosts, 1080p v210
+  and audio, sustained 24 h without drops.
+- Fan-out: one origin to two destinations.
+- Concurrent setup of ≥ 10 mirrors (endpoint-id collision issue).
+- Completion queue under load at 1080p50/2160p50.
+- Empirical tmpfs and CPU sizing.
+
+---
+
+## 16. Demo deployments
+
+### 16.1 Docker Compose (`docker/`)
+
+1. `docker-compose.demo.yaml` — **single machine, no RDMA**: nmos-cpp registry,
+   two agents (host A / host B simulated with separate MXL roots, `tcp`
+   provider), mxl-decklink mock input on A, mxl-decklink mock output on B,
+   Prometheus and Grafana with the dashboard provisioned. README contains the
+   step-by-step demo including the IS-05 PATCH via `curl` (and optionally a
+   web controller).
+2. `docker-compose.host.yaml` — **one file per real host**: agent with host
+   networking, devices, `IPC_LOCK`, memlock, MXL root mount, config file mount.
+   README shows the three-host full-mesh example with a matching `peers` block
+   per host.
+
+### 16.2 Kubernetes (`deploy/`)
+
+- `mxl-fabrics-agent.yaml`: DaemonSet (one agent per node), `hostNetwork: true`,
+  `dnsPolicy: ClusterFirstWithHostNet`, `IPC_LOCK`, hostPath for the MXL root,
+  ConfigMap for the config file with per-node peer maps (selected by
+  `HOST_ID` = node name via the downward API), readiness/liveness probes,
+  Prometheus scrape annotations.
+- RDMA device access via the generic device plugin (as in
+  mxl-decklink's `deploy/generic-device-plugin.yaml`) exposing
+  `/dev/infiniband`.
+- `monitoring/`: example ServiceMonitor and the Grafana dashboard as ConfigMap.
+
+---
+
+## 17. Implementation order (suggested)
+
+1. Skeleton, config, web/ops server, `/metrics`, CI, Dockerfile.
+2. Domain scanner + inventory API.
+3. Peer manager with static peers; inventory exchange.
+4. Mirror manager (eager mode) — verifiable without Fabrics.
+5. Replication engine with `tcp`; handshake; integration test §15.2.
+6. NMOS observer and own Node; demand-driven replication.
+7. Admin UI, Grafana dashboard, demo compose, Kubernetes manifests.
+8. `verbs` validation on hardware (§15.4).
+
+## 18. Open points
+
+- Final repository name.
+- Whether the agent should later also watch IS-05 `/staged` with scheduled
+  activations to pre-start data transfer (not in v1).
+- Whether mirror markers should be proposed upstream to MXL as a standard
+  domain attribute.
