@@ -40,14 +40,9 @@ RUN git init /tmp/mxl \
     && git -C /tmp/mxl fetch --depth 1 origin "${MXL_REF}" \
     && git -C /tmp/mxl checkout FETCH_HEAD
 COPY docker/mxl-vcpkg.json /tmp/mxl-manifest/vcpkg.json
-RUN git -C /opt/vcpkg rev-parse HEAD > /tmp/baseline \
-    && python3 - <<'PY'
-import json, pathlib
-p = pathlib.Path("/tmp/mxl-manifest/vcpkg.json")
-doc = json.loads(p.read_text())
-doc["builtin-baseline"] = pathlib.Path("/tmp/baseline").read_text().strip()
-p.write_text(json.dumps(doc))
-PY
+# The build image has no Python. Insert the vcpkg baseline with sed.
+RUN BASELINE="$(git -C /opt/vcpkg rev-parse HEAD)" \
+    && sed -i "1a\\  \"builtin-baseline\": \"${BASELINE}\"," /tmp/mxl-manifest/vcpkg.json
 RUN cmake -S /tmp/mxl -B /tmp/mxl/build -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
         -DVCPKG_MANIFEST_DIR=/tmp/mxl-manifest \
