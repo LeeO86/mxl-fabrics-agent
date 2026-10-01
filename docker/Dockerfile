@@ -78,7 +78,11 @@ COPY --from=build /opt/mxl/lib/ /usr/local/lib/
 COPY --from=build /src/build/mxl-fabrics-agent /usr/local/bin/mxl-fabrics-agent
 COPY --from=build /src/build/mxl-pattern-writer /usr/local/bin/mxl-pattern-writer
 COPY tests/integration/fake_nmos.py /usr/local/share/mxl-fabrics-agent/fake_nmos.py
-RUN ldconfig && useradd --uid 1000 --no-create-home --shell /usr/sbin/nologin mxl
+# Ubuntu 24.04 already has uid 1000 (user ubuntu). useradd --uid 1000 then exits 4.
+RUN ldconfig \
+    && if ! getent passwd 1000 >/dev/null; then \
+         useradd --uid 1000 --no-create-home --shell /usr/sbin/nologin mxl; \
+       fi
 USER 1000:1000
 EXPOSE 8095 3232 3233
 ENTRYPOINT ["/usr/local/bin/mxl-fabrics-agent"]
