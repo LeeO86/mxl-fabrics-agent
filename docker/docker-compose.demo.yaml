@@ -1,0 +1,70 @@
+# Single machine, no RDMA. Two agents, a pattern writer, Prometheus, and Grafana.
+services:
+  nmos:
+    image: mxl-fabrics-agent
+    entrypoint: ["python3", "/usr/local/share/mxl-fabrics-agent/fake_nmos.py", "3211", "3210"]
+    network_mode: host
+  agent-a:
+    image: mxl-fabrics-agent
+    network_mode: host
+    depends_on: [nmos]
+    environment:
+      HOST_ID: node-a
+      MXL_ROOT: /mxl/a
+      DEFAULT_PROVIDER: tcp
+      FABRIC_INTERFACE: 127.0.0.1
+      WEB_PORT: "18095"
+      NMOS_PORT: "18232"
+      FABRIC_PORT_BASE: "23600"
+      NMOS_REGISTRY_ADDRESS: 127.0.0.1
+      NMOS_QUERY_ADDRESS: 127.0.0.1
+      NMOS_QUERY_PORT: "3211"
+      LOCAL_NODE_IDS: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+      TMPFS_RESERVE_MB: "64"
+      PEERS: '[{"host_id":"node-b","control_url":"http://127.0.0.1:18096/api/v1","local_fabric_addr":"127.0.0.1","remote_fabric_addr":"127.0.0.1","provider":"tcp"}]'
+    volumes:
+      - mxl-a:/mxl/a
+  agent-b:
+    image: mxl-fabrics-agent
+    network_mode: host
+    depends_on: [nmos]
+    environment:
+      HOST_ID: node-b
+      MXL_ROOT: /mxl/b
+      DEFAULT_PROVIDER: tcp
+      FABRIC_INTERFACE: 127.0.0.1
+      WEB_PORT: "18096"
+      NMOS_PORT: "18242"
+      FABRIC_PORT_BASE: "23700"
+      NMOS_REGISTRY_ADDRESS: 127.0.0.1
+      NMOS_QUERY_ADDRESS: 127.0.0.1
+      NMOS_QUERY_PORT: "3211"
+      LOCAL_NODE_IDS: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+      TMPFS_RESERVE_MB: "64"
+      PEERS: '[{"host_id":"node-a","control_url":"http://127.0.0.1:18095/api/v1","local_fabric_addr":"127.0.0.1","remote_fabric_addr":"127.0.0.1","provider":"tcp"}]'
+    volumes:
+      - mxl-b:/mxl/b
+  writer:
+    image: mxl-fabrics-agent
+    network_mode: host
+    entrypoint: ["/usr/local/bin/mxl-pattern-writer", "/mxl/a/src", "11111111-1111-4111-8111-111111111111", "100000"]
+    volumes:
+      - mxl-a:/mxl/a
+    depends_on: [agent-a]
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    network_mode: host
+    volumes:
+      - ../deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  grafana:
+    image: grafana/grafana:11.3.0
+    network_mode: host
+    environment:
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ../deploy/grafana/mxl-fabrics-agent.json:/var/lib/grafana/dashboards/mxl-fabrics-agent.json:ro
+volumes:
+  mxl-a:
+  mxl-b:
