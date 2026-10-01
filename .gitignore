@@ -1,0 +1,8 @@
+build/
+web/dist/
+web/node_modules/
+compile_commands.json
+.cache/
+*.o
+*.a
+CMakeUserPresets.json

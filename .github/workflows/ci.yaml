@@ -1,0 +1,79 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: web
+        working-directory: web
+        run: npm install --no-fund --no-audit && npm run build
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git pkg-config curl zip unzip tar \
+            bison flex autoconf automake libtool \
+            libibverbs-dev librdmacm-dev rdma-core \
+            libboost-system-dev libboost-thread-dev libboost-chrono-dev \
+            libboost-date-time-dev libboost-regex-dev libboost-random-dev \
+            libboost-filesystem-dev libcpprest-dev nlohmann-json3-dev \
+            libssl-dev libavahi-compat-libdnssd-dev
+          curl -fsSL -o /tmp/libfabric.tar.bz2 https://github.com/ofiwg/libfabric/releases/download/v2.3.1/libfabric-2.3.1.tar.bz2
+          tar -xf /tmp/libfabric.tar.bz2 -C /tmp
+          cd /tmp/libfabric-2.3.1
+          ./configure --prefix=/usr/local --enable-verbs=yes --enable-tcp=yes --enable-shm=yes \
+            --disable-usnic --disable-efa --disable-opx --disable-psm3 --disable-rxm
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+      - name: mxl
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg /opt/vcpkg
+          /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          git init /tmp/mxl
+          git -C /tmp/mxl remote add origin https://github.com/dmf-mxl/mxl.git
+          git -C /tmp/mxl fetch --depth 1 origin 218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7
+          git -C /tmp/mxl checkout FETCH_HEAD
+          mkdir -p /tmp/mxl-manifest
+          python3 - <<'PY'
+          import json, pathlib, subprocess
+          baseline = subprocess.check_output(["git", "-C", "/opt/vcpkg", "rev-parse", "HEAD"], text=True).strip()
+          doc = json.loads(pathlib.Path("docker/mxl-vcpkg.json").read_text())
+          doc["builtin-baseline"] = baseline
+          pathlib.Path("/tmp/mxl-manifest/vcpkg.json").write_text(json.dumps(doc))
+          PY
+          cmake -S /tmp/mxl -B /tmp/mxl/build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_MANIFEST_DIR=/tmp/mxl-manifest \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF -DBUILD_TOOLS=OFF -DBUILD_UTILS=OFF -DBUILD_DOCS=OFF \
+            -DMXL_ENABLE_FABRICS_OFI=ON -DCMAKE_INSTALL_PREFIX=/opt/mxl
+          cmake --build /tmp/mxl/build -j"$(nproc)"
+          sudo cmake --install /tmp/mxl/build
+      - name: nmos-cpp
+        run: |
+          sudo git init /opt/nmos-cpp
+          sudo git -C /opt/nmos-cpp remote add origin https://github.com/sony/nmos-cpp.git
+          sudo git -C /opt/nmos-cpp fetch --depth 1 origin fe303849527394b03bdedc8f161f377fe458bb62
+          sudo git -C /opt/nmos-cpp checkout FETCH_HEAD
+          sudo chown -R "$USER" /opt/nmos-cpp
+      - name: agent
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="/opt/mxl;/tmp/mxl/build/vcpkg_installed/x64-linux" \
+            -DMFA_WITH_NMOS=ON -DNMOS_CPP_DIR=/opt/nmos-cpp/Development
+          cmake --build build -j"$(nproc)"
+          ./build/unit-tests
+      - name: integration
+        run: |
+          sudo ldconfig
+          export LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib
+          export FI_PROVIDER=tcp
+          tests/integration/tcp_mesh.sh

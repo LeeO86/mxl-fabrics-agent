@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mxl-fabrics-agent
+data:
+  node-a.json: |
+    {"PEERS":[{"host_id":"node-b","local_fabric_addr":"192.168.12.1","remote_fabric_addr":"192.168.12.2","provider":"verbs"}]}
+  node-b.json: |
+    {"PEERS":[{"host_id":"node-a","local_fabric_addr":"192.168.12.2","remote_fabric_addr":"192.168.12.1","provider":"verbs"}]}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mxl-fabrics-agent
+  labels:
+    app: mxl-fabrics-agent
+spec:
+  selector:
+    matchLabels:
+      app: mxl-fabrics-agent
+  template:
+    metadata:
+      labels:
+        app: mxl-fabrics-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8095"
+        prometheus.io/path: "/metrics"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: agent
+          image: ghcr.io/leeo86/mxl-fabrics-agent:nightly-dev
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          resources:
+            limits:
+              rdma/infiniband: 1
+          env:
+            - name: HOST_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MXL_ROOT
+              value: /Volumes/mxl
+            - name: AGENT_CONFIG_FILE
+              value: /etc/mxl-fabrics-agent/agent.json
+            - name: DEFAULT_PROVIDER
+              value: verbs
+          volumeMounts:
+            - name: mxl
+              mountPath: /Volumes/mxl
+            - name: config
+              mountPath: /etc/mxl-fabrics-agent
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8095
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8095
+      initContainers:
+        - name: select-config
+          image: busybox:1.36
+          env:
+            - name: HOST_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command: ["sh", "-c", "cp /cm/${HOST_ID}.json /cfg/agent.json"]
+          volumeMounts:
+            - name: configmap
+              mountPath: /cm
+            - name: config
+              mountPath: /cfg
+      volumes:
+        - name: mxl
+          hostPath:
+            path: /Volumes/mxl
+            type: Directory
+        - name: config
+          emptyDir: {}
+        - name: configmap
+          configMap:
+            name: mxl-fabrics-agent

@@ -1,0 +1,7 @@
+scrape_configs:
+  - job_name: mxl-fabrics-agent
+    static_configs:
+      - targets:
+          - node-a.example:8095
+          - node-b.example:8095
+          - node-c.example:8095

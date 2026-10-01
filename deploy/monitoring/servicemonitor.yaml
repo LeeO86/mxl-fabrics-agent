@@ -1,0 +1,12 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mxl-fabrics-agent
+spec:
+  selector:
+    matchLabels:
+      app: mxl-fabrics-agent
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

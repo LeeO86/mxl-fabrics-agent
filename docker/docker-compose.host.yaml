@@ -1,0 +1,24 @@
+# One real host. Run this file on every machine in the mesh.
+# Replace HOST_ID, the MXL root, and the PEERS block. verbs covers E810 (irdma)
+# and ConnectX (mlx5).
+services:
+  agent:
+    image: ghcr.io/leeo86/mxl-fabrics-agent:nightly-dev
+    network_mode: host
+    cap_add:
+      - IPC_LOCK
+    ulimits:
+      memlock: -1
+    devices:
+      - /dev/infiniband
+    volumes:
+      - /Volumes/mxl:/Volumes/mxl
+      - /run/dbus:/run/dbus
+      - ./agent.json:/etc/mxl-fabrics-agent/agent.json:ro
+    environment:
+      HOST_ID: ${HOST_ID:?set HOST_ID}
+      MXL_ROOT: /Volumes/mxl
+      AGENT_CONFIG_FILE: /etc/mxl-fabrics-agent/agent.json
+      DEFAULT_PROVIDER: verbs
+      PROVIDER_FALLBACK: tcp
+    restart: unless-stopped
