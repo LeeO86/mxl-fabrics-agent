@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <iostream>
 #include <thread>
+#include <sys/resource.h>
 #include <unistd.h>
 
 extern char** environ;
@@ -36,6 +37,15 @@ int main(int argc, char** argv)
 {
     (void)argc;
     (void)argv;
+    // A mirror keeps one descriptor per grain (50 for 1 s at 50p), and eager mode
+    // mirrors every flow of every peer. Docker's default soft limit of 1024 runs out
+    // with a few dozen flows; mxlCreateFlowWriter then fails ("Too many open files").
+    rlimit files{};
+    if (getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur < files.rlim_max)
+    {
+        files.rlim_cur = files.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &files);
+    }
     auto const env = mfa::environmentValues(environ);
     std::map<std::string, std::string> fileValues;
     auto const fileIt = env.find("AGENT_CONFIG_FILE");
