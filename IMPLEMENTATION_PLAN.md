@@ -34,8 +34,22 @@ One thread reconciles scanner, peer, and NMOS snapshots into mirror plans (`src/
 
 `verbs` setup failure with `PROVIDER_FALLBACK=tcp` retries that link on `tcp` and reports `fallback: true`.
 
-## 4. Tests
+## 4. Local nodes on the pod network
 
-- Unit tests cover config precedence, local-node matching, IS-05 demand derivation, the mirror state machine, include/exclude filters, inventory classification, and handshake idempotency.
+`LOCAL_NODE_CIDRS` (empty by default, not a runtime key) adds a fourth local-node
+rule after the host-address, hostname, and static-list rules, and after the
+agent's own Node is excluded. An endpoint host that is an IP literal is matched
+directly. A DNS name is resolved with `getaddrinfo` only when the list is
+non-empty, with a 250 ms bound and a 30 s positive and negative cache. A name
+that does not resolve is not local and is logged once at debug. The match rule
+(`list`, `hostname`, `ip`, `cidr`) is logged at debug as `nmos_node_local`.
+
+The platform renders each node's pod CIDR into that agent's config. The agent
+does not watch the Kubernetes API or derive the CIDR from routes. A later
+`LOCAL_NODE_CIDRS=auto` could do that.
+
+## 5. Tests
+
+- Unit tests cover config precedence, local-node matching (including `LOCAL_NODE_CIDRS`), IS-05 demand derivation, the mirror state machine, include/exclude filters, inventory classification, and handshake idempotency.
 - `tests/integration/tcp_mesh.sh` runs two agents on one machine with the `tcp` provider: eager mirror before activation, identical grain indices, release after grace, peer down, resume, and `stale_reference`.
 - Hardware checks in spec §15.4 (sustained `verbs` on E810 and ConnectX) are not run in CI.

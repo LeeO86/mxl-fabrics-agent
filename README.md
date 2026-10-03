@@ -113,7 +113,7 @@ With eager mode the mirror domain already exists. Grains show up in `/api/v1/rep
 
 ## Kubernetes
 
-`deploy/mxl-fabrics-agent.yaml` is a DaemonSet: `hostNetwork`, `IPC_LOCK`, the MXL root hostPath, and a ConfigMap selected by `HOST_ID` (downward API node name). RDMA device access reuses the generic device plugin pattern from mxl-decklink, exposing `/dev/infiniband`. `deploy/monitoring/` has a ServiceMonitor example. The Grafana dashboard is `deploy/grafana/mxl-fabrics-agent.json`.
+`deploy/mxl-fabrics-agent.yaml` is a DaemonSet: `hostNetwork`, `IPC_LOCK`, the MXL root hostPath, and a ConfigMap selected by `HOST_ID` (downward API node name). Set `LOCAL_NODE_CIDRS` in that per-node file to the node's pod CIDR (`kubectl get node <name> -o jsonpath='{.spec.podCIDR}'`) so NMOS Nodes on the pod network of the same machine count as local. RDMA device access reuses the generic device plugin pattern from mxl-decklink, exposing `/dev/infiniband`. `deploy/monitoring/` has a ServiceMonitor example. The Grafana dashboard is `deploy/grafana/mxl-fabrics-agent.json`.
 
 ## Configuration
 
@@ -130,5 +130,6 @@ Environment variables override `AGENT_CONFIG_FILE`, which overrides the defaults
 | `PROVIDER_FALLBACK` | empty, or `tcp` |
 | `WEB_PORT` | 8095 |
 | `NMOS_PORT` | 3232 |
+| `LOCAL_NODE_CIDRS` | empty (this node's pod CIDR when media functions use the pod network) |
 
 `WEB_ENABLE=false` removes the UI and config writes. `/api/v1` stays available for peers.

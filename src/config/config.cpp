@@ -189,6 +189,7 @@ std::vector<std::string> configKeys()
         "DEFAULT_PROVIDER", "PROVIDER_FALLBACK", "FABRIC_INTERFACE", "FABRIC_PORT_BASE", "FABRIC_PORT_COUNT", "PEERS",
         "PEER_POLL_INTERVAL_MS", "RELEASE_GRACE_MS", "NMOS_ENABLE", "NMOS_REGISTRY_ADDRESS", "NMOS_REGISTRY_PORT",
         "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT", "NMOS_POLL_INTERVAL_MS", "NMOS_PORT", "LOCAL_NODE_IDS", "LOCAL_NODE_HOSTNAMES",
+        "LOCAL_NODE_CIDRS",
         "WEB_PORT", "WEB_ENABLE", "RT_PRIORITY", "CPU_AFFINITY", "LOG_LEVEL", "METRICS_PER_FLOW", "AGENT_CONFIG_FILE"};
 }
 
@@ -247,6 +248,15 @@ Config parseConfig(std::map<std::string, std::string> const& values)
     cfg.nmos_port = parseInt("NMOS_PORT", valueOr(values, "NMOS_PORT", "3232"), 1, 65534);
     cfg.local_node_ids = splitComma(valueOr(values, "LOCAL_NODE_IDS", ""));
     cfg.local_node_hostnames = splitComma(valueOr(values, "LOCAL_NODE_HOSTNAMES", ""));
+    for (auto const& item : splitComma(valueOr(values, "LOCAL_NODE_CIDRS", "")))
+    {
+        auto const cidr = parseIpCidr(item);
+        if (!cidr)
+        {
+            throw ConfigError("LOCAL_NODE_CIDRS has invalid CIDR " + item);
+        }
+        cfg.local_node_cidrs.push_back(*cidr);
+    }
     cfg.web_port = parseInt("WEB_PORT", valueOr(values, "WEB_PORT", "8095"), 1, 65535);
     cfg.web_enable = parseBool("WEB_ENABLE", valueOr(values, "WEB_ENABLE", "true"));
     cfg.rt_priority = parseInt("RT_PRIORITY", valueOr(values, "RT_PRIORITY", "0"), 0, 99);
@@ -342,6 +352,18 @@ std::map<std::string, std::string> configToMap(Config const& cfg)
     values["NMOS_PORT"] = std::to_string(cfg.nmos_port);
     values["LOCAL_NODE_IDS"] = joinComma(cfg.local_node_ids);
     values["LOCAL_NODE_HOSTNAMES"] = joinComma(cfg.local_node_hostnames);
+    values["LOCAL_NODE_CIDRS"] = [&] {
+        std::string out;
+        for (std::size_t i = 0; i < cfg.local_node_cidrs.size(); ++i)
+        {
+            if (i != 0)
+            {
+                out += ",";
+            }
+            out += cfg.local_node_cidrs[i].text;
+        }
+        return out;
+    }();
     values["WEB_PORT"] = std::to_string(cfg.web_port);
     values["WEB_ENABLE"] = cfg.web_enable ? "true" : "false";
     values["RT_PRIORITY"] = std::to_string(cfg.rt_priority);
