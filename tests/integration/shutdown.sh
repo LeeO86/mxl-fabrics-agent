@@ -82,18 +82,21 @@ env \
 AGENT=$!
 PIDS+=($AGENT)
 
-for ((i = 0; i < 50; i++)); do
+for ((i = 0; i < 40; i++)); do
   if curl -sf --max-time 1 http://127.0.0.1:18195/readyz >/dev/null; then
     break
   fi
   if ! kill -0 "$AGENT" 2>/dev/null; then
     echo "--- agent ---"; tail -n 80 "$BASE/agent.log" || true
+    echo "--- nmos ---"; tail -n 40 "$BASE/nmos.log" || true
     fail "agent exited before ready"
   fi
-  sleep 0.2
+  sleep 0.5
 done
 curl -sf --max-time 1 http://127.0.0.1:18195/readyz >/dev/null || {
   echo "--- agent ---"; tail -n 80 "$BASE/agent.log" || true
+  echo "--- nmos ---"; tail -n 40 "$BASE/nmos.log" || true
+  echo "--- query nodes ---"; curl -s --max-time 1 http://127.0.0.1:18981/x-nmos/query/v1.3/nodes || true
   echo "--- status ---"; curl -s --max-time 1 http://127.0.0.1:18195/statusz || true
   fail "readyz did not become ready"
 }

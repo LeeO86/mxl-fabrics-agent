@@ -93,7 +93,7 @@ def receivers():
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        return
+        sys.stderr.write("%s %s\n" % (self.command, self.path))
 
     def _json(self, code, body):
         raw = json.dumps(body).encode()

@@ -166,6 +166,9 @@ void NmosNode::start()
                         {
                             throw std::runtime_error("failed to insert node");
                         }
+                        // The registration thread waits on this condition. Without the
+                        // notify it never sees the node and /readyz stays down.
+                        nodeModel.notify();
                     }
                     if (ready_)
                     {
