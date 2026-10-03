@@ -120,6 +120,11 @@ LocalIdentity identityFrom(Config const& cfg)
     id.addresses = localAddresses();
     id.extraNodeIds.insert(cfg.local_node_ids.begin(), cfg.local_node_ids.end());
     id.extraHostnames.insert(cfg.local_node_hostnames.begin(), cfg.local_node_hostnames.end());
+    id.cidrs = cfg.local_node_cidrs;
+    if (!id.cidrs.empty())
+    {
+        id.resolveName = [](std::string const& name) { return resolveNameCached(name); };
+    }
     id.ownNodeId = nodeIdForHost(cfg.host_id).str();
     return id;
 }

@@ -1,5 +1,8 @@
 #pragma once
 
+#include "util/cidr.hpp"
+
+#include <functional>
 #include <optional>
 #include <set>
 #include <string>
@@ -28,8 +31,20 @@ struct LocalIdentity
     std::set<std::string> extraNodeIds;
     std::set<std::string> extraHostnames;
     std::string ownNodeId;
+    std::vector<IpCidr> cidrs;
+    // Used only when cidrs is non-empty and an endpoint host is not an IP literal.
+    // Empty means "do not resolve".
+    std::function<std::vector<std::string>(std::string const&)> resolveName;
 };
 
+struct LocalDecision
+{
+    bool local = false;
+    // "list", "hostname", "ip", or "cidr" when local is true.
+    char const* rule = "";
+};
+
+LocalDecision matchLocalNode(NodeView const& node, LocalIdentity const& self);
 bool nodeIsLocal(NodeView const& node, LocalIdentity const& self);
 
 struct ActiveParams

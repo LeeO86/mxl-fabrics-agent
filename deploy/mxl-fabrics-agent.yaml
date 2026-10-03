@@ -3,10 +3,12 @@ kind: ConfigMap
 metadata:
   name: mxl-fabrics-agent
 data:
+  # LOCAL_NODE_CIDRS is that node's pod CIDR:
+  # kubectl get node <name> -o jsonpath='{.spec.podCIDR}'
   node-a.json: |
-    {"PEERS":[{"host_id":"node-b","local_fabric_addr":"192.168.12.1","remote_fabric_addr":"192.168.12.2","provider":"verbs"}]}
+    {"PEERS":[{"host_id":"node-b","local_fabric_addr":"192.168.12.1","remote_fabric_addr":"192.168.12.2","provider":"verbs"}],"LOCAL_NODE_CIDRS":"10.42.0.0/24"}
   node-b.json: |
-    {"PEERS":[{"host_id":"node-a","local_fabric_addr":"192.168.12.2","remote_fabric_addr":"192.168.12.1","provider":"verbs"}]}
+    {"PEERS":[{"host_id":"node-a","local_fabric_addr":"192.168.12.2","remote_fabric_addr":"192.168.12.1","provider":"verbs"}],"LOCAL_NODE_CIDRS":"10.42.1.0/24"}
 ---
 apiVersion: apps/v1
 kind: DaemonSet

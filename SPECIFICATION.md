@@ -196,9 +196,17 @@ A Node registered in the registry is considered local to this host if any of:
 1. the host part of any of its `api.endpoints` matches an IP address of this
    host (default and expected with host networking);
 2. its `hostname` matches the host's hostname;
-3. its `id` or `hostname` is listed in `LOCAL_NODE_IDS` / `LOCAL_NODE_HOSTNAMES`.
+3. its `id` or `hostname` is listed in `LOCAL_NODE_IDS` / `LOCAL_NODE_HOSTNAMES`;
+4. the host part of any of its `api.endpoints` is an IP address inside
+   `LOCAL_NODE_CIDRS`, or a DNS name that resolves to such an address.
 
-The agent's own Node is excluded.
+Rule 4 is for media functions that run on the Kubernetes pod network of the
+same node as the agent. Those Nodes advertise a pod IP, or sometimes a
+Service DNS name, which is not a host interface address, and their
+`hostname` is the pod name. The platform sets `LOCAL_NODE_CIDRS` to that
+node's pod CIDR. The agent's own Node is excluded before any of these rules.
+Lookups are time-bounded and cached for a short time; a name that does not
+resolve is not local. An empty `LOCAL_NODE_CIDRS` disables the rule.
 
 ### 6.2 Observing receivers
 
@@ -447,6 +455,7 @@ include/exclude lists apply at runtime.
 | `NMOS_POLL_INTERVAL_MS` | 1000 | IS-05 `/active` reconciliation |
 | `NMOS_PORT` | 3232 | own Node API (WebSocket listener on `NMOS_PORT+1`) |
 | `LOCAL_NODE_IDS` / `LOCAL_NODE_HOSTNAMES` | empty | extra local-node rules (§6.1) |
+| `LOCAL_NODE_CIDRS` | empty | comma-separated IPv4/IPv6 CIDRs; endpoint hosts inside them are local (§6.1) |
 | `WEB_PORT` | 8095 | UI, REST, health, metrics |
 | `WEB_ENABLE` | true | UI + REST (health/metrics always on) |
 | `RT_PRIORITY` / `CPU_AFFINITY` | 0 / empty | fabric thread scheduling |

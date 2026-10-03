@@ -15,6 +15,7 @@ set(MFA_CORE_SOURCES
     src/util/logging.cpp
     src/util/uuid.cpp
     src/util/net.cpp
+    src/util/cidr.cpp
     src/util/threading.cpp
     src/util/httpclient.cpp
     src/config/config.cpp

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "util/cidr.hpp"
+
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -51,6 +53,7 @@ struct Config
     int nmos_port = 3232;
     std::vector<std::string> local_node_ids;
     std::vector<std::string> local_node_hostnames;
+    std::vector<IpCidr> local_node_cidrs;
     int web_port = 8095;
     bool web_enable = true;
     int rt_priority = 0;

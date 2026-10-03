@@ -6,32 +6,76 @@
 
 namespace mfa
 {
-bool nodeIsLocal(NodeView const& node, LocalIdentity const& self)
+namespace
+{
+LocalDecision decided(char const* rule)
+{
+    return LocalDecision{true, rule};
+}
+} // namespace
+
+LocalDecision matchLocalNode(NodeView const& node, LocalIdentity const& self)
 {
     if (!self.ownNodeId.empty() && node.id == self.ownNodeId)
     {
-        return false;
+        return {};
     }
     if (self.extraNodeIds.count(node.id) != 0)
     {
-        return true;
+        return decided("list");
     }
-    if (!node.hostname.empty() && (node.hostname == self.hostname || self.extraHostnames.count(node.hostname) != 0))
+    if (!node.hostname.empty() && node.hostname == self.hostname)
     {
-        return true;
+        return decided("hostname");
     }
-    if (self.extraHostnames.count(node.id) != 0)
+    if ((!node.hostname.empty() && self.extraHostnames.count(node.hostname) != 0) || self.extraHostnames.count(node.id) != 0)
     {
-        return true;
+        return decided("list");
     }
     for (auto const& ep : node.endpoints)
     {
         if (self.addresses.count(ep.host) != 0)
         {
-            return true;
+            return decided("ip");
         }
     }
-    return false;
+    if (self.cidrs.empty())
+    {
+        return {};
+    }
+    for (auto const& ep : node.endpoints)
+    {
+        if (ep.host.empty())
+        {
+            continue;
+        }
+        std::string literal;
+        if (parseIpLiteral(ep.host, &literal))
+        {
+            if (ipInCidrs(literal, self.cidrs))
+            {
+                return decided("cidr");
+            }
+            continue;
+        }
+        if (!self.resolveName)
+        {
+            continue;
+        }
+        for (auto const& address : self.resolveName(ep.host))
+        {
+            if (ipInCidrs(address, self.cidrs))
+            {
+                return decided("cidr");
+            }
+        }
+    }
+    return {};
+}
+
+bool nodeIsLocal(NodeView const& node, LocalIdentity const& self)
+{
+    return matchLocalNode(node, self).local;
 }
 
 std::optional<ActiveParams> parseActive(std::string const& body)

@@ -29,3 +29,4 @@ LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/tc
 - Default web port is 8095. NMOS is 3232 and 3233. Fabric target ports start at 23500.
 - `verbs` covers both Intel E810 (`irdma`) and NVIDIA ConnectX (`mlx5`).
 - DeckLink and the ST 2110 gateway need `MIRROR_MODE=eager` because they reject an unknown `mxl_domain_id` at IS-05 activation.
+- `LOCAL_NODE_CIDRS` is the node's pod CIDR when media functions advertise pod IPs. Empty leaves local-node matching unchanged.

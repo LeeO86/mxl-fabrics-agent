@@ -3,6 +3,7 @@
 #include "util/httpclient.hpp"
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
+#include "util/net.hpp"
 
 #include <chrono>
 #include <map>
@@ -52,6 +53,15 @@ void NmosObserver::updateConfig(Config const& cfg)
     for (auto const& name : cfg.local_node_hostnames)
     {
         self_.extraHostnames.insert(name);
+    }
+    self_.cidrs = cfg.local_node_cidrs;
+    if (self_.cidrs.empty())
+    {
+        self_.resolveName = {};
+    }
+    else
+    {
+        self_.resolveName = [](std::string const& name) { return resolveNameCached(name); };
     }
 }
 
@@ -263,6 +273,11 @@ void NmosObserver::poll(std::string const& base)
             }
         }
     }
+    LocalIdentity self;
+    {
+        std::lock_guard const lock{mu_};
+        self = self_;
+    }
     for (auto const& item : asArray(receivers.body))
     {
         if (!item.is<picojson::object>())
@@ -282,10 +297,16 @@ void NmosObserver::poll(std::string const& base)
         auto const nodeId = deviceNode[receiver.device_id];
         receiver.node_id = nodeId;
         auto const node = nodeById.find(nodeId);
-        if (node == nodeById.end() || !nodeIsLocal(node->second, self_))
+        if (node == nodeById.end())
         {
             continue;
         }
+        auto const decision = matchLocalNode(node->second, self);
+        if (!decision.local)
+        {
+            continue;
+        }
+        log::debug("nmos_node_local", {{"node_id", node->second.id}, {"hostname", node->second.hostname}, {"rule", decision.rule}});
         receiver.node_label = node->second.label;
         receiver.control_href = deviceControl[receiver.device_id];
         if (!receiver.control_href.empty())
