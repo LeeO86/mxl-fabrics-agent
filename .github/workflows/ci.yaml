@@ -77,3 +77,4 @@ jobs:
           export LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib
           export FI_PROVIDER=tcp
           tests/integration/tcp_mesh.sh
+          tests/integration/shutdown.sh

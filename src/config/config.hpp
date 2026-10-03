@@ -27,6 +27,7 @@ struct Config
 {
     std::string host_id;
     std::string mxl_root = "/Volumes/mxl";
+    std::string state_dir = "/config";
     int scan_interval_ms = 2000;
     std::string mirror_mode = "eager";
     std::vector<std::string> mirror_include_domains;
@@ -45,12 +46,18 @@ struct Config
     int peer_poll_interval_ms = 2000;
     int release_grace_ms = 2000;
     bool nmos_enable = true;
+    std::string nmos_seed;
+    std::string nmos_label;
+    std::map<std::string, std::vector<std::string>> nmos_tags;
+    bool nmos_dns_sd = false;
+    std::string nmos_host_address;
     std::string nmos_registry_address;
     int nmos_registry_port = 3210;
     std::string nmos_query_address;
     int nmos_query_port = 3211;
     int nmos_poll_interval_ms = 1000;
     int nmos_port = 3232;
+    int shutdown_timeout_s = 10;
     std::vector<std::string> local_node_ids;
     std::vector<std::string> local_node_hostnames;
     std::vector<IpCidr> local_node_cidrs;
@@ -65,6 +72,12 @@ struct Config
     std::string queryHost() const
     {
         return nmos_query_address.empty() ? nmos_registry_address : nmos_query_address;
+    }
+
+    // A registry is in use when an address is set, or DNS-SD browsing is explicitly on.
+    bool registryConfigured() const
+    {
+        return nmos_dns_sd || !nmos_registry_address.empty();
     }
 };
 

@@ -5,6 +5,7 @@
 
 #include <fstream>
 #include <filesystem>
+#include <set>
 
 namespace mfa
 {
@@ -107,13 +108,51 @@ Config ConfigStore::updateFile(std::map<std::string, std::string> const& patch, 
             restart_ = true;
         }
     }
+    auto const keptFile = cfg_.config_file;
     cfg_ = loadLayered(file_, env_, &origin_);
+    if (cfg_.config_file.empty())
+    {
+        cfg_.config_file = keptFile;
+    }
     persistUnlocked();
     if (restart != nullptr)
     {
         *restart = restart_;
     }
     return cfg_;
+}
+
+void ConfigStore::importDocument(std::map<std::string, std::string> const& doc)
+{
+    std::lock_guard const lock{mu_};
+    auto const keys = configKeys();
+    std::set<std::string> known(keys.begin(), keys.end());
+    std::map<std::string, std::string> next;
+    for (auto const& [key, value] : doc)
+    {
+        if (known.count(key) == 0)
+        {
+            continue;
+        }
+        auto const origin = origin_.find(key);
+        if (origin != origin_.end() && origin->second == ValueOrigin::Env)
+        {
+            continue;
+        }
+        next[key] = value;
+        if (!isRuntimeKey(key))
+        {
+            restart_ = true;
+        }
+    }
+    file_ = std::move(next);
+    auto const keptFile = cfg_.config_file;
+    cfg_ = loadLayered(file_, env_, &origin_);
+    if (cfg_.config_file.empty())
+    {
+        cfg_.config_file = keptFile;
+    }
+    persistUnlocked();
 }
 
 void ConfigStore::replaceFile(std::map<std::string, std::string> const& fileLayer)
@@ -131,7 +170,12 @@ void ConfigStore::replaceFile(std::map<std::string, std::string> const& fileLaye
             restart_ = true;
         }
     }
+    auto const keptFile = cfg_.config_file;
     cfg_ = loadLayered(file_, env_, &origin_);
+    if (cfg_.config_file.empty())
+    {
+        cfg_.config_file = keptFile;
+    }
     persistUnlocked();
 }
 
@@ -156,7 +200,7 @@ void ConfigStore::persistUnlocked()
     picojson::object obj;
     for (auto const& [key, value] : file_)
     {
-        if (key == "PEERS")
+        if (key == "PEERS" || key == "NMOS_TAGS")
         {
             std::string err;
             auto parsed = json::parse(value, &err);

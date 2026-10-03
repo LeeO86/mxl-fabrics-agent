@@ -95,6 +95,12 @@ void ReplicationEngine::releaseDomain(std::string const& path)
     domains_.erase(path);
 }
 
+void ReplicationEngine::releaseAll()
+{
+    std::lock_guard const lock{mu_};
+    domains_.clear();
+}
+
 bool ReplicationEngine::ensureWriter(std::string const& path, std::string const& flowDef, std::string* error)
 {
     auto dom = domain(path);

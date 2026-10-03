@@ -1,5 +1,6 @@
 #include "util/net.hpp"
 
+#include "util/cidr.hpp"
 #include "util/logging.hpp"
 
 #include <ifaddrs.h>
@@ -66,6 +67,64 @@ std::set<std::string> localAddresses()
     }
     freeifaddrs(list);
     return out;
+}
+
+std::string firstNonLoopbackIPv4()
+{
+    ifaddrs* list = nullptr;
+    if (getifaddrs(&list) != 0)
+    {
+        return {};
+    }
+    std::string found;
+    for (auto* it = list; it != nullptr && found.empty(); it = it->ifa_next)
+    {
+        if (it->ifa_addr == nullptr || it->ifa_addr->sa_family != AF_INET)
+        {
+            continue;
+        }
+        auto* addr = reinterpret_cast<sockaddr_in*>(it->ifa_addr);
+        char text[INET6_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &addr->sin_addr, text, sizeof(text)) == nullptr)
+        {
+            continue;
+        }
+        std::string ip(text);
+        if (ip == "0.0.0.0" || ip.rfind("127.", 0) == 0)
+        {
+            continue;
+        }
+        found = std::move(ip);
+    }
+    freeifaddrs(list);
+    return found;
+}
+
+bool announceableAddress(std::string_view host, std::string* normalized, std::string* error)
+{
+    std::string norm;
+    if (!parseIpLiteral(host, &norm))
+    {
+        if (error != nullptr)
+        {
+            *error = "must be an IP address literal";
+        }
+        return false;
+    }
+    bool bad = norm == "0.0.0.0" || norm == "::" || norm == "::1" || norm.rfind("127.", 0) == 0;
+    if (bad)
+    {
+        if (error != nullptr)
+        {
+            *error = "must not be loopback or unspecified";
+        }
+        return false;
+    }
+    if (normalized != nullptr)
+    {
+        *normalized = norm;
+    }
+    return true;
 }
 
 int taiOffsetSeconds()

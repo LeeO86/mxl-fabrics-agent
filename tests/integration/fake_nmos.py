@@ -24,6 +24,8 @@ state = {
     "mxl_domain_id": None,
     "mxl_flow_id": None,
 }
+registered_nodes = {}
+deleted = []
 
 
 def active():
@@ -38,7 +40,7 @@ def active():
 
 
 def nodes():
-    return [
+    found = [
         {
             "id": NODE_ID,
             "version": "0:0",
@@ -51,6 +53,8 @@ def nodes():
             "interfaces": [],
         }
     ]
+    found.extend(registered_nodes.values())
+    return found
 
 
 def devices():
@@ -89,7 +93,7 @@ def receivers():
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        return
+        sys.stderr.write("%s %s\n" % (self.command, self.path))
 
     def _json(self, code, body):
         raw = json.dumps(body).encode()
@@ -111,13 +115,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, active())
         if path == "/control":
             return self._json(200, state)
+        if path == "/deleted":
+            return self._json(200, deleted)
         if path == "/x-nmos/registration/v1.3/" or path == "/x-nmos/query/v1.3/":
             return self._json(200, ["v1.3"])
         return self._json(200, [])
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(length)
+        raw = self.rfile.read(length) if length else b"{}"
+        path = self.path.split("?", 1)[0]
+        if path.rstrip("/").endswith("/resource"):
+            try:
+                body = json.loads(raw.decode() or "{}")
+            except json.JSONDecodeError:
+                body = {}
+            if isinstance(body, dict) and body.get("type") == "node" and isinstance(body.get("data"), dict):
+                data = body["data"]
+                if data.get("id"):
+                    registered_nodes[data["id"]] = data
+            return self._json(201, {})
         self._json(200, {})
 
     def do_PUT(self):
@@ -135,6 +152,10 @@ class Handler(BaseHTTPRequestHandler):
         self.do_PUT()
 
     def do_DELETE(self):
+        path = self.path.split("?", 1)[0]
+        deleted.append(path)
+        if "/nodes/" in path:
+            registered_nodes.pop(path.rstrip("/").split("/")[-1], None)
         self._json(204, {})
 
 

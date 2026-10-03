@@ -61,6 +61,7 @@ public:
     std::vector<ReplicaView> status() const;
     std::shared_ptr<FabricDomain> domain(std::string const& path);
     void releaseDomain(std::string const& path);
+    void releaseAll();
     bool ensureWriter(std::string const& path, std::string const& flowDef, std::string* error);
     void releaseWriter(std::string const& path, std::string const& flowId);
 

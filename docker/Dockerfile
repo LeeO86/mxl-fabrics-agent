@@ -84,5 +84,8 @@ RUN ldconfig \
          useradd --uid 1000 --no-create-home --shell /usr/sbin/nologin mxl; \
        fi
 USER 1000:1000
+LABEL org.opencontainers.image.source="https://github.com/LeeO86/mxl-fabrics-agent" \
+      org.opencontainers.image.licenses="MIT" \
+      io.dmf.mxl.revision="218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7"
 EXPOSE 8095 3232 3233
 ENTRYPOINT ["/usr/local/bin/mxl-fabrics-agent"]

@@ -11,8 +11,9 @@ class NmosNode
 {
 public:
     using Ready = std::function<void(bool, std::string const&)>;
+    using Registered = std::function<void(bool)>;
 
-    NmosNode(Config cfg, std::string nodeId, Ready ready);
+    NmosNode(Config cfg, std::string nodeId, Ready ready, Registered registered = {});
     ~NmosNode();
     void start();
     void stop();
@@ -22,6 +23,7 @@ private:
     Config cfg_;
     std::string nodeId_;
     Ready ready_;
+    Registered registered_;
     struct Impl;
     Impl* impl_ = nullptr;
 };

@@ -43,10 +43,24 @@ sleep 0.3
 PEERS_A='[{"host_id":"node-b","control_url":"http://127.0.0.1:18096/api/v1","local_fabric_addr":"127.0.0.1","remote_fabric_addr":"127.0.0.1","provider":"tcp"}]'
 PEERS_B='[{"host_id":"node-a","control_url":"http://127.0.0.1:18095/api/v1","local_fabric_addr":"127.0.0.1","remote_fabric_addr":"127.0.0.1","provider":"tcp"}]'
 
+HOST_ADDR="$(hostname -I 2>/dev/null | awk '{print $1}')"
+if [[ -z "$HOST_ADDR" || "$HOST_ADDR" == 127.* ]]; then
+  HOST_ADDR="$(python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("192.0.2.1", 9))
+print(s.getsockname()[0])
+PY
+)"
+fi
+[[ -n "$HOST_ADDR" && "$HOST_ADDR" != 127.* ]] || fail "need a non-loopback IPv4 for NMOS_HOST_ADDRESS"
+
 common=(
   DEFAULT_PROVIDER=tcp
   FABRIC_INTERFACE=127.0.0.1
   NMOS_ENABLE=true
+  NMOS_DNS_SD=false
+  NMOS_HOST_ADDRESS="$HOST_ADDR"
   NMOS_REGISTRY_ADDRESS=127.0.0.1
   NMOS_REGISTRY_PORT=18970
   NMOS_QUERY_ADDRESS=127.0.0.1

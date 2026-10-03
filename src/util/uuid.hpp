@@ -25,4 +25,10 @@ inline Uuid nodeIdForHost(std::string_view hostId)
     static constexpr Uuid ns = {{0x6d, 0x78, 0x6c, 0x2d, 0x66, 0x61, 0x62, 0x72, 0x69, 0x63, 0x73, 0x2d, 0x61, 0x67, 0x65, 0x6e}};
     return uuidV5(ns, hostId);
 }
+
+// NMOS_SEED when set, otherwise HOST_ID. Unset seed keeps the historical node id.
+inline std::string nmosNodeId(std::string_view seed, std::string_view hostId)
+{
+    return nodeIdForHost(seed.empty() ? hostId : seed).str();
+}
 } // namespace mfa

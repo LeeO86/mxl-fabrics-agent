@@ -4,6 +4,7 @@
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
 #include "util/net.hpp"
+#include "util/uuid.hpp"
 
 #include <chrono>
 #include <map>
@@ -55,6 +56,7 @@ void NmosObserver::updateConfig(Config const& cfg)
         self_.extraHostnames.insert(name);
     }
     self_.cidrs = cfg.local_node_cidrs;
+    self_.ownNodeId = nmosNodeId(cfg.nmos_seed, cfg.host_id);
     if (self_.cidrs.empty())
     {
         self_.resolveName = {};
@@ -278,6 +280,7 @@ void NmosObserver::poll(std::string const& base)
         std::lock_guard const lock{mu_};
         self = self_;
     }
+    next.registered = nodeById.count(self.ownNodeId) != 0;
     for (auto const& item : asArray(receivers.body))
     {
         if (!item.is<picojson::object>())
@@ -357,7 +360,14 @@ void NmosObserver::loop()
             int port = cfg.nmos_query_port;
             if (host.empty())
             {
-                if (!discover(host, port))
+                if (!cfg.nmos_dns_sd)
+                {
+                    std::lock_guard const lock{mu_};
+                    snap_.registry_up = false;
+                    snap_.registry = "unconfigured";
+                    snap_.error.clear();
+                }
+                else if (!discover(host, port))
                 {
                     std::lock_guard const lock{mu_};
                     snap_.registry_up = false;
