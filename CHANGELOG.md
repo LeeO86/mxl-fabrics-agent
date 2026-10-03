@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The agent raises its open-file soft limit to the hard limit at start. A mirror keeps one descriptor per grain, and with Docker's default soft limit of 1024 eager mirrors of about 30 flows failed with "Too many open files" (`mirror_writer_failed`, `mxlCreateFlowWriter failed (1)`).
+
 ## 1.0.0
 
 Stable platform contract. A later breaking change needs v2.

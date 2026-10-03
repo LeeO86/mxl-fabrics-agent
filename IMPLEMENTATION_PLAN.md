@@ -53,6 +53,13 @@ does not watch the Kubernetes API or derive the CIDR from routes. A later
 - Unit tests cover config precedence, local-node matching (including `LOCAL_NODE_CIDRS`), IS-05 demand derivation, the mirror state machine, include/exclude filters, inventory classification, and handshake idempotency.
 - `tests/integration/tcp_mesh.sh` runs two agents on one machine with the `tcp` provider: eager mirror before activation, identical grain indices, release after grace, peer down, resume, and `stale_reference`.
 - Hardware checks in spec §15.4 (sustained `verbs` on E810 and ConnectX) are not run in CI.
+- Lab run 2026-10-03, one host (2× Xeon Gold 6136, no RDMA device, so `tcp` over loopback only), two agents (1.0.0 and this tree), lab stand-in NMOS with 16 receivers, 1080p50 v210 sources from mxl-test-player (1 s history) and `mxl-mv-writer` (MXL default history, 10 grains):
+  - One 1 s-history flow: 49.5 grains/s, `lag_grains` 0, 0.13 cores per agent. Mirrored pixels equal the origin.
+  - 16 concurrent 1 s-history flows: 30 grains/s on average, about 2.7 GB/s in total, about 1.2 cores per agent. The `tcp` provider on this host carries about ten 1080p50 flows; the rest need `verbs`.
+  - A flow with a 10-grain ring (200 ms at 50p) replicates at about 25 grains/s even alone. The initiator gets `MXL_ERR_NOT_READY` from `mxlFabricsInitiatorMakeProgressNonBlocking` on about every other pump (state `pending`), its reader falls out of the 10-grain ring (`TOO_LATE`) and resyncs; the destination logs `open grain 8` (`MXL_ERR_INVALID_ARG`, index not after the last commit). Open: check with `verbs`; until then use at least 1 s history for flows that cross hosts over `tcp`.
+  - Eager mode mirrored every flow of both lab domains (4.7 GB of tmpfs for 16 video flows with 1 s history plus audio and data). With Docker's default open-file limit the mirrors failed after about 30 flows; fixed in this tree.
+  - `/api/v1/replications` shows `state: pending` for links that move 50 grains/s, and `mxl_fabrics_agent_replication_lag_grains` stayed 0 while a link lost half its grains.
+  - Not covered: `verbs`, the 3-host mesh, the 24 h run, fan-out over two links, completion queues under RDMA load.
 - `tests/integration/shutdown.sh` checks registration, exit 143, node DELETE, and own-mirror removal.
 
 ## 6. Platform guideline G1–G14
