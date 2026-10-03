@@ -41,13 +41,40 @@ int main(int argc, char** argv)
     auto const fileIt = env.find("AGENT_CONFIG_FILE");
     try
     {
+        std::string configPath;
         if (fileIt != env.end() && !fileIt->second.empty())
         {
-            fileValues = mfa::loadConfigFile(fileIt->second);
+            configPath = fileIt->second;
+        }
+        else
+        {
+            auto const state = env.count("STATE_DIR") != 0 && !env.at("STATE_DIR").empty() ? env.at("STATE_DIR") : "/config";
+            auto const candidate = (std::filesystem::path(state) / "agent.json").string();
+            if (std::filesystem::is_regular_file(candidate))
+            {
+                configPath = candidate;
+            }
+        }
+        if (!configPath.empty())
+        {
+            fileValues = mfa::loadConfigFile(configPath);
         }
         std::map<std::string, mfa::ValueOrigin> origin;
         auto cfg = mfa::loadLayered(fileValues, env, &origin);
         mfa::log::setLevel(cfg.log_level);
+        if (cfg.config_file.empty())
+        {
+            std::error_code dirEc;
+            std::filesystem::create_directories(cfg.state_dir, dirEc);
+            if (!dirEc)
+            {
+                cfg.config_file = (std::filesystem::path(cfg.state_dir) / "agent.json").string();
+            }
+            else
+            {
+                mfa::log::warn("state_dir_unwritable", {{"path", cfg.state_dir}, {"error", dirEc.message()}});
+            }
+        }
         std::error_code ec;
         if (!std::filesystem::is_directory(cfg.mxl_root, ec))
         {
@@ -105,13 +132,19 @@ int main(int argc, char** argv)
         std::signal(SIGALRM, onAlarm);
         while (!gStop)
         {
+            if (controller.fatal() != 0)
+            {
+                controller.stop();
+                server.stop();
+                return controller.fatal();
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        alarm(15);
+        alarm(static_cast<unsigned>(cfg.shutdown_timeout_s));
         controller.stop();
         server.stop();
         alarm(0);
-        return 0;
+        return 143;
     }
     catch (mfa::ConfigError const& ex)
     {

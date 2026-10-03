@@ -117,19 +117,95 @@ With eager mode the mirror domain already exists. Grains show up in `/api/v1/rep
 
 ## Configuration
 
-Environment variables override `AGENT_CONFIG_FILE`, which overrides the defaults. Invalid configuration exits 78. Peer entries and the mirror include/exclude lists apply at runtime. Other keys set `restart_required` in the UI.
+Every setting is an environment variable. An optional JSON file (`AGENT_CONFIG_FILE`) is the file layer. Precedence is environment, then file, then the default. Unknown environment variables are ignored. An invalid value exits 78 with a one-line JSON error. There are no secret settings, so logs and `GET /api/v1/config/export` contain the whole configuration.
 
-| Key | Default |
+Within one layer, a canonical name wins over its alias. If both are set and differ, the process exits 78. The environment still beats the file when the two layers disagree.
+
+State the process writes for itself lives under `STATE_DIR` (default `/config`). When `AGENT_CONFIG_FILE` is unset and that directory can be created, configuration saves go to `$STATE_DIR/agent.json`. Mirror domains are MXL data under the scan path, not application state.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `HOST_ID` | hostname | Fabrics peer identity. Also the NMOS node id seed when `NMOS_SEED` is unset |
+| `MXL_DOMAIN_SCAN_PATH` | `/Volumes/mxl` | Parent of domain directories, including `mirror-*`. Alias: `MXL_ROOT` |
+| `STATE_DIR` | `/config` | Writable directory for the saved configuration |
+| `AGENT_CONFIG_FILE` | `$STATE_DIR/agent.json` when that directory is writable | JSON file layer |
+| `SCAN_INTERVAL_MS` | 2000 | Full rescan interval |
+| `MIRROR_MODE` | `eager` | `eager` or `on-demand` |
+| `MIRROR_INCLUDE_DOMAINS` / `MIRROR_INCLUDE_FLOWS` | empty | Extra allow lists. Empty means no extra filter |
+| `MIRROR_EXCLUDE_DOMAINS` / `MIRROR_EXCLUDE_FLOWS` | empty | Deny lists |
+| `MIRROR_GRACE_S` | 10 | Keep a mirror after the origin disappears |
+| `TMPFS_RESERVE_MB` | 512 | Free space left on the MXL filesystem |
+| `MXL_CLEANUP_ON_EXIT` | false | On shutdown, remove mirror domains this agent owns. Alias: `CLEANUP_MIRRORS_ON_EXIT`. The platform sets this true |
+| `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |
+| `PROVIDER_FALLBACK` | empty | `tcp` to retry a failed verbs link |
+| `FABRIC_INTERFACE` | empty | Default local fabric address |
+| `FABRIC_PORT_BASE` / `FABRIC_PORT_COUNT` | 23500 / 100 | Target port pool |
+| `PEERS` | `[]` | JSON array of peer links |
+| `PEER_POLL_INTERVAL_MS` | 2000 | Peer inventory poll |
+| `RELEASE_GRACE_MS` | 2000 | Delay before releasing a target |
+| `NMOS_ENABLE` | true | Register this node and observe the registry |
+| `NMOS_SEED` | empty | UUIDv5 input for the node id. Unset keeps UUIDv5(`HOST_ID`) |
+| `NMOS_LABEL` | `HOST_ID` | Node label. This agent has no device |
+| `NMOS_TAGS` | `{}` | JSON object of tag name to string array, added to the node. The host-id tag is always set |
+| `NMOS_DNS_SD` | false | `false` disables DNS-SD browse and mDNS advertisement. `true` needs Avahi; the platform does not use it |
+| `NMOS_HOST_ADDRESS` | first non-loopback IPv4 | IP literal announced as the node href, `api.endpoints[].host`, and the service href. Not a hostname, `0.0.0.0`, or loopback |
+| `NMOS_REGISTRY_ADDRESS` / `NMOS_REGISTRY_PORT` | empty / 3210 | Registration API. Empty with `NMOS_DNS_SD=false` means no registry |
+| `NMOS_QUERY_ADDRESS` / `NMOS_QUERY_PORT` | registry address / registry port + 1 | Query API |
+| `NMOS_POLL_INTERVAL_MS` | 1000 | How often IS-05 `/active` is read |
+| `NMOS_PORT` | 3232 | Node API. The WebSocket listener is `NMOS_PORT+1` |
+| `LOCAL_NODE_IDS` / `LOCAL_NODE_HOSTNAMES` | empty | Extra local-node rules |
+| `LOCAL_NODE_CIDRS` | empty | Pod CIDR of this node when media functions use the pod network |
+| `WEB_PORT` | 8095 | UI, `/api/v1`, health, metrics |
+| `WEB_ENABLE` | true | `false` hides the UI and `PUT /api/v1/config`. Health, metrics, and `/api/v1` stay up |
+| `RT_PRIORITY` / `CPU_AFFINITY` | 0 / empty | Fabric thread scheduling |
+| `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` |
+| `METRICS_PER_FLOW` | true | Drop per-flow metric labels when false |
+| `SHUTDOWN_TIMEOUT_S` | 10 | SIGTERM budget. The process then exits 143 |
+
+`HOST_ID` is the fabrics peer id. It is not the address in the NMOS href. That address is `NMOS_HOST_ADDRESS`.
+
+## Exit codes
+
+| Code | When |
 | --- | --- |
-| `HOST_ID` | hostname |
-| `MXL_ROOT` | `/Volumes/mxl` |
-| `MIRROR_MODE` | `eager` (`eager` or `on-demand`) |
-| `MIRROR_INCLUDE_DOMAINS` / `MIRROR_INCLUDE_FLOWS` | empty (no extra filter) |
-| `MIRROR_EXCLUDE_DOMAINS` / `MIRROR_EXCLUDE_FLOWS` | empty |
-| `DEFAULT_PROVIDER` | `verbs` |
-| `PROVIDER_FALLBACK` | empty, or `tcp` |
-| `WEB_PORT` | 8095 |
-| `NMOS_PORT` | 3232 |
-| `LOCAL_NODE_CIDRS` | empty (this node's pod CIDR when media functions use the pod network) |
+| 0 | The process left `main` without a termination signal. A SIGTERM shutdown is 143 |
+| 75 | A listen port could not be bound (`WEB_PORT`, `NMOS_PORT`, or the WebSocket on `NMOS_PORT+1`), or no fabric provider is usable |
+| 78 | Invalid configuration, or the MXL scan path is not a directory |
+| 143 | SIGTERM or SIGINT, including when shutdown exceeds `SHUTDOWN_TIMEOUT_S` |
 
-`WEB_ENABLE=false` removes the UI and config writes. `/api/v1` stays available for peers.
+On SIGTERM the agent releases MXL readers and writers, removes its node from the registry, then, when `MXL_CLEANUP_ON_EXIT=true`, deletes only mirror directories it owns. Another function's domain and another agent's mirrors are left in place.
+
+## HTTP API
+
+All of these are on `WEB_PORT`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/livez` | Process is up |
+| GET | `/readyz` | Scanner is running and, when a registry is configured, this node is registered |
+| GET | `/metrics` | Prometheus text, prefix `mxl_fabrics_agent_` |
+| GET | `/statusz` | Short JSON status |
+| GET | `/` | Admin UI, unless `WEB_ENABLE=false` |
+| GET | `/api/v1/info` | Version, host id, boot id |
+| GET | `/api/v1/inventory` | Local domains and flows |
+| GET | `/api/v1/mirrors` | Mirror domains |
+| GET | `/api/v1/demand` | Local IS-05 demand |
+| GET | `/api/v1/replications` | Active replications |
+| POST | `/api/v1/replications` | Peer asks this host to send a flow |
+| DELETE | `/api/v1/replications/{id}/targets/{dest}` | Peer releases a target |
+| GET | `/api/v1/peers` | Peer link status |
+| POST | `/api/v1/peers/{id}/test` | Control-plane and local target check |
+| GET | `/api/v1/events` | Server-sent events |
+| GET | `/api/v1/config` | Effective configuration, origin, and `restart_required` |
+| GET | `/api/v1/config/env` | `KEY=value` form |
+| PUT | `/api/v1/config` | Patch the file layer. Hidden when `WEB_ENABLE=false` |
+| GET | `/api/v1/config/export` | One JSON document of the effective configuration. No secrets exist to omit |
+| POST | `/api/v1/config/import` | Restore that document into the file layer. Environment variables still win |
+
+This agent has no IS-05 senders or receivers. It does not accept connection patches. It only reads other nodes' active connections.
+
+## Running on the platform
+
+The platform runs one agent per node as a DaemonSet on the host network. Host networking is required for RDMA and for the fabric addresses in the peer map. `deploy/mxl-fabrics-agent.yaml` shows the contract: no `hostIPC`, `IPC_LOCK` for memory registration, the MXL root hostPath at `/Volumes/mxl`, a writable `/config` volume, probes on `/livez` and `/readyz`, and `terminationGracePeriodSeconds` greater than `SHUTDOWN_TIMEOUT_S`.
+
+Set `NMOS_HOST_ADDRESS` to the node IP, `NMOS_DNS_SD=false`, and `NMOS_REGISTRY_PORT` to the platform registration port (the query port defaults to that port plus 1). Set `LOCAL_NODE_CIDRS` to the node's pod CIDR. Set `MXL_CLEANUP_ON_EXIT=true` so this node's mirrors disappear on shutdown. Leave `NMOS_SEED` unset to keep the existing node id, which is UUIDv5 of `HOST_ID`. Setting `NMOS_SEED` changes that id.

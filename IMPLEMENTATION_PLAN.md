@@ -53,3 +53,25 @@ does not watch the Kubernetes API or derive the CIDR from routes. A later
 - Unit tests cover config precedence, local-node matching (including `LOCAL_NODE_CIDRS`), IS-05 demand derivation, the mirror state machine, include/exclude filters, inventory classification, and handshake idempotency.
 - `tests/integration/tcp_mesh.sh` runs two agents on one machine with the `tcp` provider: eager mirror before activation, identical grain indices, release after grace, peer down, resume, and `stale_reference`.
 - Hardware checks in spec §15.4 (sustained `verbs` on E810 and ConnectX) are not run in CI.
+- `tests/integration/shutdown.sh` checks registration, exit 143, node DELETE, and own-mirror removal.
+
+## 6. Platform guideline G1–G14
+
+v1.0.0 is the stable contract for the settings below. A later break needs v2.
+
+| Item | Status | Evidence | What changed |
+| --- | --- | --- | --- |
+| G1 Configuration | met | `src/config/config.cpp:274`, `src/main.cpp:152` | Env, then file, then default. Unknown env keys ignored. Invalid values exit 78. Settings table in README. State under `STATE_DIR` (default `/config`). No secret settings |
+| G2 MXL domains | met | `src/config/config.cpp:277`, `src/reconcile/controller.cpp:206`, `src/reconcile/controller.cpp:421` | `MXL_DOMAIN_SCAN_PATH` (alias `MXL_ROOT`, default `/Volumes/mxl`). One output domain and `history_duration` are N/A: mirrors are per source domain and copy the origin `options.json`. A `domain_def.json` with a different id is not overwritten. Cleanup deletes only this agent's mirrors |
+| G3 NMOS identity | met | `src/util/uuid.hpp:30`, `src/nmos/node.cpp:134` | `NMOS_SEED` (default: `HOST_ID`, so existing node ids stay). No device, source, flow, sender, or receiver, so those ids are N/A. `NMOS_LABEL` and `NMOS_TAGS` are on the node. The host-id tag stays. No BCP-002 group hints exist |
+| G4 Registry, no DNS-SD | met | `src/nmos/node.cpp:80`, `src/nmos/observer.cpp:363`, `src/config/config.cpp:358` | `NMOS_DNS_SD` defaults false: `pri` and `highest_pri` are `INT_MAX`, and the observer does not browse. Query defaults to the registry address and registration port + 1. Avahi is not required while DNS-SD is off |
+| G5 Announce addresses | met | `src/util/net.cpp:72`, `src/nmos/node.cpp:73` | `NMOS_HOST_ADDRESS`, else the first non-loopback IPv4. Used for the node href, `api.endpoints[].host`, and the service href. `HOST_ID` stays the peer id, not the href host. No SDP, ICE, or SRT |
+| G6 Ports | met | `src/main.cpp:127`, `src/reconcile/controller.cpp:172` | `WEB_PORT`, `NMOS_PORT` (WebSocket `NMOS_PORT+1`), `FABRIC_PORT_BASE`/`COUNT`. Bind failure of the web or NMOS listeners exits 75. Fabric ports come from the pool when a replication starts; one failure fails that replication |
+| G7 Health and metrics | met | `src/reconcile/controller.cpp:634`, `src/ops/metrics.cpp:119` | `/livez`, `/readyz` (registration required only when a registry is configured), `/metrics` with prefix `mxl_fabrics_agent_` |
+| G8 Clean shutdown | met | `src/main.cpp:143`, `src/reconcile/controller.cpp:200`, `src/nmos/node.cpp:197` | SIGTERM releases MXL resources, erases the node so nmos-cpp DELETEs it, DELETEs the node explicitly, removes own mirrors when `MXL_CLEANUP_ON_EXIT=true` (alias `CLEANUP_MIRRORS_ON_EXIT`), and exits 143 within `SHUTDOWN_TIMEOUT_S` (default 10). No child processes |
+| G9 IS-05 | N/A | `src/nmos/node.cpp` | This agent has no senders or receivers and does not implement the connection API. It only reads other nodes' `/active` |
+| G10 Config export | met | `src/reconcile/controller.cpp:883` | `GET /api/v1/config/export` and `POST /api/v1/config/import`. Existing config routes stay. Nothing is secret, so nothing is omitted |
+| G11 Image and CI | met | `.github/workflows/container.yaml:28`, `docker/Dockerfile:86` | ghcr.io/leeo86/mxl-fabrics-agent. `main`: `git-<sha7>` and `nightly-dev`. Tag `vX.Y.Z`: `X.Y.Z`, `X.Y`, `X`. Those version tags are not moved. Image user 1000. `IPC_LOCK` is for RDMA, not root. OCI source, revision, licenses, and `io.dmf.mxl.revision` |
+| G12 Kubernetes example | met | `deploy/mxl-fabrics-agent.yaml` | Host network is required (RDMA and peer fabric addresses). Standard env, `/livez` and `/readyz`, grace period above the shutdown timeout, MXL root hostPath, writable `/config`, no `hostIPC`, `IPC_LOCK` only |
+| G13 Documentation | met | `README.md`, `CHANGELOG.md`, `SPECIFICATION.md` | Settings, ports, exit codes, API, platform runbook, 1.0.0 changelog. The spec matches the code |
+| G14 Tests | met | `tests/unit/test_config.cpp`, `tests/integration/shutdown.sh`, `.github/workflows/ci.yaml` | Unit tests cover aliases, seed, tags, host address, query-port default, and import. Integration covers ready, SIGTERM, deregistration, and own-mirror removal |

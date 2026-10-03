@@ -20,9 +20,10 @@ cmake -S . -B build -G Ninja \
 cmake --build build
 ./build/unit-tests
 LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/tcp_mesh.sh
+LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/shutdown.sh
 ```
 
-`MXL_ROOT` must exist or the process exits 78. For a loopback run, a directory on `/dev/shm` is enough.
+`MXL_ROOT` (alias of `MXL_DOMAIN_SCAN_PATH`) must exist or the process exits 78. For a loopback run, a directory on `/dev/shm` is enough. SIGTERM exits 143. A port that cannot be bound exits 75. Invalid configuration exits 78.
 
 ## Runtime notes
 
@@ -30,3 +31,6 @@ LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/tc
 - `verbs` covers both Intel E810 (`irdma`) and NVIDIA ConnectX (`mlx5`).
 - DeckLink and the ST 2110 gateway need `MIRROR_MODE=eager` because they reject an unknown `mxl_domain_id` at IS-05 activation.
 - `LOCAL_NODE_CIDRS` is the node's pod CIDR when media functions advertise pod IPs. Empty leaves local-node matching unchanged.
+- `NMOS_DNS_SD` defaults to false (no browse, no mDNS). Set it true only when Avahi should be used.
+- `NMOS_HOST_ADDRESS` is the IP announced in the node href. Unset, the first non-loopback IPv4 is used.
+- `NMOS_SEED` unset keeps the node id as UUIDv5 of `HOST_ID`. `MXL_CLEANUP_ON_EXIT` (alias `CLEANUP_MIRRORS_ON_EXIT`) removes this agent's own mirrors on shutdown.

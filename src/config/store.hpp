@@ -20,6 +20,9 @@ public:
     // Returns the merged config. Runtime keys take effect immediately.
     Config updateFile(std::map<std::string, std::string> const& patch, bool* restart = nullptr);
     void replaceFile(std::map<std::string, std::string> const& fileLayer);
+    // Replace the file layer with the document. Keys owned by the environment are left unchanged.
+    // Unknown keys are ignored. There are no secret fields.
+    void importDocument(std::map<std::string, std::string> const& doc);
     std::string exportJson() const;
     std::string exportEnv() const;
 

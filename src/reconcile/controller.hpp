@@ -29,6 +29,7 @@ public:
     void start();
     void stop();
     bool ready() const { return ready_.load(); }
+    int fatal() const { return fatal_.load(); }
     HttpResponse handle(HttpRequest const& request);
     void stream(SseEmit const& emit);
 
@@ -53,6 +54,8 @@ private:
     std::thread thread_;
     std::atomic<bool> ready_{false};
     std::atomic<bool> nmosReady_{false};
+    std::atomic<bool> nmosRegistered_{false};
+    std::atomic<int> fatal_{0};
     std::string nmosError_;
     DemandSnapshot demand_;
     std::vector<DomainRecord> mirrors_;

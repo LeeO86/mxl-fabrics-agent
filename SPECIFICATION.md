@@ -220,18 +220,36 @@ resolve is not local. An empty `LOCAL_NODE_CIDRS` disables the rule.
   - on every reconciliation tick (`NMOS_POLL_INTERVAL_MS`, default 1000),
     because a controller may change transport params without the IS-04
     subscription changing.
-- The registry is found via `NMOS_REGISTRY_ADDRESS`/`NMOS_REGISTRY_PORT`, else
-  via DNS-SD (`_nmos-query._tcp`), with the same Avahi requirements as
-  mxl-decklink.
+- The registry Query API is `NMOS_QUERY_ADDRESS` (default: `NMOS_REGISTRY_ADDRESS`)
+  on `NMOS_QUERY_PORT` (default: `NMOS_REGISTRY_PORT + 1`).
+- `NMOS_DNS_SD` defaults to false. DNS-SD browse and mDNS advertisement are
+  then both off, and Avahi or D-Bus is not required. `NMOS_DNS_SD=true` is the
+  only mode that browses `_nmos-query._tcp`.
 
 ### 6.3 The agent's own Node
 
 - The agent registers one IS-04 v1.3 Node with no devices, senders or receivers.
+  There is no device, so there are no device, source, flow, sender, or receiver ids.
+- The node id is UUIDv5 of `NMOS_SEED` when that is set, otherwise UUIDv5 of
+  `HOST_ID` (the same id this agent has always used). The same seed gives the
+  same id after a restart.
+- `NMOS_LABEL` is the node label (default `HOST_ID`).
+- `NMOS_TAGS` (a JSON object of string arrays) is added to the node. The tag
+  `urn:x-leeo86:mxl-fabrics-agent:host-id: ["<HOST_ID>"]` is always set. This
+  agent has no BCP-002 group hints.
+- The node `href`, `api.endpoints[].host`, and the service href are the IP
+  literal `NMOS_HOST_ADDRESS` (default: the first non-loopback IPv4). They are
+  never a hostname, `0.0.0.0`, or `127.0.0.1`.
 - Its `services` array contains one entry:
-  `{"href": "http://<host-ip>:<WEB_PORT>/api/v1", "type": "urn:x-leeo86:service:mxl-fabrics-agent/v1.0", "authorization": false}`.
-- Its `tags` include `urn:x-leeo86:mxl-fabrics-agent:host-id: ["<HOST_ID>"]`.
+  `{"href": "http://<NMOS_HOST_ADDRESS>:<WEB_PORT>/api/v1", "type": "urn:x-leeo86:service:mxl-fabrics-agent/v1.0", "authorization": false}`.
 - This Node is the discovery mechanism for peer agents (§8.1). It is optional
   only if `PEERS` is fully specified statically.
+- With a registry configured, `/readyz` stays 503 until the registration
+  client has registered the node or the Query API lists it. `NMOS_DNS_SD=false`
+  and an empty registry address do not wait for registration.
+- On shutdown the node resource is removed from the nmos-cpp model so the
+  registration client sends DELETE, and the agent also DELETEs
+  `/x-nmos/registration/v1.3/resource/nodes/{id}`.
 
 ### 6.4 Deriving demand
 
@@ -309,7 +327,9 @@ mirror is not created, and status/metric/log report `insufficient_space`.
   adopted (re-opened as writer) or removed if no longer wanted. Mirror domains
   with a foreign `owner_host_id` are left untouched and reported as conflict.
 - On clean shutdown (SIGTERM) the agent stops replications and, if
-  `CLEANUP_MIRRORS_ON_EXIT=true` (default false), removes its mirrors.
+  `MXL_CLEANUP_ON_EXIT=true` (alias `CLEANUP_MIRRORS_ON_EXIT`, default false),
+  removes only mirror directories it owns. An existing `domain_def.json` whose
+  id does not match the mirror is not overwritten.
 
 ---
 
@@ -363,6 +383,11 @@ posture as the siblings: protected networks only).
 | GET | `/replications` | active replications (both roles) |
 | GET | `/mirrors` | local mirrors and their state |
 | GET | `/demand` | local demand entries and the receivers behind them |
+| GET | `/config` | effective configuration, where each key came from, `restart_required` |
+| GET | `/config/env` | the same configuration as `KEY=value` lines |
+| PUT | `/config` | patch the file layer (`WEB_ENABLE=false` rejects this) |
+| GET | `/config/export` | one JSON document of the effective configuration |
+| POST | `/config/import` | replace the file layer with that document. Environment still wins |
 
 Inventory exchange: each agent polls peers' `/inventory` every
 `PEER_POLL_INTERVAL_MS` (default 2000) and additionally reacts to `/events`.
@@ -433,14 +458,16 @@ include/exclude lists apply at runtime.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `HOST_ID` | hostname | stable identity of this host/agent |
-| `MXL_ROOT` | `/Volumes/mxl` | MXL tmpfs root |
+| `HOST_ID` | hostname | fabrics peer identity; NMOS node id seed when `NMOS_SEED` is unset |
+| `MXL_DOMAIN_SCAN_PATH` | `/Volumes/mxl` | parent of domain directories. Alias: `MXL_ROOT` |
+| `STATE_DIR` | `/config` | directory for the configuration file this process writes |
 | `SCAN_INTERVAL_MS` | 2000 | full re-scan interval |
 | `MIRROR_MODE` | `eager` | `eager` or `on-demand` |
-| `MIRROR_INCLUDE` / `MIRROR_EXCLUDE` | empty | domain/flow id filters |
+| `MIRROR_INCLUDE_DOMAINS` / `MIRROR_INCLUDE_FLOWS` | empty | allow lists; empty does not filter |
+| `MIRROR_EXCLUDE_DOMAINS` / `MIRROR_EXCLUDE_FLOWS` | empty | deny lists |
 | `MIRROR_GRACE_S` | 10 | keep mirror after origin disappears |
-| `TMPFS_RESERVE_MB` | 512 | minimum free tmpfs |
-| `CLEANUP_MIRRORS_ON_EXIT` | false | remove own mirrors on SIGTERM |
+| `TMPFS_RESERVE_MB` | 512 | minimum free space on the MXL filesystem |
+| `MXL_CLEANUP_ON_EXIT` | false | remove own mirrors on SIGTERM. Alias: `CLEANUP_MIRRORS_ON_EXIT` |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |
 | `PROVIDER_FALLBACK` | empty | `tcp` to allow fallback |
 | `FABRIC_INTERFACE` | empty | default local fabric interface/IP |
@@ -450,16 +477,25 @@ include/exclude lists apply at runtime.
 | `PEER_POLL_INTERVAL_MS` | 2000 | inventory poll interval |
 | `RELEASE_GRACE_MS` | 2000 | delay before releasing a target |
 | `NMOS_ENABLE` | true | register own Node and observe registry |
-| `NMOS_REGISTRY_ADDRESS` / `NMOS_REGISTRY_PORT` | empty / 3210 | unicast registry; empty = DNS-SD |
-| `NMOS_QUERY_ADDRESS` / `NMOS_QUERY_PORT` | registry / 3211 | Query API if separate |
+| `NMOS_SEED` | empty | UUIDv5 name for the node id. Empty uses `HOST_ID` |
+| `NMOS_LABEL` | `HOST_ID` | node label |
+| `NMOS_TAGS` | `{}` | JSON object of tag name to array of strings, merged onto the node |
+| `NMOS_DNS_SD` | false | `false` disables DNS-SD browse and mDNS advertisement |
+| `NMOS_HOST_ADDRESS` | first non-loopback IPv4 | IP literal announced to other systems |
+| `NMOS_REGISTRY_ADDRESS` / `NMOS_REGISTRY_PORT` | empty / 3210 | Registration API. Empty does not mean DNS-SD |
+| `NMOS_QUERY_ADDRESS` / `NMOS_QUERY_PORT` | registry address / registry port + 1 | Query API |
 | `NMOS_POLL_INTERVAL_MS` | 1000 | IS-05 `/active` reconciliation |
 | `NMOS_PORT` | 3232 | own Node API (WebSocket listener on `NMOS_PORT+1`) |
 | `LOCAL_NODE_IDS` / `LOCAL_NODE_HOSTNAMES` | empty | extra local-node rules (§6.1) |
 | `LOCAL_NODE_CIDRS` | empty | comma-separated IPv4/IPv6 CIDRs; endpoint hosts inside them are local (§6.1) |
 | `WEB_PORT` | 8095 | UI, REST, health, metrics |
-| `WEB_ENABLE` | true | UI + REST (health/metrics always on) |
+| `WEB_ENABLE` | true | `false` hides the UI and `PUT /api/v1/config`. `/api/v1` stays up |
 | `RT_PRIORITY` / `CPU_AFFINITY` | 0 / empty | fabric thread scheduling |
 | `LOG_LEVEL` | `info` | structured JSON logs |
+| `SHUTDOWN_TIMEOUT_S` | 10 | SIGTERM budget before exit 143 |
+| `AGENT_CONFIG_FILE` | unset | optional JSON file. Saves use `$STATE_DIR/agent.json` when that directory is writable |
+
+Combined `MIRROR_INCLUDE` / `MIRROR_EXCLUDE` are rejected. There are no secret settings.
 
 Port defaults are chosen so they do not collide with mxl-decklink
 (8080, 3212/3213) when all containers share host networking. The gateway's
@@ -489,11 +525,13 @@ The same list SHOULD be added to the mxl-st2110-gateway spec.
 
 ### 12.1 HTTP endpoints on `WEB_PORT`
 
-- `/livez`, `/readyz` (ready = MXL root mounted, scanner running, NMOS
-  registration done or disabled, fabric instance(s) initialised), `/statusz`
-  (full JSON state).
-- `/metrics` — Prometheus text format.
-- `/api/v1/...` — §8.3.
+- `/livez` is 200 while the process is up.
+- `/readyz` is 200 when the scanner is running and, if a registry is configured
+  (`NMOS_REGISTRY_ADDRESS` set or `NMOS_DNS_SD=true`), the node is registered.
+- `/metrics` — Prometheus text, prefix `mxl_fabrics_agent_`.
+- `/api/v1/...` — §8.3, plus `GET /config/export` and `POST /config/import`.
+  Export is the effective configuration. Import replaces the file layer.
+  Environment variables still win. No field is a secret.
 - `/` — admin UI (when `WEB_ENABLE=true`).
 
 ### 12.2 Admin UI (Vue SPA)
@@ -558,10 +596,10 @@ Structured JSON logs, one event per line, with `replication_id`, `flow_id`,
 
 | Code | Meaning |
 | --- | --- |
-| 0 | clean shutdown |
-| 75 | startup failed after retries (`EX_TEMPFAIL`), e.g. no fabric provider |
-| 78 | invalid configuration (`EX_CONFIG`) |
-| 143 | shutdown grace exceeded |
+| 0 | the process returned from `main` without a termination signal |
+| 75 | a listen port could not be bound, or no fabric provider is usable (`EX_TEMPFAIL`) |
+| 78 | invalid configuration, or the MXL scan path is missing (`EX_CONFIG`) |
+| 143 | SIGTERM or SIGINT completed, or `SHUTDOWN_TIMEOUT_S` elapsed |
 
 ---
 
@@ -570,12 +608,12 @@ Structured JSON logs, one event per line, with `replication_id`, `flow_id`,
 - Base image and multi-stage build like mxl-decklink (build MXL with Fabrics,
   libfabric, nmos-cpp in builder stages; slim runtime stage).
 - Runtime requirements:
-  - host networking (RDMA, peer addressing, NMOS DNS-SD);
+  - host networking (RDMA and peer fabric addresses; DNS-SD is off unless `NMOS_DNS_SD=true`);
   - `/dev/infiniband` devices (`uverbs*`, `rdma_cm`);
   - capability `IPC_LOCK` and `memlock` ulimit unlimited (memory registration);
   - MXL root bind-mounted read-write;
   - runs as the uid/gid owning the MXL root (e.g. `1000:1000`);
-  - optional: `/run/dbus`, `/run/avahi-daemon` for DNS-SD.
+  - `/run/dbus` and `/run/avahi-daemon` only when `NMOS_DNS_SD=true`.
 - Host prerequisites (documented in README): rdma-core, irdma loaded with
   RoCEv2 enabled on the E810 ports used for the mesh (verify the irdma RoCE
   mode setting), IP addresses on the direct links, MTU consistent per link,
@@ -590,8 +628,12 @@ Same as the siblings:
 
 - GitHub Actions: build, unit tests, integration tests (§15.2, `tcp` provider),
   build and push to GHCR `ghcr.io/leeo86/<repo-name>`.
-- Tags: `vX.Y.Z` → `X.Y.Z`, `X.Y`, `X`, `latest` + GitHub Release;
-  `main` → `nightly-dev`; every build → `git-<sha>`.
+- Tags: `vX.Y.Z` → immutable `X.Y.Z`, `X.Y`, `X`, plus a GitHub Release.
+  `main` → moving `nightly-dev`. Every build → `git-<sha7>`.
+  `latest` is not published. OCI labels include `org.opencontainers.image.source`,
+  `.revision`, `.licenses`, and `io.dmf.mxl.revision` (the MXL commit).
+  The runtime image runs as uid 1000. Host networking needs `IPC_LOCK` for RDMA,
+  not root.
 
 ---
 
@@ -617,6 +659,9 @@ Single machine, `tcp` provider over loopback, two simulated hosts:
   (eager) → grains arrive with identical indices → disable receiver → target
   released after grace → kill source agent → `peer_down` → restart →
   replication resumes → format change at source → `stale_reference` reported.
+- `tests/integration/shutdown.sh`: start, `/readyz` after registration, SIGTERM,
+  exit 143, the registry records DELETE, and only this agent's mirror directory
+  is removed.
 
 ### 15.3 NMOS checks
 

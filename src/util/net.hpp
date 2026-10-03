@@ -8,6 +8,10 @@ namespace mfa
 {
 std::string localHostname();
 std::set<std::string> localAddresses();
+// First non-loopback IPv4, in interface order. Empty when the host has none.
+std::string firstNonLoopbackIPv4();
+// True for a unicast IP literal that is not loopback and not 0.0.0.0 / ::.
+bool announceableAddress(std::string_view host, std::string* normalized, std::string* error);
 int taiOffsetSeconds();
 bool pathIsTmpfs(std::string const& path);
 

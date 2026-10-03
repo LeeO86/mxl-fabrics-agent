@@ -56,6 +56,16 @@ std::string mirrorPath(std::string const& root, std::string const& domainId)
     return (fs::path(root) / ("mirror-" + domainId)).string();
 }
 
+std::string domainIdOf(std::string const& text)
+{
+    auto const root = json::parse(text);
+    if (!root.is<picojson::object>())
+    {
+        return {};
+    }
+    return json::asString(root.get<picojson::object>(), "id").value_or("");
+}
+
 std::string domainDef(std::string const& domainId, std::string const& sourceHost, std::string const& owner)
 {
     picojson::object marker;
@@ -125,7 +135,7 @@ LocalIdentity identityFrom(Config const& cfg)
     {
         id.resolveName = [](std::string const& name) { return resolveNameCached(name); };
     }
-    id.ownNodeId = nodeIdForHost(cfg.host_id).str();
+    id.ownNodeId = nmosNodeId(cfg.nmos_seed, cfg.host_id);
     return id;
 }
 } // namespace
@@ -152,12 +162,21 @@ void Controller::start()
     auto const cfg = store_->get();
     if (cfg.nmos_enable)
     {
-        node_ = std::make_unique<NmosNode>(cfg, nodeIdForHost(cfg.host_id).str(), [this](bool ok, std::string const& error) {
-            nmosReady_ = ok;
-            nmosError_ = error;
-            observer_.setRegistered(ok);
-            cv_.notify_all();
-        });
+        node_ = std::make_unique<NmosNode>(
+            cfg, nmosNodeId(cfg.nmos_seed, cfg.host_id),
+            [this](bool ok, std::string const& error) {
+                nmosReady_ = ok;
+                nmosError_ = error;
+                if (!ok && error.find("built without") == std::string::npos)
+                {
+                    fatal_ = 75;
+                }
+                cv_.notify_all();
+            },
+            [this](bool registered) {
+                nmosRegistered_ = registered;
+                cv_.notify_all();
+            });
         node_->start();
     }
     scanner_.start();
@@ -178,6 +197,11 @@ void Controller::stop()
     {
         thread_.join();
     }
+    engine_.releaseAll();
+    if (node_)
+    {
+        node_->stop();
+    }
     auto const cfg = store_->get();
     if (cfg.cleanup_mirrors_on_exit)
     {
@@ -189,16 +213,13 @@ void Controller::stop()
             if (marker && marker->mirror && marker->owner_host_id == cfg.host_id)
             {
                 fs::remove_all(entry.path(), ec);
+                log::info("mirror_domain_removed", {{"path", entry.path().string()}});
             }
         }
     }
     observer_.stop();
     peers_.stop();
     scanner_.stop();
-    if (node_)
-    {
-        node_->stop();
-    }
     {
         std::lock_guard const lock{eventMu_};
         eventsStop_ = true;
@@ -392,23 +413,37 @@ void Controller::tick()
         }
         if (plan.create)
         {
-            writeText(fs::path(path) / "domain_def.json", domainDef(remote.domain->domain_id, remote.peer->host_id, cfg.host_id));
-            if (!remote.domain->options_json.empty())
+            auto const defPath = fs::path(path) / "domain_def.json";
+            auto const existing = readText(defPath);
+            bool const mismatch = !existing.empty() && domainIdOf(existing) != remote.domain->domain_id;
+            if (mismatch)
             {
-                auto const optionsPath = fs::path(path) / "options.json";
-                if (!fs::exists(optionsPath))
+                log::error("mirror_domain_id_mismatch",
+                    {{"path", defPath.string()}, {"existing", domainIdOf(existing)}, {"wanted", remote.domain->domain_id}});
+            }
+            else
+            {
+                if (existing.empty())
                 {
-                    writeText(optionsPath, remote.domain->options_json);
+                    writeText(defPath, domainDef(remote.domain->domain_id, remote.peer->host_id, cfg.host_id));
                 }
-            }
-            std::string error;
-            if (!remote.flow->flow_def_json.empty())
-            {
-                engine_.ensureWriter(path, remote.flow->flow_def_json, &error);
-            }
-            if (!error.empty())
-            {
-                log::warn("mirror_writer_failed", {{"flow_id", remote.flow->flow_id}, {"error", error}});
+                if (!remote.domain->options_json.empty())
+                {
+                    auto const optionsPath = fs::path(path) / "options.json";
+                    if (!fs::exists(optionsPath))
+                    {
+                        writeText(optionsPath, remote.domain->options_json);
+                    }
+                }
+                std::string error;
+                if (!remote.flow->flow_def_json.empty())
+                {
+                    engine_.ensureWriter(path, remote.flow->flow_def_json, &error);
+                }
+                if (!error.empty())
+                {
+                    log::warn("mirror_writer_failed", {{"flow_id", remote.flow->flow_id}, {"error", error}});
+                }
             }
         }
         DomainRecord view;
@@ -602,7 +637,9 @@ HttpResponse Controller::handle(HttpRequest const& request)
     }
     if (request.method == "GET" && request.path == "/readyz")
     {
-        bool const nmosOk = !cfg.nmos_enable || nmosReady_.load();
+        bool const registryRequired = cfg.nmos_enable && cfg.registryConfigured();
+        bool const registered = nmosRegistered_.load() || observer_.snapshot().registered;
+        bool const nmosOk = !cfg.nmos_enable || (nmosReady_.load() && (!registryRequired || registered));
         bool const ok = ready_.load() && scanner_.running() && nmosOk;
         return json(ok ? 200 : 503, ok ? "{\"status\":\"ready\"}" : "{\"status\":\"not ready\"}");
     }
@@ -617,6 +654,7 @@ HttpResponse Controller::handle(HttpRequest const& request)
         root["boot_id"] = picojson::value(bootId_);
         root["ready"] = picojson::value(ready_.load());
         root["nmos"] = picojson::value(nmosReady_.load());
+        root["nmos_registered"] = picojson::value(nmosRegistered_.load() || observer_.snapshot().registered);
         root["nmos_error"] = picojson::value(nmosError_);
         root["tai_offset_seconds"] = picojson::value(static_cast<double>(tai_));
         root["mxl_root_tmpfs"] = picojson::value(rootTmpfs_);
@@ -841,6 +879,37 @@ HttpResponse Controller::handle(HttpRequest const& request)
     if (request.method == "GET" && request.path == "/api/v1/config/env")
     {
         return HttpResponse{200, "text/plain", store_->exportEnv(), false};
+    }
+    if (request.method == "GET" && request.path == "/api/v1/config/export")
+    {
+        return json(200, store_->exportJson());
+    }
+    if (request.method == "POST" && request.path == "/api/v1/config/import")
+    {
+        try
+        {
+            auto body = request.body;
+            std::string err;
+            auto const parsed = json::parse(body, &err);
+            if (!err.empty() || !parsed.is<picojson::object>())
+            {
+                return json(400, "{\"error\":\"config body is not a JSON object\"}");
+            }
+            auto const& obj = parsed.get<picojson::object>();
+            if (obj.size() == 1 && obj.count("config") != 0 && obj.at("config").is<picojson::object>())
+            {
+                body = obj.at("config").serialize();
+            }
+            store_->importDocument(loadConfigFileText(body));
+            engine_.updateConfig(store_->get());
+            peers_.updateConfig(store_->get());
+            observer_.updateConfig(store_->get());
+            return json(200, std::string("{\"restart_required\":") + (store_->restartRequired() ? "true" : "false") + "}");
+        }
+        catch (ConfigError const& ex)
+        {
+            return json(400, std::string("{\"error\":\"") + ex.what() + "\"}");
+        }
     }
     if (request.method == "PUT" && request.path == "/api/v1/config")
     {

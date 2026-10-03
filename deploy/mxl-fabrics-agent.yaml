@@ -5,6 +5,7 @@ metadata:
 data:
   # LOCAL_NODE_CIDRS is that node's pod CIDR:
   # kubectl get node <name> -o jsonpath='{.spec.podCIDR}'
+  # Leave NMOS_SEED unset to keep the node id as UUIDv5(HOST_ID).
   node-a.json: |
     {"PEERS":[{"host_id":"node-b","local_fabric_addr":"192.168.12.1","remote_fabric_addr":"192.168.12.2","provider":"verbs"}],"LOCAL_NODE_CIDRS":"10.42.0.0/24"}
   node-b.json: |
@@ -29,11 +30,18 @@ spec:
         prometheus.io/port: "8095"
         prometheus.io/path: "/metrics"
     spec:
+      # Host network: RDMA and the fabric addresses in the peer map.
+      # hostIPC is not set.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        supplementalGroups: [1000]
       containers:
         - name: agent
-          image: ghcr.io/leeo86/mxl-fabrics-agent:nightly-dev
+          image: ghcr.io/leeo86/mxl-fabrics-agent:1.0.0
           securityContext:
             capabilities:
               add: ["IPC_LOCK"]
@@ -45,17 +53,34 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: MXL_ROOT
+            - name: MXL_DOMAIN_SCAN_PATH
               value: /Volumes/mxl
+            - name: STATE_DIR
+              value: /config
             - name: AGENT_CONFIG_FILE
-              value: /etc/mxl-fabrics-agent/agent.json
+              value: /config/agent.json
             - name: DEFAULT_PROVIDER
               value: verbs
+            - name: NMOS_DNS_SD
+              value: "false"
+            - name: NMOS_HOST_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # Platform registry. NMOS_QUERY_PORT defaults to this port plus 1.
+            - name: NMOS_REGISTRY_ADDRESS
+              value: "10.0.0.10"
+            - name: NMOS_REGISTRY_PORT
+              value: "3210"
+            - name: MXL_CLEANUP_ON_EXIT
+              value: "true"
+            - name: SHUTDOWN_TIMEOUT_S
+              value: "10"
           volumeMounts:
             - name: mxl
               mountPath: /Volumes/mxl
-            - name: config
-              mountPath: /etc/mxl-fabrics-agent
+            - name: state
+              mountPath: /config
           readinessProbe:
             httpGet:
               path: /readyz
@@ -72,19 +97,21 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-          command: ["sh", "-c", "cp /cm/${HOST_ID}.json /cfg/agent.json"]
+          command: ["sh", "-c", "if [ ! -f /config/agent.json ]; then cp \"/cm/${HOST_ID}.json\" /config/agent.json; fi; chown 1000:1000 /config /config/agent.json"]
           volumeMounts:
             - name: configmap
               mountPath: /cm
-            - name: config
-              mountPath: /cfg
+            - name: state
+              mountPath: /config
       volumes:
         - name: mxl
           hostPath:
             path: /Volumes/mxl
             type: Directory
-        - name: config
-          emptyDir: {}
+        - name: state
+          hostPath:
+            path: /var/lib/mxl-fabrics-agent
+            type: DirectoryOrCreate
         - name: configmap
           configMap:
             name: mxl-fabrics-agent
