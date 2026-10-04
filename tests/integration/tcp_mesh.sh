@@ -182,4 +182,23 @@ for ((i = 0; i < 20; i++)); do
 done
 [[ "$stale" == 1 ]] || fail "stale_reference was not reported"
 say "stale reference reported"
+
+# A 1080p50 v210 flow with a 200 ms ring (10 grains; MXL's default history): every
+# grain has to arrive, not every other one (lab run 2026-10-03).
+SMALL_DOMAIN="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+SMALL_FLOW="22222222-2222-4222-8222-222222222222"
+"$WRITER" video "$A/small" "$SMALL_DOMAIN" "$SMALL_FLOW" 60 200 >"$BASE/writer3.log" 2>&1 &
+PIDS+=($!)
+sleep 1
+curl -sf --max-time 2 -X PUT http://127.0.0.1:18971/control \
+  -H 'content-type: application/json' \
+  -d "{\"master_enable\":true,\"mxl_domain_id\":\"$SMALL_DOMAIN\",\"mxl_flow_id\":\"$SMALL_FLOW\"}" >/dev/null
+if ! rate=$("$WRITER" rate "$B/mirror-$SMALL_DOMAIN" "$SMALL_FLOW" 10 45); then
+  echo "$rate"
+  echo "--- A ---"; grep -v '"level":"debug"' "$LOGA" | tail -n 20
+  echo "--- B ---"; grep -v '"level":"debug"' "$LOGB" | tail -n 20
+  echo "--- reps A ---"; curl -sf http://127.0.0.1:18095/api/v1/replications || true
+  fail "200 ms ring flow: fewer than 45 of 50 grains/s"
+fi
+say "200 ms ring flow: $rate"
 say "passed"
