@@ -176,6 +176,8 @@ struct InitiatorSlot
     std::string lastError;
     std::string state = "pending";
     std::map<std::string, mxlFabricsTargetInfo> targets;
+    // The target info each target was added with, to recognise a repeated request.
+    std::map<std::string, std::string> targetTexts;
 };
 
 class Session
@@ -562,9 +564,18 @@ public:
         auto existing = slot.targets.find(destHost);
         if (existing != slot.targets.end())
         {
+            // The destination repeats its request on every reconcile pass. Removing
+            // and adding the same target dropped the connection each time (every
+            // 0.4 s in the integration test), and a 200 ms ring lost half its grains
+            // while the initiator reconnected.
+            if (slot.targetTexts[destHost] == targetInfo)
+            {
+                return true;
+            }
             mxlFabricsInitiatorRemoveTarget(slot.initiator, existing->second);
             mxlFabricsFreeTargetInfo(existing->second);
             slot.targets.erase(existing);
+            slot.targetTexts.erase(destHost);
         }
         mxlFabricsTargetInfo info = nullptr;
         auto const status = mxlFabricsTargetInfoFromString(targetInfo.c_str(), &info);
@@ -587,6 +598,7 @@ public:
             return false;
         }
         slot.targets.emplace(destHost, info);
+        slot.targetTexts[destHost] = targetInfo;
         slot.connected = false;
         slot.state = "pending";
         publish();
@@ -608,6 +620,7 @@ public:
         mxlFabricsInitiatorRemoveTarget(it->second.initiator, found->second);
         mxlFabricsFreeTargetInfo(found->second);
         it->second.targets.erase(found);
+        it->second.targetTexts.erase(destHost);
         publish();
     }
 
@@ -662,6 +675,7 @@ private:
             mxlFabricsFreeTargetInfo(info);
         }
         slot.targets.clear();
+        slot.targetTexts.clear();
         if (slot.initiator != nullptr && fabrics_ != nullptr)
         {
             mxlFabricsDestroyInitiator(fabrics_, slot.initiator);
