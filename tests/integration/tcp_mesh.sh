@@ -94,8 +94,9 @@ wait_http() {
   return 1
 }
 
-wait_http http://127.0.0.1:18095/livez || fail "agent A did not start"
-wait_http http://127.0.0.1:18096/livez || fail "agent B did not start"
+# A busy CI runner can need more than 10 s to start both agents (seen once, 2026-10-04).
+wait_http http://127.0.0.1:18095/livez 150 || fail "agent A did not start"
+wait_http http://127.0.0.1:18096/livez 150 || fail "agent B did not start"
 say "agents up"
 
 "$WRITER" "$A/src" "$FLOW_ID" 2000 >"$BASE/writer.log" 2>&1 &
