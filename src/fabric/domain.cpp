@@ -680,21 +680,27 @@ private:
         {
             return;
         }
+        // MXL_ERR_NOT_READY means queued operations (connection setup, transfers)
+        // are still in progress. Until the connection completed once, wait for it;
+        // after that, keep queueing transfers. Waiting for every transfer to finish
+        // first sent about every other grain over tcp, and a 10-grain ring overtook
+        // the reader (lab run 2026-10-03).
         auto const progress = mxlFabricsInitiatorMakeProgressNonBlocking(slot.initiator);
-        if (progress == MXL_ERR_NOT_READY || progress == MXL_ERR_INTERRUPTED)
-        {
-            slot.state = "pending";
-            return;
-        }
-        if (progress != MXL_STATUS_OK)
+        bool const busy = progress == MXL_ERR_NOT_READY || progress == MXL_ERR_INTERRUPTED;
+        if (!busy && progress != MXL_STATUS_OK)
         {
             slot.errors += 1;
             slot.lastError = "progress " + statusText(progress);
             slot.state = "error";
             return;
         }
-        slot.connected = true;
-        slot.inFlight = false;
+        slot.connected = slot.connected || !busy;
+        slot.inFlight = busy;
+        if (!slot.connected)
+        {
+            slot.state = "pending";
+            return;
+        }
         if (slot.continuous)
         {
             pumpSamples(slot);
@@ -714,7 +720,17 @@ private:
         }
     }
 
+    // Every grain that is ready (bounded per pump), so a link catches up after a
+    // stall instead of moving one grain per pump.
     void pumpGrains(InitiatorSlot& slot)
+    {
+        for (int n = 0; n < 16 && pumpGrain(slot); ++n)
+        {
+        }
+    }
+
+    // One grain; true when it was queued for transfer.
+    bool pumpGrain(InitiatorSlot& slot)
     {
         if (!slot.primed)
         {
@@ -726,19 +742,19 @@ private:
         auto const status = mxlFlowReaderGetGrainNonBlocking(slot.reader, slot.nextIndex, &info, &payload);
         if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY || status == MXL_ERR_TIMEOUT || status == MXL_ERR_NOT_READY)
         {
-            return;
+            return false;
         }
         if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
         {
             slot.nextIndex = mxlGetCurrentIndex(&slot.info.common.grainRate);
-            return;
+            return false;
         }
         if (status != MXL_STATUS_OK)
         {
             slot.errors += 1;
             slot.lastError = "get grain " + statusText(status);
             slot.state = "error";
-            return;
+            return false;
         }
         std::uint16_t end = 0;
         if ((info.flags & MXL_GRAIN_FLAG_INVALID) == 0)
@@ -748,18 +764,19 @@ private:
         auto const transfer = mxlFabricsInitiatorTransferGrain(slot.initiator, slot.nextIndex, 0, end);
         if (transfer == MXL_ERR_NOT_READY)
         {
-            return;
+            return false;
         }
         if (transfer != MXL_STATUS_OK)
         {
             slot.errors += 1;
             slot.lastError = "transfer " + statusText(transfer);
             slot.state = "error";
-            return;
+            return false;
         }
         slot.grains += 1;
         slot.bytes += info.grainSize != 0 ? info.grainSize : end;
         slot.nextIndex += 1;
+        return true;
     }
 
     void pumpSamples(InitiatorSlot& slot)
