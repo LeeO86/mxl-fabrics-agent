@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.0.1
 
+- A replication target that the destination requests again with the same target info is kept. The destination repeats its `POST /replications` on every reconcile pass, and the source removed and re-added the target each time, which dropped the connection: links showed `pending`, and a flow with a 200 ms ring (MXL's default, 10 grains at 50p) lost half its grains while the initiator reconnected (lab run 2026-10-03). The integration test now replicates a 1080p50 flow with a 200 ms ring over `tcp`: 50.3 of 50 grains/s, none missed (26.3 before).
 - The agent raises its open-file soft limit to the hard limit at start. A mirror keeps one descriptor per grain, and with Docker's default soft limit of 1024 eager mirrors of about 30 flows failed with "Too many open files" (`mirror_writer_failed`, `mxlCreateFlowWriter failed (1)`).
 
 ## 1.0.0
