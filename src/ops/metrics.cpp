@@ -83,6 +83,17 @@ void Metrics::addCounter(std::string const& name, double value, std::map<std::st
     counters_.push_back(Series{name, labels, value});
 }
 
+void Metrics::setCounter(std::string const& name, double value, std::map<std::string, std::string> const& labels)
+{
+    std::lock_guard const lock{mu_};
+    if (auto* row = find(counters_, name, labels))
+    {
+        row->value = value;
+        return;
+    }
+    counters_.push_back(Series{name, labels, value});
+}
+
 void Metrics::observe(std::string const& name, double seconds, std::map<std::string, std::string> const& labels)
 {
     std::lock_guard const lock{mu_};

@@ -4,6 +4,7 @@
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
 
+#include <algorithm>
 #include <filesystem>
 
 namespace mfa
@@ -203,6 +204,37 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
             state.last_error = dom ? dom->error() : "domain";
             continue;
         }
+        // A destination without a new grain for 5 s while it is in error or its source is being written
+        // (a peer that hung, a queue pair out of retries, a closed connection that reports nothing) is set
+        // up again: the source gets new target info and replaces the dead connection. The wait doubles
+        // with each rebuild in a row (5, 10, 20, 40 s) so an unreachable source does not churn.
+        if (!state.target_info.empty())
+        {
+            auto const now = std::chrono::steady_clock::now();
+            for (auto const& row : dom->rows())
+            {
+                if (row.key != key || row.role != "destination")
+                {
+                    continue;
+                }
+                if (row.grains != state.seen_grains)
+                {
+                    state.seen_grains = row.grains;
+                    state.progress_at = now;
+                    state.stalls = 0;
+                }
+                else if ((row.state == "error" || pull.source_active) &&
+                         now - state.progress_at > std::chrono::seconds(5LL << std::min<std::uint64_t>(state.stalls, 3)))
+                {
+                    log::warn("replication_restarted",
+                              {{"peer", pull.peer}, {"flow_id", pull.flow_id}, {"state", row.state}, {"error", row.last_error}});
+                    dom->destroyTarget(key);
+                    state.target_info.clear();
+                    state.restarts += 1;
+                    state.stalls += 1;
+                }
+            }
+        }
         if (state.target_info.empty())
         {
             FabricEndpoint ep = endpoint(pull.peer);
@@ -237,6 +269,8 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
                 continue;
             }
             state.target_info = setup.target_info;
+            state.seen_grains = 0;
+            state.progress_at = std::chrono::steady_clock::now();
             state.provider = setup.provider_used;
             state.fallback = setup.fallback;
             state.state = "pending";
@@ -272,6 +306,7 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
             state.replication_id = json::asString(obj, "replication_id").value_or(state.replication_id);
             state.state = json::asString(obj, "state").value_or("pending");
         }
+        state.last_error.clear(); // the peer answered: an earlier "recv" or "http 500" is over
         if (state.state == "active")
         {
             state.backoff = std::chrono::milliseconds(250);

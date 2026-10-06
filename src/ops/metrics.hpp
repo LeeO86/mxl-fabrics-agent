@@ -13,6 +13,8 @@ class Metrics
 public:
     void setGauge(std::string const& name, double value, std::map<std::string, std::string> const& labels = {});
     void addCounter(std::string const& name, double value, std::map<std::string, std::string> const& labels = {});
+    /// A counter whose total is kept elsewhere (a replication's grains, bytes, errors, restarts).
+    void setCounter(std::string const& name, double value, std::map<std::string, std::string> const& labels = {});
     void observe(std::string const& name, double seconds, std::map<std::string, std::string> const& labels = {});
     std::string render() const;
 

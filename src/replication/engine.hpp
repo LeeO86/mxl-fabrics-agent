@@ -26,6 +26,7 @@ struct PullRequest
     bool allow_tcp_fallback = false;
     std::string peer_boot;
     std::uint64_t peer_revision = 0;
+    bool source_active = false; // a writer holds the origin flow (peer inventory): grains are expected
 };
 
 struct ReplicaView
@@ -79,6 +80,9 @@ private:
         std::chrono::milliseconds backoff{250};
         std::uint64_t restarts = 0;
         std::string last_error;
+        std::uint64_t seen_grains = 0;                         // destination row's grains at the last check
+        std::chrono::steady_clock::time_point progress_at{};   // when they last changed (or the target was set up)
+        std::uint64_t stalls = 0;                              // rebuilds in a row without a new grain
         bool fallback = false;
         std::string provider;
     };

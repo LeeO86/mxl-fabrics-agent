@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.3
+
+- A dead link is set up again. A destination without a new grain for 5 s while it is in `error` or its source flow is being written (a peer that hung, a queue pair out of retries, a closed connection that reports nothing) tears its target down and repeats the handshake; the source replaces the dead connection with the new target. `restarts` counts it, the log says `replication_restarted`. The wait doubles with each rebuild in a row (5, 10, 20, 40 s). Before, such a link stayed `error` (or even `active` without grains) with `restarts` 0 until the agent restarted.
+- `last_error` is cleared when a link works again: a source or destination pass without a new error is `active` again (a destination in `error` also needs new grains), and a successful handshake clears `recv` or `http …`. The `errors` count keeps the history.
+- `/metrics` exports `replication_grains_total`, `replication_bytes_total` and `replication_errors_total` per flow, peer and role, and `replication_restarts_total` per destination. Before, `replication_grains_total` was always 0 and the other three were missing. `replication_errors_total` has no `kind` label (SPEC §12 now says so; the Grafana error panel groups by flow and role); the histograms `grain_transfer_seconds` and `setup_seconds` and `nmos_poll_errors_total` are marked "not implemented yet".
+
 ## 1.0.2
 
 - The image contains `ibverbs-providers`, the user-space RDMA drivers (`irdma` for Intel E810, `mlx5` for ConnectX, `rxe`) and `/etc/libibverbs.d`. Without them libibverbs found no device even with `/dev/infiniband` mapped, and an agent with `DEFAULT_PROVIDER=verbs` exited with `no_fabric_provider`. `ibverbs-utils` adds `ibv_devices` and `ibv_devinfo` to check what the container sees. Lab check over soft-RoCE (`rxe` on one host, two agents): 4 flows of 1080p50 replicate over `verbs` at 50.2 grains/s, lag 0, no errors.

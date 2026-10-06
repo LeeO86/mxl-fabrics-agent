@@ -714,6 +714,7 @@ private:
         }
         slot.connected = true;
         slot.inFlight = false;
+        auto const errorsBefore = slot.errors;
         if (slot.continuous)
         {
             pumpSamples(slot);
@@ -727,9 +728,12 @@ private:
         {
             slot.head = runtime.headIndex;
         }
-        if (slot.state != "error")
+        // A pass without a new error is a working link again: an earlier error is history (the
+        // errors counter keeps it), not the state.
+        if (slot.errors == errorsBefore)
         {
             slot.state = "active";
+            slot.lastError.clear();
         }
     }
 
@@ -843,6 +847,8 @@ private:
         {
             return;
         }
+        auto const errorsBefore = slot.errors;
+        auto const grainsBefore = slot.grains;
         if (writer->second.continuous)
         {
             for (int n = 0; n < 32; ++n)
@@ -948,8 +954,14 @@ private:
                 ++committed;
             }
         }
-        if (slot.state != "error")
+        // Back from error only when grains arrive again: a pass without data must not make a dead
+        // link look active (the replication engine sets it up again, see ReplicationEngine::reconcile).
+        if (slot.errors == errorsBefore && (slot.state != "error" || slot.grains > grainsBefore))
         {
+            if (slot.state == "error")
+            {
+                slot.lastError.clear();
+            }
             slot.state = slot.grains > 0 ? "active" : "pending";
         }
     }

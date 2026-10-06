@@ -416,6 +416,16 @@ Inventory exchange: each agent polls peers' `/inventory` every
 If the source restarts, the destination detects it (inventory `revision` reset
 or `/info` boot id change) and repeats the handshake with a fresh target.
 
+A link is `error` only while errors occur: a pass without a new error returns it
+to `active` (a destination also needs new grains) and clears `last_error`; the
+`errors` count keeps the history. A destination without a new grain for 5 s while
+it is in `error` or its source flow is being written (the peer inventory shows a
+writer: a peer that hung, a queue pair out of retries, a closed connection that
+reports nothing) tears its target down and repeats the handshake with a fresh
+target, which the source puts in place of the dead connection; `restarts` counts
+it. The wait doubles with each rebuild in a row (5, 10, 20, 40 s). A successful
+handshake clears the destination's last handshake error (`recv`, `http …`).
+
 ---
 
 ## 9. Replication engine
@@ -567,13 +577,13 @@ Tabs:
 | `replications_active` | gauge | role (source/destination), provider |
 | `replication_grains_total` | counter | flow_id, peer, role |
 | `replication_bytes_total` | counter | flow_id, peer, role |
-| `replication_errors_total` | counter | flow_id, peer, role, kind |
+| `replication_errors_total` | counter | flow_id, peer, role (no `kind`: errors are counted, not classified) |
 | `replication_restarts_total` | counter | flow_id, peer |
 | `replication_lag_grains` | gauge | flow_id, peer |
-| `grain_transfer_seconds` | histogram | provider |
-| `setup_seconds` | histogram | phase (target_setup, handshake, first_grain) |
+| `grain_transfer_seconds` | histogram | provider (not implemented yet) |
+| `setup_seconds` | histogram | phase (target_setup, handshake, first_grain) (not implemented yet) |
 | `nmos_registry_up` | gauge | — |
-| `nmos_poll_errors_total` | counter | — |
+| `nmos_poll_errors_total` | counter | — (not implemented yet) |
 | `tai_offset_seconds` | gauge | — |
 | `completion_queue_depth` | gauge | flow_id |
 

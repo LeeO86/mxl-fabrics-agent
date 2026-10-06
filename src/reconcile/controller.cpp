@@ -471,6 +471,7 @@ void Controller::tick()
             pull.allow_tcp_fallback = cfg.provider_fallback == "tcp";
             pull.peer_boot = remote.peer->boot_id;
             pull.peer_revision = remote.peer->revision;
+            pull.source_active = remote.flow->active;
             pulls.push_back(std::move(pull));
         }
     }
@@ -580,7 +581,15 @@ void Controller::renderMetrics()
         {
             metrics_.setGauge("replication_lag_grains", static_cast<double>(row.lag), {{"flow_id", row.flow_id}, {"peer", row.peer}});
             metrics_.setGauge("completion_queue_depth", row.cq_depth, {{"flow_id", row.flow_id}});
-            metrics_.addCounter("replication_grains_total", 0, {{"flow_id", row.flow_id}, {"peer", row.peer}, {"role", row.role}});
+            // The totals live in the replication rows (they start again with a new replication).
+            std::map<std::string, std::string> const labels{{"flow_id", row.flow_id}, {"peer", row.peer}, {"role", row.role}};
+            metrics_.setCounter("replication_grains_total", static_cast<double>(row.grains), labels);
+            metrics_.setCounter("replication_bytes_total", static_cast<double>(row.bytes), labels);
+            metrics_.setCounter("replication_errors_total", static_cast<double>(row.errors), labels);
+            if (row.role == "destination")
+            {
+                metrics_.setCounter("replication_restarts_total", static_cast<double>(row.restarts), {{"flow_id", row.flow_id}, {"peer", row.peer}});
+            }
         }
     }
     for (auto const& [key, count] : reps)
