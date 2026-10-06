@@ -283,7 +283,8 @@ activation race between IS-05 activation and replication start.
 
 - Mirror domain path: `<MXL_ROOT>/mirror-<source-domain-id>/` — a sibling of the
   local domains, so media functions scanning `MXL_ROOT` find it.
-- `domain_def.json` carries the **source** domain id, plus a marker object:
+- `domain_def.json` carries the **source** domain id, a label, a description
+  and empty tags (BCP-007-03), plus a marker object:
   `"x-mxl-fabrics-agent": {"mirror": true, "source_host_id": "...", "owner_host_id": "<HOST_ID>"}`.
   Readers ignore unknown fields; the agent uses the marker for classification.
 - `options.json` is copied verbatim from the source domain, so ring geometry
@@ -328,8 +329,13 @@ mirror is not created, and status/metric/log report `insufficient_space`.
   with a foreign `owner_host_id` are left untouched and reported as conflict.
 - On clean shutdown (SIGTERM) the agent stops replications and, if
   `MXL_CLEANUP_ON_EXIT=true` (alias `CLEANUP_MIRRORS_ON_EXIT`, default false),
-  removes only mirror directories it owns. An existing `domain_def.json` whose
-  id does not match the mirror is not overwritten.
+  removes only mirror directories it owns. With `false` it keeps the mirror
+  flows: MXL deletes a flow when its last writer is released or its instance
+  destroyed, so the agent leaves both to the process exit, and the next start
+  re-opens the same flows (readers keep them; a re-created flow would leave
+  readers that do not reopen on `MXL_ERR_FLOW_INVALID` on the old one). An
+  existing `domain_def.json` whose id does not match the mirror is not
+  overwritten.
 
 ---
 
@@ -416,6 +422,16 @@ Inventory exchange: each agent polls peers' `/inventory` every
 If the source restarts, the destination detects it (inventory `revision` reset
 or `/info` boot id change) and repeats the handshake with a fresh target.
 
+A link is `error` only while errors occur: a pass without a new error returns it
+to `active` (a destination also needs new grains) and clears `last_error`; the
+`errors` count keeps the history. A destination without a new grain for 5 s while
+it is in `error` or its source flow is being written (the peer inventory shows a
+writer: a peer that hung, a queue pair out of retries, a closed connection that
+reports nothing) tears its target down and repeats the handshake with a fresh
+target, which the source puts in place of the dead connection; `restarts` counts
+it. The wait doubles with each rebuild in a row (5, 10, 20, 40 s). A successful
+handshake clears the destination's last handshake error (`recv`, `http …`).
+
 ---
 
 ## 9. Replication engine
@@ -442,9 +458,11 @@ or `/info` boot id change) and repeats the handshake with a fresh target.
   (PTP/chrony with correct kernel TAI offset). The agent checks `CLOCK_TAI`
   offset sanity at startup and exposes it as a metric; replicated readers on
   the destination will otherwise read the wrong grains or none.
-- The agent measures replication lag as `origin head index − mirror head index`
-  (from the source's reported head and the local mirror head) and transfer
-  latency per grain where possible.
+- The agent measures replication lag as `origin head index − mirror head index`.
+  Origin writers commit at the current TAI index, so the destination uses the
+  flow's current index (`mxlGetCurrentIndex` at the flow rate) as the origin
+  head; for continuous flows the lag counts transfer batches. It is 0 while no
+  writer holds the origin flow and before the first grain.
 
 ---
 
@@ -567,13 +585,13 @@ Tabs:
 | `replications_active` | gauge | role (source/destination), provider |
 | `replication_grains_total` | counter | flow_id, peer, role |
 | `replication_bytes_total` | counter | flow_id, peer, role |
-| `replication_errors_total` | counter | flow_id, peer, role, kind |
+| `replication_errors_total` | counter | flow_id, peer, role (no `kind`: errors are counted, not classified) |
 | `replication_restarts_total` | counter | flow_id, peer |
 | `replication_lag_grains` | gauge | flow_id, peer |
-| `grain_transfer_seconds` | histogram | provider |
-| `setup_seconds` | histogram | phase (target_setup, handshake, first_grain) |
+| `grain_transfer_seconds` | histogram | provider (not implemented yet) |
+| `setup_seconds` | histogram | phase (target_setup, handshake, first_grain) (not implemented yet) |
 | `nmos_registry_up` | gauge | — |
-| `nmos_poll_errors_total` | counter | — |
+| `nmos_poll_errors_total` | counter | — (not implemented yet) |
 | `tai_offset_seconds` | gauge | — |
 | `completion_queue_depth` | gauge | flow_id |
 

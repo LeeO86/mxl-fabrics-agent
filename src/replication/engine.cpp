@@ -4,6 +4,7 @@
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
 
+#include <algorithm>
 #include <filesystem>
 
 namespace mfa
@@ -95,9 +96,16 @@ void ReplicationEngine::releaseDomain(std::string const& path)
     domains_.erase(path);
 }
 
-void ReplicationEngine::releaseAll()
+void ReplicationEngine::releaseAll(bool keepFlows)
 {
     std::lock_guard const lock{mu_};
+    if (keepFlows)
+    {
+        for (auto const& [_, dom] : domains_)
+        {
+            dom->keepFlowsOnExit();
+        }
+    }
     domains_.clear();
 }
 
@@ -192,6 +200,7 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
         }
         state.peer_boot = pull.peer_boot;
         state.peer_revision = pull.peer_revision;
+        state.source_active = pull.source_active;
         if (std::chrono::steady_clock::now() < state.next_attempt && state.state == "error")
         {
             continue;
@@ -202,6 +211,37 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
             state.state = "error";
             state.last_error = dom ? dom->error() : "domain";
             continue;
+        }
+        // A destination without a new grain for 5 s while it is in error or its source is being written
+        // (a peer that hung, a queue pair out of retries, a closed connection that reports nothing) is set
+        // up again: the source gets new target info and replaces the dead connection. The wait doubles
+        // with each rebuild in a row (5, 10, 20, 40 s) so an unreachable source does not churn.
+        if (!state.target_info.empty())
+        {
+            auto const now = std::chrono::steady_clock::now();
+            for (auto const& row : dom->rows())
+            {
+                if (row.key != key || row.role != "destination")
+                {
+                    continue;
+                }
+                if (row.grains != state.seen_grains)
+                {
+                    state.seen_grains = row.grains;
+                    state.progress_at = now;
+                    state.stalls = 0;
+                }
+                else if ((row.state == "error" || pull.source_active) &&
+                         now - state.progress_at > std::chrono::seconds(5LL << std::min<std::uint64_t>(state.stalls, 3)))
+                {
+                    log::warn("replication_restarted",
+                              {{"peer", pull.peer}, {"flow_id", pull.flow_id}, {"state", row.state}, {"error", row.last_error}});
+                    dom->destroyTarget(key);
+                    state.target_info.clear();
+                    state.restarts += 1;
+                    state.stalls += 1;
+                }
+            }
         }
         if (state.target_info.empty())
         {
@@ -237,6 +277,8 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
                 continue;
             }
             state.target_info = setup.target_info;
+            state.seen_grains = 0;
+            state.progress_at = std::chrono::steady_clock::now();
             state.provider = setup.provider_used;
             state.fallback = setup.fallback;
             state.state = "pending";
@@ -272,6 +314,7 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
             state.replication_id = json::asString(obj, "replication_id").value_or(state.replication_id);
             state.state = json::asString(obj, "state").value_or("pending");
         }
+        state.last_error.clear(); // the peer answered: an earlier "recv" or "http 500" is over
         if (state.state == "active")
         {
             state.backoff = std::chrono::milliseconds(250);
@@ -372,7 +415,6 @@ bool ReplicationEngine::eraseTarget(std::string const& replicationId, std::strin
 std::vector<ReplicaView> ReplicationEngine::status() const
 {
     std::vector<ReplicaView> out;
-    std::map<std::string, std::uint64_t> sourceHead;
     for (auto const& [_, dom] : domains_)
     {
         for (auto const& row : dom->rows())
@@ -391,22 +433,8 @@ std::vector<ReplicaView> ReplicationEngine::status() const
             view.last_error = row.last_error;
             view.fallback = row.fallback;
             view.cq_depth = row.cq_depth;
-            if (row.role == "source")
-            {
-                sourceHead[row.flow_id] = row.head;
-            }
+            view.lag = static_cast<std::int64_t>(row.behind);
             out.push_back(std::move(view));
-        }
-    }
-    for (auto& view : out)
-    {
-        if (view.role == "destination")
-        {
-            auto const it = sourceHead.find(view.flow_id);
-            if (it != sourceHead.end() && it->second >= view.head)
-            {
-                view.lag = static_cast<std::int64_t>(it->second - view.head);
-            }
         }
     }
     for (auto const& [key, state] : dest_)
@@ -418,6 +446,10 @@ std::vector<ReplicaView> ReplicationEngine::status() const
             {
                 view.state = state.state == "active" ? view.state : state.state;
                 view.restarts = state.restarts;
+                if (!state.source_active)
+                {
+                    view.lag = 0; // nobody writes the origin flow: the mirror is not behind
+                }
                 view.fallback = state.fallback || view.fallback;
                 if (!state.provider.empty())
                 {

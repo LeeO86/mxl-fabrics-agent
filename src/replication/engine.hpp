@@ -26,6 +26,7 @@ struct PullRequest
     bool allow_tcp_fallback = false;
     std::string peer_boot;
     std::uint64_t peer_revision = 0;
+    bool source_active = false; // a writer holds the origin flow (peer inventory): grains are expected
 };
 
 struct ReplicaView
@@ -61,7 +62,7 @@ public:
     std::vector<ReplicaView> status() const;
     std::shared_ptr<FabricDomain> domain(std::string const& path);
     void releaseDomain(std::string const& path);
-    void releaseAll();
+    void releaseAll(bool keepFlows = false);
     bool ensureWriter(std::string const& path, std::string const& flowDef, std::string* error);
     void releaseWriter(std::string const& path, std::string const& flowId);
 
@@ -79,6 +80,10 @@ private:
         std::chrono::milliseconds backoff{250};
         std::uint64_t restarts = 0;
         std::string last_error;
+        std::uint64_t seen_grains = 0;                         // destination row's grains at the last check
+        std::chrono::steady_clock::time_point progress_at{};   // when they last changed (or the target was set up)
+        std::uint64_t stalls = 0;                              // rebuilds in a row without a new grain
+        bool source_active = false;                            // from the last pull request
         bool fallback = false;
         std::string provider;
     };
