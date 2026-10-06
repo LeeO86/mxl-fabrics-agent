@@ -697,7 +697,12 @@ private:
         auto const progress = mxlFabricsInitiatorMakeProgressNonBlocking(slot.initiator);
         if (progress == MXL_ERR_NOT_READY || progress == MXL_ERR_INTERRUPTED)
         {
-            slot.state = "pending";
+            // NOT_READY also means transfers still in flight (verbs, most passes).
+            // Only an initiator that never connected to its current targets is pending.
+            if (!slot.connected)
+            {
+                slot.state = "pending";
+            }
             return;
         }
         if (progress != MXL_STATUS_OK)

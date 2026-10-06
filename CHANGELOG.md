@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2
+
+- The image contains `ibverbs-providers`, the user-space RDMA drivers (`irdma` for Intel E810, `mlx5` for ConnectX, `rxe`) and `/etc/libibverbs.d`. Without them libibverbs found no device even with `/dev/infiniband` mapped, and an agent with `DEFAULT_PROVIDER=verbs` exited with `no_fabric_provider`. `ibverbs-utils` adds `ibv_devices` and `ibv_devinfo` to check what the container sees. Lab check over soft-RoCE (`rxe` on one host, two agents): 4 flows of 1080p50 replicate over `verbs` at 50.2 grains/s, lag 0, no errors.
+- A connected source link stays `active`. `mxlFabricsInitiatorMakeProgressNonBlocking` returns `MXL_ERR_NOT_READY` while transfers are still in flight, which on `verbs` is most passes; the agent showed `pending` for those, and the destination copied it, so links that moved 50 grains/s flipped between `active` and `pending` in `/api/v1/replications` and the web UI (on `tcp` too, less often). Only a link that has not connected to its current target is `pending`. The `replications_active` metric counted both states and does not change.
+
 ## 1.0.1
 
 - A replication target that the destination requests again with the same target info is kept. The destination repeats its `POST /replications` on every reconcile pass, and the source removed and re-added the target each time, which dropped the connection: links showed `pending`, and a flow with a 200 ms ring (MXL's default, 10 grains at 50p) lost half its grains while the initiator reconnected (lab run 2026-10-03). The integration test now replicates a 1080p50 flow with a 200 ms ring over `tcp`: 50.3 of 50 grains/s, none missed (26.3 before).

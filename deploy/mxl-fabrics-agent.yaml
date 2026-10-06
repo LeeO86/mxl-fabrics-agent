@@ -41,7 +41,7 @@ spec:
         supplementalGroups: [1000]
       containers:
         - name: agent
-          image: ghcr.io/leeo86/mxl-fabrics-agent:1.0.1
+          image: ghcr.io/leeo86/mxl-fabrics-agent:1.0.2
           securityContext:
             capabilities:
               add: ["IPC_LOCK"]

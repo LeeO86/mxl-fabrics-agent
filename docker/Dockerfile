@@ -67,9 +67,12 @@ RUN cmake -S /src -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     && /src/build/unit-tests
 
 FROM ubuntu:24.04 AS runtime
+# ibverbs-providers holds the user-space NIC drivers (irdma for E810, mlx5, rxe) and
+# /etc/libibverbs.d; without it libibverbs finds no device and verbs has no provider.
+# ibverbs-utils: ibv_devices and ibv_devinfo, to check what the container sees.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates curl \
-        libibverbs1 librdmacm1 rdma-core \
+        libibverbs1 librdmacm1 rdma-core ibverbs-providers ibverbs-utils \
         libcpprest2.10 libboost-chrono1.83.0t64 libboost-thread1.83.0 \
         libssl3t64 libavahi-compat-libdnssd1 \
     && rm -rf /var/lib/apt/lists/*
