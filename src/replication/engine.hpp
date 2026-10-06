@@ -65,8 +65,6 @@ public:
     void releaseAll(bool keepFlows = false);
     // grain_transfer_seconds of source grains; set before the first domain is opened.
     void setTransferObserver(TransferObserver observer);
-    int pacingBatches() const { return pacingBatches_; } // in effect since start; 0 = off
-    double pacingSpread() const { return pacingSpread_; }
     bool ensureWriter(std::string const& path, std::string const& flowDef, std::string* error);
     void releaseWriter(std::string const& path, std::string const& flowId);
 
@@ -105,7 +103,5 @@ private:
     std::map<std::string, std::uint64_t> sourceRestarts_;
     TransferObserver transferObserver_;
     int nextPort_;
-    int pacingBatches_;
-    double pacingSpread_;
 };
 } // namespace mfa

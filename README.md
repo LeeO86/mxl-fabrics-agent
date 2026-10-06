@@ -143,9 +143,6 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | `PEERS` | `[]` | JSON array of peer links |
 | `PEER_POLL_INTERVAL_MS` | 2000 | Peer inventory poll |
 | `RELEASE_GRACE_MS` | 2000 | Delay before releasing a target |
-| `TRANSFER_PACING` | off | `frame` sends each video grain in slice batches spread over part of the frame time instead of one burst at line rate (for receiving NICs that drop bursts, e.g. E810 at PCIe Gen3 x8). Adds up to the spread to the latency. Restart required |
-| `TRANSFER_PACING_SPREAD` | 0.5 | Share of the grain duration the batches are spread over, 0.1–0.9. Restart required |
-| `TRANSFER_PACING_BATCHES` | 8 | Slice batches per grain, 2–64. Restart required |
 | `NMOS_ENABLE` | true | Register this node and observe the registry |
 | `NMOS_SEED` | empty | UUIDv5 input for the node id. Unset keeps UUIDv5(`HOST_ID`) |
 | `NMOS_LABEL` | `HOST_ID` | Node label. This agent has no device |
