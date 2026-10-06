@@ -836,6 +836,10 @@ HttpResponse Controller::handle(HttpRequest const& request)
         picojson::object response;
         response["replication_id"] = picojson::value(result.replication_id);
         response["state"] = picojson::value(result.state);
+        if (result.origin_head)
+        {
+            response["origin_head"] = picojson::value(static_cast<double>(*result.origin_head));
+        }
         publish("replication", picojson::value(response).serialize());
         return json(result.status == 0 ? 201 : result.status, picojson::value(response).serialize());
     }

@@ -686,6 +686,18 @@ public:
         return rows_;
     }
 
+    std::optional<std::uint64_t> originHead(std::string const& key) const
+    {
+        auto const it = initiators_.find(key);
+        mxlFlowRuntimeInfo runtime{};
+        if (it == initiators_.end() || it->second.reader == nullptr ||
+            mxlFlowReaderGetRuntimeInfo(it->second.reader, &runtime) != MXL_STATUS_OK || runtime.headIndex == MXL_UNDEFINED_INDEX)
+        {
+            return std::nullopt;
+        }
+        return runtime.headIndex;
+    }
+
     void setTransferObserver(TransferObserver observer)
     {
         transferObserver_ = std::move(observer);
@@ -1410,6 +1422,13 @@ void FabricDomain::removeInitiatorTarget(std::string const& key, std::string con
 void FabricDomain::destroyInitiator(std::string const& key)
 {
     impl_->call([&](Session& session) { session.destroyInitiator(key); });
+}
+
+std::optional<std::uint64_t> FabricDomain::originHead(std::string const& key)
+{
+    std::optional<std::uint64_t> head;
+    impl_->call([&](Session& session) { head = session.originHead(key); });
+    return head;
 }
 
 void FabricDomain::keepFlowsOnExit()

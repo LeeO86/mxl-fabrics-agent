@@ -425,11 +425,14 @@ or `/info` boot id change) and repeats the handshake with a fresh target.
 A link is `error` only while errors occur: a pass without a new error returns it
 to `active` (a destination also needs new grains) and clears `last_error`; the
 `errors` count keeps the history. A destination without a new grain for 5 s while
-it is in `error` or its source flow is being written (the peer inventory shows a
-writer: a peer that hung, a queue pair out of retries, a closed connection that
-reports nothing) tears its target down and repeats the handshake with a fresh
-target, which the source puts in place of the dead connection; `restarts` counts
-it. The wait doubles with each rebuild in a row (5, 10, 20, 40 s). A successful
+it is in `error` or the origin moved on after its last grain (a peer that hung,
+a queue pair out of retries, a closed connection that reports nothing) tears its
+target down and repeats the handshake with a fresh target, which the source puts
+in place of the dead connection; `restarts` counts it. The source returns the
+origin flow's head index in every `POST /replications` answer (`origin_head`);
+a writer that holds the flow but writes nothing (no input signal) is not a dead
+link. With a source that sends no `origin_head` (before 1.1.0) a writer on the
+origin flow counts as moving on. The wait doubles with each rebuild in a row (5, 10, 20, 40 s). A successful
 handshake clears the destination's last handshake error (`recv`, `http …`).
 
 ---

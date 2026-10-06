@@ -229,10 +229,12 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
             state.last_error = dom ? dom->error() : "domain";
             continue;
         }
-        // A destination without a new grain for 5 s while it is in error or its source is being written
-        // (a peer that hung, a queue pair out of retries, a closed connection that reports nothing) is set
-        // up again: the source gets new target info and replaces the dead connection. The wait doubles
-        // with each rebuild in a row (5, 10, 20, 40 s) so an unreachable source does not churn.
+        // A destination without a new grain for 5 s while it is in error or the origin moved on (a peer
+        // that hung, a queue pair out of retries, a closed connection that reports nothing) is set up
+        // again: the source gets new target info and replaces the dead connection. The wait doubles with
+        // each rebuild in a row (5, 10, 20, 40 s) so an unreachable source does not churn. "Moved on" is
+        // the origin head the source reports in the handshake; a holder that writes nothing (decklink
+        // without a signal) is not a dead link. Sources before 1.1.0 report no head: a writer counts.
         if (!state.target_info.empty())
         {
             auto const now = std::chrono::steady_clock::now();
@@ -248,7 +250,7 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
                     state.progress_at = now;
                     state.stalls = 0;
                 }
-                else if ((row.state == "error" || pull.source_active) &&
+                else if ((row.state == "error" || (state.origin_head ? state.origin_moved_at > state.progress_at : pull.source_active)) &&
                          now - state.progress_at > std::chrono::seconds(5LL << std::min<std::uint64_t>(state.stalls, 3)))
                 {
                     log::warn("replication_restarted",
@@ -330,6 +332,15 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
             auto const& obj = parsed.get<picojson::object>();
             state.replication_id = json::asString(obj, "replication_id").value_or(state.replication_id);
             state.state = json::asString(obj, "state").value_or("pending");
+            if (auto const head = obj.find("origin_head"); head != obj.end() && head->second.is<double>())
+            {
+                auto const value = static_cast<std::uint64_t>(head->second.get<double>());
+                if (state.origin_head && *state.origin_head != value)
+                {
+                    state.origin_moved_at = std::chrono::steady_clock::now();
+                }
+                state.origin_head = value;
+            }
         }
         state.last_error.clear(); // the peer answered: an earlier "recv" or "http 500" is over
         if (state.state == "active")
@@ -380,6 +391,7 @@ PostResult ReplicationEngine::post(PostRequest const& request, std::string const
         log::warn("add_target_failed", {{"flow_id", request.flow_id}, {"peer", request.dest_host_id}, {"error", error}});
         return result;
     }
+    result.origin_head = dom->originHead(result.replication_id);
     for (auto const& row : dom->rows())
     {
         if (row.key == result.replication_id && row.state == "active")

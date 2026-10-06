@@ -88,6 +88,8 @@ private:
         std::chrono::steady_clock::time_point progress_at{};   // when they last changed (or the target was set up)
         std::uint64_t stalls = 0;                              // rebuilds in a row without a new grain
         bool source_active = false;                            // from the last pull request
+        std::optional<std::uint64_t> origin_head;              // from the source's handshake answer (1.1.0 sources)
+        std::chrono::steady_clock::time_point origin_moved_at{}; // when that head last changed
         bool fallback = false;
         std::string provider;
     };

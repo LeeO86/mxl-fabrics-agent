@@ -4,6 +4,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,8 @@ public:
     bool addInitiatorTarget(std::string const& key, std::string const& destHost, std::string const& targetInfo, std::string* error);
     void removeInitiatorTarget(std::string const& key, std::string const& destHost);
     void destroyInitiator(std::string const& key);
+    // Head index of the flow a source replication reads (also while its transfers are stuck).
+    std::optional<std::uint64_t> originHead(std::string const& key);
     // Shutdown without releasing writers or the MXL instance (MXL would delete the flows).
     void keepFlowsOnExit();
     void setTransferObserver(TransferObserver observer);
