@@ -478,7 +478,8 @@ handshake clears the destination's last handshake error (`recv`, `http …`).
   Origin writers commit at the current TAI index, so the destination uses the
   flow's current index (`mxlGetCurrentIndex` at the flow rate) as the origin
   head; for continuous flows the lag counts transfer batches. It is 0 while no
-  writer holds the origin flow and before the first grain.
+  writer holds the origin flow, while the origin head the source reports has
+  not moved for 2 s (a holder without a signal), and before the first grain.
 
 ---
 

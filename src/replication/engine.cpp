@@ -475,9 +475,12 @@ std::vector<ReplicaView> ReplicationEngine::status() const
             {
                 view.state = state.state == "active" ? view.state : state.state;
                 view.restarts = state.restarts;
-                if (!state.source_active)
+                // Nobody writes the origin flow (no writer, or its head has not moved for 2 s): the
+                // mirror is not behind, although the TAI index runs on.
+                if (!state.source_active ||
+                    (state.origin_head && std::chrono::steady_clock::now() - state.origin_moved_at > std::chrono::seconds(2)))
                 {
-                    view.lag = 0; // nobody writes the origin flow: the mirror is not behind
+                    view.lag = 0;
                 }
                 view.fallback = state.fallback || view.fallback;
                 if (!state.provider.empty())
