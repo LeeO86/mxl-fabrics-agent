@@ -20,6 +20,7 @@
     {"id": 3, "type": "timeseries", "title": "Lag", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "targets": [{"expr": "mxl_fabrics_agent_replication_lag_grains{host_id=\"$host_id\"}"}]},
     {"id": 4, "type": "timeseries", "title": "Errors", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "targets": [{"expr": "sum by (flow_id, role) (rate(mxl_fabrics_agent_replication_errors_total{host_id=\"$host_id\"}[5m]))"}]},
     {"id": 5, "type": "timeseries", "title": "tmpfs free", "gridPos": {"h": 6, "w": 8, "x": 0, "y": 16}, "targets": [{"expr": "mxl_fabrics_agent_tmpfs_free_bytes{host_id=\"$host_id\"}"}]},
-    {"id": 6, "type": "stat", "title": "TAI offset", "gridPos": {"h": 6, "w": 4, "x": 8, "y": 16}, "targets": [{"expr": "mxl_fabrics_agent_tai_offset_seconds{host_id=\"$host_id\"}"}]}
+    {"id": 6, "type": "stat", "title": "TAI offset", "gridPos": {"h": 6, "w": 4, "x": 8, "y": 16}, "targets": [{"expr": "mxl_fabrics_agent_tai_offset_seconds{host_id=\"$host_id\"}"}]},
+    {"id": 7, "type": "timeseries", "title": "Grain transfer time p95", "gridPos": {"h": 6, "w": 12, "x": 12, "y": 16}, "targets": [{"expr": "histogram_quantile(0.95, sum by (le, provider) (rate(mxl_fabrics_agent_grain_transfer_seconds_bucket{host_id=\"$host_id\"}[5m])))"}]}
   ]
 }

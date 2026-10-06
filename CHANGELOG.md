@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0
+
+- Optional transfer pacing: `TRANSFER_PACING=frame` sends each complete video or data grain in `TRANSFER_PACING_BATCHES` slice batches (default 8) whose starts are spread over `TRANSFER_PACING_SPREAD` of the grain duration (default 0.5, 0.1–0.9), instead of one burst at line rate. For receivers whose NIC cannot move bursts from two ports into memory at once (on the platform: E810 at PCIe Gen3 x8 discarding RoCE packets). Uses MXL's slice-range transfer; no MXL change. Adds up to the spread to the latency (10 ms at 50p with the default). Default `off`: nothing changes unless it is set. Restart required.
+- `grain_transfer_seconds{provider}` histogram (source grains, first transfer to completion; with pacing the spread included) and the gauges `transfer_pacing_batches` (0 = off) and `transfer_pacing_spread`. The Grafana dashboard shows the p95 transfer time.
+- A destination counts a grain in `replication_grains_total` and `replication_bytes_total` once, also when it arrives in several batches.
+- A link whose origin writes nothing is no longer rebuilt. 1.0.3 rebuilt a destination without new grains whenever a writer held the origin flow; a decklink input without a signal holds its flow but writes nothing, so its links were rebuilt every 5–40 s (16 times in 15 minutes on the platform) and `replication_restarts_total` rose. The source now returns the origin head index in the handshake answer (`origin_head`), and the destination rebuilds only when the origin moved on after its last grain (or the link is `error`). With a source before 1.1.0 the 1.0.3 rule stays. `lag_grains` is 0 while that origin head stands still (it grew with the TAI index before).
+
 ## 1.0.3
 
 - Mirror flows survive an agent restart when `MXL_CLEANUP_ON_EXIT=false`. MXL deletes a flow when its last writer is released or its instance destroyed, so on SIGTERM the agent removed every mirror flow and created it anew at the next start (new inode). Readers on the host stayed on the deleted flow until they were activated again or restarted (platform: mxl-webrtc-monitor, mxl-multiviewer after `kubectl rollout restart`). Now the agent closes its fabric connections and leaves its mirror writers and the MXL instance to the process exit; the next start re-opens the same flows. Lab: restart of the destination agent, the source agent and both, inodes unchanged, a GStreamer reader on a mirror kept reading (before: stopped for good); SIGTERM still exits 143 in about 1 s.

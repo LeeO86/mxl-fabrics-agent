@@ -63,6 +63,10 @@ public:
     std::shared_ptr<FabricDomain> domain(std::string const& path);
     void releaseDomain(std::string const& path);
     void releaseAll(bool keepFlows = false);
+    // grain_transfer_seconds of source grains; set before the first domain is opened.
+    void setTransferObserver(TransferObserver observer);
+    int pacingBatches() const { return pacingBatches_; } // in effect since start; 0 = off
+    double pacingSpread() const { return pacingSpread_; }
     bool ensureWriter(std::string const& path, std::string const& flowDef, std::string* error);
     void releaseWriter(std::string const& path, std::string const& flowId);
 
@@ -84,6 +88,8 @@ private:
         std::chrono::steady_clock::time_point progress_at{};   // when they last changed (or the target was set up)
         std::uint64_t stalls = 0;                              // rebuilds in a row without a new grain
         bool source_active = false;                            // from the last pull request
+        std::optional<std::uint64_t> origin_head;              // from the source's handshake answer (1.1.0 sources)
+        std::chrono::steady_clock::time_point origin_moved_at{}; // when that head last changed
         bool fallback = false;
         std::string provider;
     };
@@ -97,6 +103,9 @@ private:
     std::map<std::string, std::shared_ptr<FabricDomain>> domains_;
     std::map<std::string, DestState> dest_;
     std::map<std::string, std::uint64_t> sourceRestarts_;
+    TransferObserver transferObserver_;
     int nextPort_;
+    int pacingBatches_;
+    double pacingSpread_;
 };
 } // namespace mfa

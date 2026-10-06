@@ -73,6 +73,28 @@ int parseInt(std::string const& key, std::string const& text, int min, int max)
     }
 }
 
+double parseNumber(std::string const& key, std::string const& text, double min, double max)
+{
+    try
+    {
+        std::size_t used = 0;
+        double const value = std::stod(text, &used);
+        if (used != text.size() || !(value >= min && value <= max))
+        {
+            throw ConfigError(key + " is out of range");
+        }
+        return value;
+    }
+    catch (ConfigError const&)
+    {
+        throw;
+    }
+    catch (...)
+    {
+        throw ConfigError(key + " is not a number");
+    }
+}
+
 bool parseBool(std::string const& key, std::string const& text)
 {
     if (text == "1" || text == "true" || text == "TRUE" || text == "yes")
@@ -257,7 +279,7 @@ std::vector<std::string> configKeys()
         "MIRROR_INCLUDE_DOMAINS", "MIRROR_INCLUDE_FLOWS", "MIRROR_EXCLUDE_DOMAINS", "MIRROR_EXCLUDE_FLOWS", "MIRROR_GRACE_S",
         "TMPFS_RESERVE_MB", "MXL_CLEANUP_ON_EXIT", "CLEANUP_MIRRORS_ON_EXIT", "DEFAULT_PROVIDER", "PROVIDER_FALLBACK",
         "FABRIC_INTERFACE", "FABRIC_PORT_BASE", "FABRIC_PORT_COUNT", "PEERS", "PEER_POLL_INTERVAL_MS", "RELEASE_GRACE_MS",
-        "NMOS_ENABLE", "NMOS_SEED", "NMOS_LABEL", "NMOS_TAGS", "NMOS_DNS_SD", "NMOS_HOST_ADDRESS", "NMOS_REGISTRY_ADDRESS",
+        "TRANSFER_PACING", "TRANSFER_PACING_SPREAD", "TRANSFER_PACING_BATCHES", "NMOS_ENABLE", "NMOS_SEED", "NMOS_LABEL", "NMOS_TAGS", "NMOS_DNS_SD", "NMOS_HOST_ADDRESS", "NMOS_REGISTRY_ADDRESS",
         "NMOS_REGISTRY_PORT", "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT", "NMOS_POLL_INTERVAL_MS", "NMOS_PORT", "LOCAL_NODE_IDS",
         "LOCAL_NODE_HOSTNAMES", "LOCAL_NODE_CIDRS", "WEB_PORT", "WEB_ENABLE", "RT_PRIORITY", "CPU_AFFINITY", "LOG_LEVEL",
         "METRICS_PER_FLOW", "AGENT_CONFIG_FILE", "SHUTDOWN_TIMEOUT_S"};
@@ -321,6 +343,14 @@ Config parseConfig(std::map<std::string, std::string> const& values)
     cfg.peers = parsePeers(valueOr(values, "PEERS", "[]"));
     cfg.peer_poll_interval_ms = parseInt("PEER_POLL_INTERVAL_MS", valueOr(values, "PEER_POLL_INTERVAL_MS", "2000"), 100, 600000);
     cfg.release_grace_ms = parseInt("RELEASE_GRACE_MS", valueOr(values, "RELEASE_GRACE_MS", "2000"), 0, 600000);
+    cfg.transfer_pacing = valueOr(values, "TRANSFER_PACING", "off");
+    if (cfg.transfer_pacing != "off" && cfg.transfer_pacing != "frame")
+    {
+        throw ConfigError("TRANSFER_PACING must be off or frame");
+    }
+    // At most 0.9 of the grain duration, so a source that fell behind can still catch up.
+    cfg.transfer_pacing_spread = parseNumber("TRANSFER_PACING_SPREAD", valueOr(values, "TRANSFER_PACING_SPREAD", "0.5"), 0.1, 0.9);
+    cfg.transfer_pacing_batches = parseInt("TRANSFER_PACING_BATCHES", valueOr(values, "TRANSFER_PACING_BATCHES", "8"), 2, 64);
     cfg.nmos_enable = parseBool("NMOS_ENABLE", valueOr(aligned, "NMOS_ENABLE", "true"));
     cfg.nmos_seed = valueOr(aligned, "NMOS_SEED", "");
     cfg.nmos_dns_sd = parseBool("NMOS_DNS_SD", valueOr(aligned, "NMOS_DNS_SD", "false"));
@@ -472,6 +502,11 @@ std::map<std::string, std::string> configToMap(Config const& cfg)
     values["PEERS"] = peersToJson(cfg.peers);
     values["PEER_POLL_INTERVAL_MS"] = std::to_string(cfg.peer_poll_interval_ms);
     values["RELEASE_GRACE_MS"] = std::to_string(cfg.release_grace_ms);
+    values["TRANSFER_PACING"] = cfg.transfer_pacing;
+    std::ostringstream spread;
+    spread << cfg.transfer_pacing_spread;
+    values["TRANSFER_PACING_SPREAD"] = spread.str();
+    values["TRANSFER_PACING_BATCHES"] = std::to_string(cfg.transfer_pacing_batches);
     values["NMOS_ENABLE"] = cfg.nmos_enable ? "true" : "false";
     values["NMOS_SEED"] = cfg.nmos_seed;
     values["NMOS_LABEL"] = cfg.nmos_label;

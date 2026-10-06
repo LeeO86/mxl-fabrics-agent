@@ -20,6 +20,9 @@ std::string pullKey(PullRequest const& pull)
 ReplicationEngine::ReplicationEngine(Config cfg)
     : cfg_(std::move(cfg))
     , nextPort_(cfg_.fabric_port_base)
+    // TRANSFER_PACING* need a restart: the values at start stay in effect.
+    , pacingBatches_(cfg_.transfer_pacing == "frame" ? cfg_.transfer_pacing_batches : 0)
+    , pacingSpread_(cfg_.transfer_pacing_spread)
 {}
 
 ReplicationEngine::~ReplicationEngine()
@@ -40,6 +43,8 @@ FabricEndpoint ReplicationEngine::endpoint(std::string const& peer) const
     ep.allowTcpFallback = cfg_.provider_fallback == "tcp";
     ep.provider = cfg_.default_provider;
     ep.node = cfg_.fabric_interface;
+    ep.pacingBatches = pacingBatches_;
+    ep.pacingSpread = pacingSpread_;
     for (auto const& item : cfg_.peers)
     {
         if (item.host_id == peer)
@@ -70,15 +75,21 @@ std::shared_ptr<FabricDomain> ReplicationEngine::domain(std::string const& path)
     }
     int rt = 0;
     std::vector<int> cpus;
+    TransferObserver observer;
     {
         std::lock_guard const lock{mu_};
         rt = cfg_.rt_priority;
         cpus = cfg_.cpu_affinity;
+        observer = transferObserver_;
     }
     auto created = std::make_shared<FabricDomain>(path, rt, cpus);
     if (!created->ok())
     {
         log::error("domain_fabric_failed", {{"path", path}, {"error", created->error()}});
+    }
+    if (observer)
+    {
+        created->setTransferObserver(std::move(observer));
     }
     std::lock_guard const lock{mu_};
     auto const it = domains_.find(path);
@@ -94,6 +105,12 @@ void ReplicationEngine::releaseDomain(std::string const& path)
 {
     std::lock_guard const lock{mu_};
     domains_.erase(path);
+}
+
+void ReplicationEngine::setTransferObserver(TransferObserver observer)
+{
+    std::lock_guard const lock{mu_};
+    transferObserver_ = std::move(observer);
 }
 
 void ReplicationEngine::releaseAll(bool keepFlows)
@@ -212,10 +229,12 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
             state.last_error = dom ? dom->error() : "domain";
             continue;
         }
-        // A destination without a new grain for 5 s while it is in error or its source is being written
-        // (a peer that hung, a queue pair out of retries, a closed connection that reports nothing) is set
-        // up again: the source gets new target info and replaces the dead connection. The wait doubles
-        // with each rebuild in a row (5, 10, 20, 40 s) so an unreachable source does not churn.
+        // A destination without a new grain for 5 s while it is in error or the origin moved on (a peer
+        // that hung, a queue pair out of retries, a closed connection that reports nothing) is set up
+        // again: the source gets new target info and replaces the dead connection. The wait doubles with
+        // each rebuild in a row (5, 10, 20, 40 s) so an unreachable source does not churn. "Moved on" is
+        // the origin head the source reports in the handshake; a holder that writes nothing (decklink
+        // without a signal) is not a dead link. Sources before 1.1.0 report no head: a writer counts.
         if (!state.target_info.empty())
         {
             auto const now = std::chrono::steady_clock::now();
@@ -231,7 +250,10 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
                     state.progress_at = now;
                     state.stalls = 0;
                 }
-                else if ((row.state == "error" || pull.source_active) &&
+                // "Moved on": more than 1 s after the last grain, so the head read in the same pass as
+                // that grain does not count.
+                else if ((row.state == "error" ||
+                          (state.origin_head ? state.origin_moved_at > state.progress_at + std::chrono::seconds(1) : pull.source_active)) &&
                          now - state.progress_at > std::chrono::seconds(5LL << std::min<std::uint64_t>(state.stalls, 3)))
                 {
                     log::warn("replication_restarted",
@@ -313,6 +335,15 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
             auto const& obj = parsed.get<picojson::object>();
             state.replication_id = json::asString(obj, "replication_id").value_or(state.replication_id);
             state.state = json::asString(obj, "state").value_or("pending");
+            if (auto const head = obj.find("origin_head"); head != obj.end() && head->second.is<double>())
+            {
+                auto const value = static_cast<std::uint64_t>(head->second.get<double>());
+                if (state.origin_head && *state.origin_head != value)
+                {
+                    state.origin_moved_at = std::chrono::steady_clock::now();
+                }
+                state.origin_head = value;
+            }
         }
         state.last_error.clear(); // the peer answered: an earlier "recv" or "http 500" is over
         if (state.state == "active")
@@ -363,6 +394,7 @@ PostResult ReplicationEngine::post(PostRequest const& request, std::string const
         log::warn("add_target_failed", {{"flow_id", request.flow_id}, {"peer", request.dest_host_id}, {"error", error}});
         return result;
     }
+    result.origin_head = dom->originHead(result.replication_id);
     for (auto const& row : dom->rows())
     {
         if (row.key == result.replication_id && row.state == "active")
@@ -446,9 +478,12 @@ std::vector<ReplicaView> ReplicationEngine::status() const
             {
                 view.state = state.state == "active" ? view.state : state.state;
                 view.restarts = state.restarts;
-                if (!state.source_active)
+                // Nobody writes the origin flow (no writer, or its head has not moved for 2 s): the
+                // mirror is not behind, although the TAI index runs on.
+                if (!state.source_active ||
+                    (state.origin_head && std::chrono::steady_clock::now() - state.origin_moved_at > std::chrono::seconds(2)))
                 {
-                    view.lag = 0; // nobody writes the origin flow: the mirror is not behind
+                    view.lag = 0;
                 }
                 view.fallback = state.fallback || view.fallback;
                 if (!state.provider.empty())

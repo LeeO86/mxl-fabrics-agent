@@ -159,6 +159,7 @@ say "peer down reported"
 
 env "${common[@]}" HOST_ID=node-a MXL_ROOT="$A" WEB_PORT=18095 NMOS_PORT=18232 FABRIC_PORT_BASE=23600 PEERS="$PEERS_A" \
   "$BIN" >"$LOGA" 2>&1 &
+A_PID=$!
 PIDS+=($!)
 curl -sf --max-time 2 -X PUT http://127.0.0.1:18971/control \
   -H 'content-type: application/json' \
@@ -202,4 +203,37 @@ if ! rate=$("$WRITER" rate "$B/mirror-$SMALL_DOMAIN" "$SMALL_FLOW" 10 45); then
   fail "200 ms ring flow: fewer than 45 of 50 grains/s"
 fi
 say "200 ms ring flow: $rate"
+
+# TRANSFER_PACING=frame on the source: the same flow in 8 slice batches spread over half a grain.
+# The reader takes only whole grains with the right index stamp, so every batch has to arrive and
+# the destination has to put the grain together.
+kill -TERM "$A_PID" 2>/dev/null || true
+wait "$A_PID" 2>/dev/null || true
+env "${common[@]}" HOST_ID=node-a MXL_ROOT="$A" WEB_PORT=18095 NMOS_PORT=18232 FABRIC_PORT_BASE=23600 PEERS="$PEERS_A" \
+  TRANSFER_PACING=frame TRANSFER_PACING_SPREAD=0.5 TRANSFER_PACING_BATCHES=8 "$BIN" >"$LOGA" 2>&1 &
+A_PID=$!
+PIDS+=($!)
+wait_http http://127.0.0.1:18095/livez || fail "paced node-a did not start"
+if ! "$WRITER" read "$B/mirror-$SMALL_DOMAIN" "$SMALL_FLOW" 25; then
+  fail "paced replication did not resume"
+fi
+dest_errors() {
+  curl -sf --max-time 2 http://127.0.0.1:18096/api/v1/replications |
+    python3 -c 'import json,sys; print(sum(r["errors"] for r in json.load(sys.stdin) if r["role"] == "destination" and r["flow_id"] == sys.argv[1]))' "$SMALL_FLOW"
+}
+errors_before="$(dest_errors)"
+if ! rate=$("$WRITER" rate "$B/mirror-$SMALL_DOMAIN" "$SMALL_FLOW" 10 45); then
+  echo "$rate"
+  echo "--- A ---"; grep -v '"level":"debug"' "$LOGA" | tail -n 20
+  echo "--- B ---"; grep -v '"level":"debug"' "$LOGB" | tail -n 20
+  fail "paced 200 ms ring flow: fewer than 45 of 50 grains/s"
+fi
+errors_after="$(dest_errors)"
+# Each batch reports its grain; committing a grain again that is complete was an error per batch.
+[[ "$errors_after" == "$errors_before" ]] || fail "paced flow: destination errors $errors_before -> $errors_after"
+metrics="$(curl -sf --max-time 2 http://127.0.0.1:18095/metrics)"
+grep -q '^mxl_fabrics_agent_transfer_pacing_batches 8' <<<"$metrics" || fail "transfer_pacing_batches is not 8"
+count="$(grep '^mxl_fabrics_agent_grain_transfer_seconds_count{provider="tcp"}' <<<"$metrics" | awk '{print $2}')"
+[[ -n "$count" && "${count%.*}" -gt 100 ]] || fail "grain_transfer_seconds has no observations: '$count'"
+say "paced 200 ms ring flow: $rate, $count transfers timed"
 say "passed"

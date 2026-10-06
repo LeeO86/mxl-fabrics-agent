@@ -1,19 +1,26 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace mfa
 {
+// Called on the domain thread with a source grain's transfer time (first transfer to completion).
+using TransferObserver = std::function<void(std::string const& provider, double seconds)>;
+
 struct FabricEndpoint
 {
     std::string provider = "tcp";
     std::string node;
     std::string service;
     bool allowTcpFallback = false;
+    int pacingBatches = 0;     // TRANSFER_PACING=frame: slice batches per grain; 0 = whole grains
+    double pacingSpread = 0.5; // share of the grain duration the batches start within
 };
 
 struct TargetSetup
@@ -74,8 +81,11 @@ public:
     bool addInitiatorTarget(std::string const& key, std::string const& destHost, std::string const& targetInfo, std::string* error);
     void removeInitiatorTarget(std::string const& key, std::string const& destHost);
     void destroyInitiator(std::string const& key);
+    // Head index of the flow a source replication reads (also while its transfers are stuck).
+    std::optional<std::uint64_t> originHead(std::string const& key);
     // Shutdown without releasing writers or the MXL instance (MXL would delete the flows).
     void keepFlowsOnExit();
+    void setTransferObserver(TransferObserver observer);
 
     std::vector<FabricRow> rows() const;
 

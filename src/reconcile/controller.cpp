@@ -153,6 +153,10 @@ Controller::Controller(std::shared_ptr<ConfigStore> store)
 {
     tai_ = taiOffsetSeconds();
     rootTmpfs_ = pathIsTmpfs(store_->get().mxl_root);
+    // Source grains, from the first transfer to its completion (with TRANSFER_PACING the spread included).
+    engine_.setTransferObserver([this](std::string const& provider, double seconds) {
+        metrics_.observe("grain_transfer_seconds", seconds, {{"provider", provider}});
+    });
 }
 
 Controller::~Controller()
@@ -542,6 +546,8 @@ void Controller::renderMetrics()
         }
     }
     metrics_.setGauge("info", 1, {{"host_id", cfg.host_id}, {"version", kVersion}, {"mxl_version", kMxlPinName}, {"libfabric_version", "2.3"}});
+    metrics_.setGauge("transfer_pacing_batches", engine_.pacingBatches());
+    metrics_.setGauge("transfer_pacing_spread", engine_.pacingBatches() > 0 ? engine_.pacingSpread() : 0);
     metrics_.setGauge("domains", local, {{"kind", "local"}});
     metrics_.setGauge("domains", mirror, {{"kind", "mirror"}});
     metrics_.setGauge("domains", conflict, {{"kind", "conflict"}});
@@ -830,6 +836,10 @@ HttpResponse Controller::handle(HttpRequest const& request)
         picojson::object response;
         response["replication_id"] = picojson::value(result.replication_id);
         response["state"] = picojson::value(result.state);
+        if (result.origin_head)
+        {
+            response["origin_head"] = picojson::value(static_cast<double>(*result.origin_head));
+        }
         publish("replication", picojson::value(response).serialize());
         return json(result.status == 0 ? 201 : result.status, picojson::value(response).serialize());
     }
