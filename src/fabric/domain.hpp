@@ -10,7 +10,7 @@
 
 namespace mfa
 {
-// Called on the domain thread with a source grain's transfer time (first transfer to completion).
+// Called on the domain thread with a source grain's transfer time (transfer to completion).
 using TransferObserver = std::function<void(std::string const& provider, double seconds)>;
 
 struct FabricEndpoint
@@ -19,8 +19,6 @@ struct FabricEndpoint
     std::string node;
     std::string service;
     bool allowTcpFallback = false;
-    int pacingBatches = 0;     // TRANSFER_PACING=frame: slice batches per grain; 0 = whole grains
-    double pacingSpread = 0.5; // share of the grain duration the batches start within
 };
 
 struct TargetSetup

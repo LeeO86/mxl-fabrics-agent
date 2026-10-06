@@ -45,37 +45,6 @@ TEST_CASE("config defaults and precedence")
     CHECK_FALSE(isRuntimeKey("WEB_PORT"));
 }
 
-TEST_CASE("transfer pacing is off by default and needs a restart")
-{
-    auto values = baseValues();
-    auto cfg = parseConfig(values);
-    CHECK(cfg.transfer_pacing == "off");
-    CHECK(cfg.transfer_pacing_spread == doctest::Approx(0.5));
-    CHECK(cfg.transfer_pacing_batches == 8);
-    CHECK_FALSE(isRuntimeKey("TRANSFER_PACING"));
-
-    values["TRANSFER_PACING"] = "frame";
-    values["TRANSFER_PACING_SPREAD"] = "0.25";
-    values["TRANSFER_PACING_BATCHES"] = "16";
-    cfg = parseConfig(values);
-    CHECK(cfg.transfer_pacing == "frame");
-    CHECK(cfg.transfer_pacing_spread == doctest::Approx(0.25));
-    CHECK(cfg.transfer_pacing_batches == 16);
-    auto const exported = configToMap(cfg);
-    CHECK(exported.at("TRANSFER_PACING") == "frame");
-    CHECK(exported.at("TRANSFER_PACING_SPREAD") == "0.25");
-    CHECK(exported.at("TRANSFER_PACING_BATCHES") == "16");
-
-    for (auto const& [key, bad] : std::vector<std::pair<std::string, std::string>>{{"TRANSFER_PACING", "slice"},
-             {"TRANSFER_PACING_SPREAD", "1.0"}, {"TRANSFER_PACING_SPREAD", "0.05"}, {"TRANSFER_PACING_SPREAD", "half"},
-             {"TRANSFER_PACING_BATCHES", "1"}})
-    {
-        auto broken = baseValues();
-        broken[key] = bad;
-        CHECK_THROWS_AS(parseConfig(broken), ConfigError);
-    }
-}
-
 TEST_CASE("config rejects combined include keys and bad mode")
 {
     auto values = baseValues();

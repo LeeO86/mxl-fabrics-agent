@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <csignal>
 #include <filesystem>
 #include <iostream>
@@ -126,6 +127,12 @@ int main(int argc, char** argv)
             mfa::log::warn("provider_fallback_default", {{"from", cfg.default_provider}, {"to", "tcp"}});
         }
         mfa::log::info("startup", {{"version", mfa::kVersion}, {"host_id", cfg.host_id}, {"mxl", mfa::kMxlPin}});
+        // 1.1.0 only: over verbs MXL's target keeps one receive for immediate data, and every paced
+        // batch carries one, so pacing multiplied retransmissions. The setting is ignored now.
+        if (char const* pacing = std::getenv("TRANSFER_PACING"); pacing != nullptr && std::string(pacing) != "off")
+        {
+            mfa::log::warn("transfer_pacing_removed", {{"value", pacing}, {"detail", "TRANSFER_PACING was removed in 1.2.0 and is ignored"}});
+        }
         auto store = std::make_shared<mfa::ConfigStore>(cfg, origin, fileValues);
         mfa::Controller controller(store);
         mfa::HttpServer server;

@@ -448,22 +448,12 @@ handshake clears the destination's last handshake error (`recv`, `http …`).
   Continuous (audio) flows use the corresponding sample-transfer API if the
   pinned MXL provides it; if not, audio replication is listed as a known
   deviation in `IMPLEMENTATION_PLAN.md`.
-- Optional transfer pacing (`TRANSFER_PACING=frame`, default `off`): a
-  complete video or data grain goes out in `TRANSFER_PACING_BATCHES` slice
-  batches (default 8; MXL Fabrics transfers slice ranges) whose starts are
-  spread over `TRANSFER_PACING_SPREAD` of the grain duration (default 0.5,
-  0.1–0.9), instead of one burst at line rate. For receivers whose NIC cannot
-  move two ports' bursts into memory at once (Intel E810 at PCIe Gen3 x8 drops
-  RoCE packets). Each batch starts when due, also while earlier ones are in
-  flight; the next grain starts once all batches are complete. Partial and
-  invalid grains go out at once. A target added or replaced, or a pause of
-  more than 100 ms (an endpoint connected again), sends the grain again from its
-  first slice, which carries the grain header. The destination commits what has
-  arrived (a partial grain stays open, readers of whole grains wait for its last
-  slice), once for all batches reported together, skips batches of a grain it
-  already committed complete, and counts the grain once. Adds up to the spread
-  to the latency.
-  Continuous flows are not paced.
+- No transfer pacing: a grain goes out as one transfer. 1.1.0 had an optional
+  pacing (slice batches spread over part of the grain duration); over `verbs`
+  MXL's target keeps one receive posted for the immediate data that ends every
+  transfer, so the batches ran into "receiver not ready" and retransmissions
+  rose about 1000-fold on the platform's E810 mesh. Removed in 1.2.0;
+  `TRANSFER_PACING` is ignored with a warning.
 - Target side: drain completions with the batch/non-blocking read where
   available; never let the completion queue grow past its depth. Each received
   grain is committed to the mirror flow at the **same grain index** as the
@@ -514,9 +504,6 @@ include/exclude lists apply at runtime.
 | `PEERS` | empty | peer link map (§8.2), file only or JSON in env |
 | `PEER_POLL_INTERVAL_MS` | 2000 | inventory poll interval |
 | `RELEASE_GRACE_MS` | 2000 | delay before releasing a target |
-| `TRANSFER_PACING` | off | `off` or `frame`: send grains in slice batches (§9); restart required |
-| `TRANSFER_PACING_SPREAD` | 0.5 | share of the grain duration the batch starts are spread over, 0.1–0.9; restart required |
-| `TRANSFER_PACING_BATCHES` | 8 | slice batches per grain, 2–64; restart required |
 | `NMOS_ENABLE` | true | register own Node and observe registry |
 | `NMOS_SEED` | empty | UUIDv5 name for the node id. Empty uses `HOST_ID` |
 | `NMOS_LABEL` | `HOST_ID` | node label |
@@ -611,9 +598,7 @@ Tabs:
 | `replication_errors_total` | counter | flow_id, peer, role (no `kind`: errors are counted, not classified) |
 | `replication_restarts_total` | counter | flow_id, peer |
 | `replication_lag_grains` | gauge | flow_id, peer |
-| `grain_transfer_seconds` | histogram | provider; source grains, first transfer to completion (with pacing the spread included) |
-| `transfer_pacing_batches` | gauge | — (0 = pacing off) |
-| `transfer_pacing_spread` | gauge | — |
+| `grain_transfer_seconds` | histogram | provider; source grains, transfer to completion |
 | `setup_seconds` | histogram | phase (target_setup, handshake, first_grain) (not implemented yet) |
 | `nmos_registry_up` | gauge | — |
 | `nmos_poll_errors_total` | counter | — (not implemented yet) |

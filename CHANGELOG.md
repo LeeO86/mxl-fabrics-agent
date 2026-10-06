@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.0
+
+- Transfer pacing is removed again. On the platform's E810 mesh over `verbs` it multiplied retransmissions about 1000-fold and replication broke (517 link restarts in 69 minutes, readers without grains); unpaced, the same links ran at 50 grains/s. MXL's target keeps one receive posted for the immediate data that ends every transfer and posts the next only when the agent reads the completion; with 8 batches per grain the next batch usually arrived before that (receiver not ready). MXL's public API has no transfer without an immediate, so the agent cannot work around it. `TRANSFER_PACING`, `TRANSFER_PACING_SPREAD` and `TRANSFER_PACING_BATCHES` are ignored (a set `TRANSFER_PACING` other than `off` logs `transfer_pacing_removed`); the gauges `transfer_pacing_batches` and `transfer_pacing_spread` are gone.
+- Unchanged from 1.1.0: links whose origin writes nothing are not rebuilt (`origin_head`), `lag_grains` is 0 while that head stands still, and `grain_transfer_seconds{provider}` (now transfer to completion of one grain).
+
 ## 1.1.0
 
 - Optional transfer pacing: `TRANSFER_PACING=frame` sends each complete video or data grain in `TRANSFER_PACING_BATCHES` slice batches (default 8) whose starts are spread over `TRANSFER_PACING_SPREAD` of the grain duration (default 0.5, 0.1–0.9), instead of one burst at line rate. For receivers whose NIC cannot move bursts from two ports into memory at once (on the platform: E810 at PCIe Gen3 x8 discarding RoCE packets). Uses MXL's slice-range transfer; no MXL change. Adds up to the spread to the latency (10 ms at 50p with the default). Default `off`: nothing changes unless it is set. Restart required.

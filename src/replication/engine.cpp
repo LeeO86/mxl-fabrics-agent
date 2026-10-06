@@ -20,9 +20,6 @@ std::string pullKey(PullRequest const& pull)
 ReplicationEngine::ReplicationEngine(Config cfg)
     : cfg_(std::move(cfg))
     , nextPort_(cfg_.fabric_port_base)
-    // TRANSFER_PACING* need a restart: the values at start stay in effect.
-    , pacingBatches_(cfg_.transfer_pacing == "frame" ? cfg_.transfer_pacing_batches : 0)
-    , pacingSpread_(cfg_.transfer_pacing_spread)
 {}
 
 ReplicationEngine::~ReplicationEngine()
@@ -43,8 +40,6 @@ FabricEndpoint ReplicationEngine::endpoint(std::string const& peer) const
     ep.allowTcpFallback = cfg_.provider_fallback == "tcp";
     ep.provider = cfg_.default_provider;
     ep.node = cfg_.fabric_interface;
-    ep.pacingBatches = pacingBatches_;
-    ep.pacingSpread = pacingSpread_;
     for (auto const& item : cfg_.peers)
     {
         if (item.host_id == peer)

@@ -45,9 +45,6 @@ struct Config
     std::vector<PeerConfig> peers;
     int peer_poll_interval_ms = 2000;
     int release_grace_ms = 2000;
-    std::string transfer_pacing = "off"; // off | frame: send a grain in slice batches spread over part of its duration
-    double transfer_pacing_spread = 0.5; // share of the grain duration the batches start within
-    int transfer_pacing_batches = 8;
     bool nmos_enable = true;
     std::string nmos_seed;
     std::string nmos_label;
