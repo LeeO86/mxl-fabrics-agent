@@ -217,12 +217,20 @@ wait_http http://127.0.0.1:18095/livez || fail "paced node-a did not start"
 if ! "$WRITER" read "$B/mirror-$SMALL_DOMAIN" "$SMALL_FLOW" 25; then
   fail "paced replication did not resume"
 fi
+dest_errors() {
+  curl -sf --max-time 2 http://127.0.0.1:18096/api/v1/replications |
+    python3 -c 'import json,sys; print(sum(r["errors"] for r in json.load(sys.stdin) if r["role"] == "destination" and r["flow_id"] == sys.argv[1]))' "$SMALL_FLOW"
+}
+errors_before="$(dest_errors)"
 if ! rate=$("$WRITER" rate "$B/mirror-$SMALL_DOMAIN" "$SMALL_FLOW" 10 45); then
   echo "$rate"
   echo "--- A ---"; grep -v '"level":"debug"' "$LOGA" | tail -n 20
   echo "--- B ---"; grep -v '"level":"debug"' "$LOGB" | tail -n 20
   fail "paced 200 ms ring flow: fewer than 45 of 50 grains/s"
 fi
+errors_after="$(dest_errors)"
+# Each batch reports its grain; committing a grain again that is complete was an error per batch.
+[[ "$errors_after" == "$errors_before" ]] || fail "paced flow: destination errors $errors_before -> $errors_after"
 metrics="$(curl -sf --max-time 2 http://127.0.0.1:18095/metrics)"
 grep -q '^mxl_fabrics_agent_transfer_pacing_batches 8' <<<"$metrics" || fail "transfer_pacing_batches is not 8"
 count="$(grep '^mxl_fabrics_agent_grain_transfer_seconds_count{provider="tcp"}' <<<"$metrics" | awk '{print $2}')"

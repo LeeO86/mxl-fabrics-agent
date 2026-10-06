@@ -454,12 +454,15 @@ handshake clears the destination's last handshake error (`recv`, `http …`).
   spread over `TRANSFER_PACING_SPREAD` of the grain duration (default 0.5,
   0.1–0.9), instead of one burst at line rate. For receivers whose NIC cannot
   move two ports' bursts into memory at once (Intel E810 at PCIe Gen3 x8 drops
-  RoCE packets). The next batch waits for the previous one to complete; partial
-  and invalid grains go out at once. A target added or replaced, or a pause of
+  RoCE packets). Each batch starts when due, also while earlier ones are in
+  flight; the next grain starts once all batches are complete. Partial and
+  invalid grains go out at once. A target added or replaced, or a pause of
   more than 100 ms (an endpoint connected again), sends the grain again from its
-  first slice, which carries the grain header. The destination commits every
-  batch (a partial grain stays open, readers of whole grains wait for its last
-  slice) and counts the grain once. Adds up to the spread to the latency.
+  first slice, which carries the grain header. The destination commits what has
+  arrived (a partial grain stays open, readers of whole grains wait for its last
+  slice), once for all batches reported together, skips batches of a grain it
+  already committed complete, and counts the grain once. Adds up to the spread
+  to the latency.
   Continuous flows are not paced.
 - Target side: drain completions with the batch/non-blocking read where
   available; never let the completion queue grow past its depth. Each received

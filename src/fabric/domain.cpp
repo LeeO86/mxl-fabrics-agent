@@ -145,6 +145,7 @@ struct TargetSlot
     std::uint64_t errors = 0;
     std::uint64_t head = 0;
     std::uint64_t lastCounted = MXL_UNDEFINED_INDEX; // grain index last counted in grains/bytes
+    std::uint64_t lastCompleted = MXL_UNDEFINED_INDEX; // grain index last committed with all its slices
     std::size_t lastBatch = 1; // samples in the last committed batch (a "grain" of a continuous flow)
     std::string lastError;
     std::string state = "pending";
@@ -782,6 +783,12 @@ private:
                 slot.lastError = "no transfer completed for 2 s";
                 slot.state = "error";
             }
+            // A paced batch starts when due, also while earlier batches are in flight: waiting for
+            // each completion made a grain take longer than its duration on tcp.
+            if (slot.connected && slot.pacedEnd != 0)
+            {
+                pumpPacedBatch(slot);
+            }
             return;
         }
         if (progress != MXL_STATUS_OK)
@@ -900,8 +907,8 @@ private:
     }
 
     // The next slice batch of the grain being paced, once its start is due. Batch k of n covers
-    // slices [k·end/n, (k+1)·end/n) and may start pacingSpread·k/n after the first; the next batch
-    // waits for MakeProgress to report the previous one complete.
+    // slices [k·end/n, (k+1)·end/n) and starts pacingSpread·k/n after the first; the next grain
+    // waits until MakeProgress reports all batches complete.
     void pumpPacedBatch(InitiatorSlot& slot)
     {
         int const batches = std::min<int>(slot.pacingBatches, slot.pacedEnd);
@@ -1080,13 +1087,24 @@ private:
                     slot.state = "error";
                     return;
                 }
-                slot.pendingGrains.push_back(index);
+                // Batches of a paced grain each report the grain: one commit takes them all, since
+                // the slices are already in the grain and the header holds their count.
+                if (slot.pendingGrains.empty() || slot.pendingGrains.back() != index)
+                {
+                    slot.pendingGrains.push_back(index);
+                }
             }
             int committed = 0;
             while (!slot.pendingGrains.empty() && committed < 16)
             {
                 auto const index = slot.pendingGrains.front();
                 slot.pendingGrains.erase(slot.pendingGrains.begin());
+                // Later batches of a grain that an earlier commit already found complete: MXL
+                // closed it and would refuse to open it again (MXL_ERR_INVALID_ARG).
+                if (index == slot.lastCompleted)
+                {
+                    continue;
+                }
                 mxlGrainInfo snapshot{};
                 mxlFlowWriterGetGrainInfo(writer->second.writer, index, &snapshot);
                 mxlGrainInfo opened{};
@@ -1121,6 +1139,10 @@ private:
                     slot.grains += 1;
                     slot.bytes += snapshot.grainSize;
                     slot.lastCounted = index;
+                }
+                if (snapshot.validSlices == snapshot.totalSlices)
+                {
+                    slot.lastCompleted = index; // MXL closes a grain with all slices
                 }
                 slot.head = index;
                 ++committed;

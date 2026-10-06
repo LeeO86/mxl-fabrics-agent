@@ -250,7 +250,10 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
                     state.progress_at = now;
                     state.stalls = 0;
                 }
-                else if ((row.state == "error" || (state.origin_head ? state.origin_moved_at > state.progress_at : pull.source_active)) &&
+                // "Moved on": more than 1 s after the last grain, so the head read in the same pass as
+                // that grain does not count.
+                else if ((row.state == "error" ||
+                          (state.origin_head ? state.origin_moved_at > state.progress_at + std::chrono::seconds(1) : pull.source_active)) &&
                          now - state.progress_at > std::chrono::seconds(5LL << std::min<std::uint64_t>(state.stalls, 3)))
                 {
                     log::warn("replication_restarted",
