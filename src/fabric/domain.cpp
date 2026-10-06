@@ -144,6 +144,7 @@ struct TargetSlot
     std::uint64_t bytes = 0;
     std::uint64_t errors = 0;
     std::uint64_t head = 0;
+    std::size_t lastBatch = 1; // samples in the last committed batch (a "grain" of a continuous flow)
     std::string lastError;
     std::string state = "pending";
     std::vector<std::uint64_t> pendingGrains;
@@ -173,6 +174,7 @@ struct InitiatorSlot
     bool primed = false;
     bool connected = false;
     bool inFlight = false;
+    std::chrono::steady_clock::time_point progressAt{}; // last MakeProgress that returned OK
     std::string lastError;
     std::string state = "pending";
     std::map<std::string, mxlFabricsTargetInfo> targets;
@@ -233,9 +235,11 @@ public:
             destroyTargetSlot(slot);
         }
         targets_.clear();
+        // MXL deletes a flow when its last writer is released or its instance destroyed. To keep
+        // the mirror flows for the next start (readers keep their flow), leave both to the exit.
         for (auto& [_, slot] : writers_)
         {
-            if (slot.writer != nullptr && instance_ != nullptr)
+            if (slot.writer != nullptr && instance_ != nullptr && !keepFlows_)
             {
                 mxlReleaseFlowWriter(instance_, slot.writer);
             }
@@ -246,11 +250,16 @@ public:
             mxlFabricsDestroyInstance(fabrics_);
             fabrics_ = nullptr;
         }
-        if (instance_ != nullptr)
+        if (instance_ != nullptr && !keepFlows_)
         {
             mxlDestroyInstance(instance_);
-            instance_ = nullptr;
         }
+        instance_ = nullptr;
+    }
+
+    void keepFlowsOnExit()
+    {
+        keepFlows_ = true;
     }
 
     bool ensureWriter(std::string const& flowDef, std::string* error)
@@ -703,6 +712,15 @@ private:
             {
                 slot.state = "pending";
             }
+            // MXL does not count a failed transfer as complete (a queue pair out of retries), so
+            // NOT_READY stays forever and nothing is sent. The destination sets the link up again
+            // when its grains stop; until then the source shows it.
+            else if (slot.state != "error" && std::chrono::steady_clock::now() - slot.progressAt > std::chrono::seconds(2))
+            {
+                slot.errors += 1;
+                slot.lastError = "no transfer completed for 2 s";
+                slot.state = "error";
+            }
             return;
         }
         if (progress != MXL_STATUS_OK)
@@ -714,6 +732,7 @@ private:
         }
         slot.connected = true;
         slot.inFlight = false;
+        slot.progressAt = std::chrono::steady_clock::now();
         auto const errorsBefore = slot.errors;
         if (slot.continuous)
         {
@@ -894,6 +913,7 @@ private:
                 slot.grains += 1;
                 slot.bytes += item.count * 4;
                 slot.head = item.head;
+                slot.lastBatch = item.count;
                 ++committed;
             }
         }
@@ -982,6 +1002,16 @@ private:
             row.bytes = slot.bytes;
             row.errors = slot.errors;
             row.head = slot.head;
+            // Origin writers commit at the current TAI index, so the distance from it is the lag
+            // (grainRate is the sample rate of a continuous flow).
+            if (auto const writer = writers_.find(slot.flowId); writer != writers_.end() && slot.grains > 0)
+            {
+                auto const now = mxlGetCurrentIndex(&writer->second.info.common.grainRate);
+                if (now != MXL_UNDEFINED_INDEX && now > slot.head)
+                {
+                    row.behind = (now - slot.head) / std::max<std::size_t>(slot.lastBatch, 1);
+                }
+            }
             row.last_error = slot.lastError;
             row.cq_depth = slot.cqDepth;
             row.fallback = slot.fallback;
@@ -1016,6 +1046,7 @@ private:
     std::map<std::string, TargetSlot> targets_;
     std::map<std::string, InitiatorSlot> initiators_;
     std::vector<FabricRow> rows_;
+    bool keepFlows_ = false;
 };
 
 struct Task
@@ -1238,6 +1269,11 @@ void FabricDomain::removeInitiatorTarget(std::string const& key, std::string con
 void FabricDomain::destroyInitiator(std::string const& key)
 {
     impl_->call([&](Session& session) { session.destroyInitiator(key); });
+}
+
+void FabricDomain::keepFlowsOnExit()
+{
+    impl_->call([](Session& session) { session.keepFlowsOnExit(); });
 }
 
 std::vector<FabricRow> FabricDomain::rows() const

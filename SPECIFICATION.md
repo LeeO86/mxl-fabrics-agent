@@ -283,7 +283,8 @@ activation race between IS-05 activation and replication start.
 
 - Mirror domain path: `<MXL_ROOT>/mirror-<source-domain-id>/` — a sibling of the
   local domains, so media functions scanning `MXL_ROOT` find it.
-- `domain_def.json` carries the **source** domain id, plus a marker object:
+- `domain_def.json` carries the **source** domain id, a label, a description
+  and empty tags (BCP-007-03), plus a marker object:
   `"x-mxl-fabrics-agent": {"mirror": true, "source_host_id": "...", "owner_host_id": "<HOST_ID>"}`.
   Readers ignore unknown fields; the agent uses the marker for classification.
 - `options.json` is copied verbatim from the source domain, so ring geometry
@@ -328,8 +329,13 @@ mirror is not created, and status/metric/log report `insufficient_space`.
   with a foreign `owner_host_id` are left untouched and reported as conflict.
 - On clean shutdown (SIGTERM) the agent stops replications and, if
   `MXL_CLEANUP_ON_EXIT=true` (alias `CLEANUP_MIRRORS_ON_EXIT`, default false),
-  removes only mirror directories it owns. An existing `domain_def.json` whose
-  id does not match the mirror is not overwritten.
+  removes only mirror directories it owns. With `false` it keeps the mirror
+  flows: MXL deletes a flow when its last writer is released or its instance
+  destroyed, so the agent leaves both to the process exit, and the next start
+  re-opens the same flows (readers keep them; a re-created flow would leave
+  readers that do not reopen on `MXL_ERR_FLOW_INVALID` on the old one). An
+  existing `domain_def.json` whose id does not match the mirror is not
+  overwritten.
 
 ---
 
@@ -452,9 +458,11 @@ handshake clears the destination's last handshake error (`recv`, `http …`).
   (PTP/chrony with correct kernel TAI offset). The agent checks `CLOCK_TAI`
   offset sanity at startup and exposes it as a metric; replicated readers on
   the destination will otherwise read the wrong grains or none.
-- The agent measures replication lag as `origin head index − mirror head index`
-  (from the source's reported head and the local mirror head) and transfer
-  latency per grain where possible.
+- The agent measures replication lag as `origin head index − mirror head index`.
+  Origin writers commit at the current TAI index, so the destination uses the
+  flow's current index (`mxlGetCurrentIndex` at the flow rate) as the origin
+  head; for continuous flows the lag counts transfer batches. It is 0 while no
+  writer holds the origin flow and before the first grain.
 
 ---
 

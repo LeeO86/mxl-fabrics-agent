@@ -75,6 +75,9 @@ std::string domainDef(std::string const& domainId, std::string const& sourceHost
     picojson::object obj;
     obj["id"] = picojson::value(domainId);
     obj["label"] = picojson::value("mirror " + domainId);
+    // BCP-007-03 requires description and tags as well.
+    obj["description"] = picojson::value("Mirror of MXL domain " + domainId + " from " + sourceHost + ", written by mxl-fabrics-agent");
+    obj["tags"] = picojson::value(picojson::object{});
     obj["x-mxl-fabrics-agent"] = picojson::value(marker);
     return picojson::value(obj).serialize(true);
 }
@@ -197,12 +200,13 @@ void Controller::stop()
     {
         thread_.join();
     }
-    engine_.releaseAll();
+    auto const cfg = store_->get();
+    // Without cleanup the mirror flows stay for the next start, so readers on this host keep them.
+    engine_.releaseAll(!cfg.cleanup_mirrors_on_exit);
     if (node_)
     {
         node_->stop();
     }
-    auto const cfg = store_->get();
     if (cfg.cleanup_mirrors_on_exit)
     {
         std::error_code ec;

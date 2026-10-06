@@ -135,7 +135,7 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | `MIRROR_EXCLUDE_DOMAINS` / `MIRROR_EXCLUDE_FLOWS` | empty | Deny lists |
 | `MIRROR_GRACE_S` | 10 | Keep a mirror after the origin disappears |
 | `TMPFS_RESERVE_MB` | 512 | Free space left on the MXL filesystem |
-| `MXL_CLEANUP_ON_EXIT` | false | On shutdown, remove mirror domains this agent owns. Alias: `CLEANUP_MIRRORS_ON_EXIT`. The platform sets this true |
+| `MXL_CLEANUP_ON_EXIT` | false | On shutdown, remove mirror domains this agent owns. Alias: `CLEANUP_MIRRORS_ON_EXIT`. With false the mirror flows stay, and readers on the host keep reading them after a restart |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |
 | `PROVIDER_FALLBACK` | empty | `tcp` to retry a failed verbs link |
 | `FABRIC_INTERFACE` | empty | Default local fabric address |
@@ -173,7 +173,7 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | 78 | Invalid configuration, or the MXL scan path is not a directory |
 | 143 | SIGTERM or SIGINT, including when shutdown exceeds `SHUTDOWN_TIMEOUT_S` |
 
-On SIGTERM the agent releases MXL readers and writers, removes its node from the registry, then, when `MXL_CLEANUP_ON_EXIT=true`, deletes only mirror directories it owns. Another function's domain and another agent's mirrors are left in place.
+On SIGTERM the agent closes its fabric connections, releases MXL readers, removes its node from the registry, then, when `MXL_CLEANUP_ON_EXIT=true`, releases its writers and deletes only mirror directories it owns. With `false` it does not release its mirror writers: MXL deletes a flow when its last writer is released, and the next start re-opens the same flows. Another function's domain and another agent's mirrors are left in place.
 
 ## HTTP API
 
@@ -208,4 +208,4 @@ This agent has no IS-05 senders or receivers. It does not accept connection patc
 
 The platform runs one agent per node as a DaemonSet on the host network. Host networking is required for RDMA and for the fabric addresses in the peer map. `deploy/mxl-fabrics-agent.yaml` shows the contract: no `hostIPC`, `IPC_LOCK` for memory registration, the MXL root hostPath at `/Volumes/mxl`, a writable `/config` volume, probes on `/livez` and `/readyz`, and `terminationGracePeriodSeconds` greater than `SHUTDOWN_TIMEOUT_S`.
 
-Set `NMOS_HOST_ADDRESS` to the node IP, `NMOS_DNS_SD=false`, and `NMOS_REGISTRY_PORT` to the platform registration port (the query port defaults to that port plus 1). Set `LOCAL_NODE_CIDRS` to the node's pod CIDR. Set `MXL_CLEANUP_ON_EXIT=true` so this node's mirrors disappear on shutdown. Leave `NMOS_SEED` unset to keep the existing node id, which is UUIDv5 of `HOST_ID`. Setting `NMOS_SEED` changes that id.
+Set `NMOS_HOST_ADDRESS` to the node IP, `NMOS_DNS_SD=false`, and `NMOS_REGISTRY_PORT` to the platform registration port (the query port defaults to that port plus 1). Set `LOCAL_NODE_CIDRS` to the node's pod CIDR. Set `MXL_CLEANUP_ON_EXIT=true` so this node's mirrors disappear on shutdown, or `false` so readers on the node keep their mirror flows across an agent restart. Leave `NMOS_SEED` unset to keep the existing node id, which is UUIDv5 of `HOST_ID`. Setting `NMOS_SEED` changes that id.

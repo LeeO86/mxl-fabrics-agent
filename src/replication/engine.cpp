@@ -96,9 +96,16 @@ void ReplicationEngine::releaseDomain(std::string const& path)
     domains_.erase(path);
 }
 
-void ReplicationEngine::releaseAll()
+void ReplicationEngine::releaseAll(bool keepFlows)
 {
     std::lock_guard const lock{mu_};
+    if (keepFlows)
+    {
+        for (auto const& [_, dom] : domains_)
+        {
+            dom->keepFlowsOnExit();
+        }
+    }
     domains_.clear();
 }
 
@@ -193,6 +200,7 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
         }
         state.peer_boot = pull.peer_boot;
         state.peer_revision = pull.peer_revision;
+        state.source_active = pull.source_active;
         if (std::chrono::steady_clock::now() < state.next_attempt && state.state == "error")
         {
             continue;
@@ -407,7 +415,6 @@ bool ReplicationEngine::eraseTarget(std::string const& replicationId, std::strin
 std::vector<ReplicaView> ReplicationEngine::status() const
 {
     std::vector<ReplicaView> out;
-    std::map<std::string, std::uint64_t> sourceHead;
     for (auto const& [_, dom] : domains_)
     {
         for (auto const& row : dom->rows())
@@ -426,22 +433,8 @@ std::vector<ReplicaView> ReplicationEngine::status() const
             view.last_error = row.last_error;
             view.fallback = row.fallback;
             view.cq_depth = row.cq_depth;
-            if (row.role == "source")
-            {
-                sourceHead[row.flow_id] = row.head;
-            }
+            view.lag = static_cast<std::int64_t>(row.behind);
             out.push_back(std::move(view));
-        }
-    }
-    for (auto& view : out)
-    {
-        if (view.role == "destination")
-        {
-            auto const it = sourceHead.find(view.flow_id);
-            if (it != sourceHead.end() && it->second >= view.head)
-            {
-                view.lag = static_cast<std::int64_t>(it->second - view.head);
-            }
         }
     }
     for (auto const& [key, state] : dest_)
@@ -453,6 +446,10 @@ std::vector<ReplicaView> ReplicationEngine::status() const
             {
                 view.state = state.state == "active" ? view.state : state.state;
                 view.restarts = state.restarts;
+                if (!state.source_active)
+                {
+                    view.lag = 0; // nobody writes the origin flow: the mirror is not behind
+                }
                 view.fallback = state.fallback || view.fallback;
                 if (!state.provider.empty())
                 {
