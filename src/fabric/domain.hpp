@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -8,12 +9,17 @@
 
 namespace mfa
 {
+// Called on the domain thread with a source grain's transfer time (first transfer to completion).
+using TransferObserver = std::function<void(std::string const& provider, double seconds)>;
+
 struct FabricEndpoint
 {
     std::string provider = "tcp";
     std::string node;
     std::string service;
     bool allowTcpFallback = false;
+    int pacingBatches = 0;     // TRANSFER_PACING=frame: slice batches per grain; 0 = whole grains
+    double pacingSpread = 0.5; // share of the grain duration the batches start within
 };
 
 struct TargetSetup
@@ -76,6 +82,7 @@ public:
     void destroyInitiator(std::string const& key);
     // Shutdown without releasing writers or the MXL instance (MXL would delete the flows).
     void keepFlowsOnExit();
+    void setTransferObserver(TransferObserver observer);
 
     std::vector<FabricRow> rows() const;
 

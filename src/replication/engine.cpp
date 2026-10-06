@@ -20,6 +20,9 @@ std::string pullKey(PullRequest const& pull)
 ReplicationEngine::ReplicationEngine(Config cfg)
     : cfg_(std::move(cfg))
     , nextPort_(cfg_.fabric_port_base)
+    // TRANSFER_PACING* need a restart: the values at start stay in effect.
+    , pacingBatches_(cfg_.transfer_pacing == "frame" ? cfg_.transfer_pacing_batches : 0)
+    , pacingSpread_(cfg_.transfer_pacing_spread)
 {}
 
 ReplicationEngine::~ReplicationEngine()
@@ -40,6 +43,8 @@ FabricEndpoint ReplicationEngine::endpoint(std::string const& peer) const
     ep.allowTcpFallback = cfg_.provider_fallback == "tcp";
     ep.provider = cfg_.default_provider;
     ep.node = cfg_.fabric_interface;
+    ep.pacingBatches = pacingBatches_;
+    ep.pacingSpread = pacingSpread_;
     for (auto const& item : cfg_.peers)
     {
         if (item.host_id == peer)
@@ -70,15 +75,21 @@ std::shared_ptr<FabricDomain> ReplicationEngine::domain(std::string const& path)
     }
     int rt = 0;
     std::vector<int> cpus;
+    TransferObserver observer;
     {
         std::lock_guard const lock{mu_};
         rt = cfg_.rt_priority;
         cpus = cfg_.cpu_affinity;
+        observer = transferObserver_;
     }
     auto created = std::make_shared<FabricDomain>(path, rt, cpus);
     if (!created->ok())
     {
         log::error("domain_fabric_failed", {{"path", path}, {"error", created->error()}});
+    }
+    if (observer)
+    {
+        created->setTransferObserver(std::move(observer));
     }
     std::lock_guard const lock{mu_};
     auto const it = domains_.find(path);
@@ -94,6 +105,12 @@ void ReplicationEngine::releaseDomain(std::string const& path)
 {
     std::lock_guard const lock{mu_};
     domains_.erase(path);
+}
+
+void ReplicationEngine::setTransferObserver(TransferObserver observer)
+{
+    std::lock_guard const lock{mu_};
+    transferObserver_ = std::move(observer);
 }
 
 void ReplicationEngine::releaseAll(bool keepFlows)

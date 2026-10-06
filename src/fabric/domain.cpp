@@ -144,6 +144,7 @@ struct TargetSlot
     std::uint64_t bytes = 0;
     std::uint64_t errors = 0;
     std::uint64_t head = 0;
+    std::uint64_t lastCounted = MXL_UNDEFINED_INDEX; // grain index last counted in grains/bytes
     std::size_t lastBatch = 1; // samples in the last committed batch (a "grain" of a continuous flow)
     std::string lastError;
     std::string state = "pending";
@@ -175,6 +176,19 @@ struct InitiatorSlot
     bool connected = false;
     bool inFlight = false;
     std::chrono::steady_clock::time_point progressAt{}; // last MakeProgress that returned OK
+    std::chrono::steady_clock::time_point notReadySince{}; // start of the current run of NOT_READY passes
+    // TRANSFER_PACING=frame: a complete grain goes out in slice batches whose starts are spread
+    // over pacingSpread, instead of one burst at line rate.
+    int pacingBatches = 0;
+    std::chrono::nanoseconds pacingSpread{};
+    std::uint16_t pacedEnd = 0;  // slices of the grain being paced, 0 = none
+    std::uint16_t pacedSent = 0; // slices sent so far
+    int pacedBatch = 0;          // next batch
+    std::chrono::steady_clock::time_point pacedStart{};
+    std::uint64_t pacedBytes = 0;
+    // grain_transfer_seconds: from the grain's first transfer to the completion of its last one.
+    std::chrono::steady_clock::time_point transferStart{};
+    bool awaitingCompletion = false;
     std::string lastError;
     std::string state = "pending";
     std::map<std::string, mxlFabricsTargetInfo> targets;
@@ -538,6 +552,13 @@ public:
             slot.provider = provider;
             slot.fallback = fallback;
             slot.state = "pending";
+            auto const rate = info.common.grainRate;
+            if (!slot.continuous && endpoint.pacingBatches > 1 && rate.numerator > 0)
+            {
+                slot.pacingBatches = endpoint.pacingBatches;
+                slot.pacingSpread = std::chrono::nanoseconds(
+                    static_cast<std::int64_t>(endpoint.pacingSpread * 1e9 * static_cast<double>(rate.denominator) / static_cast<double>(rate.numerator)));
+            }
             initiators_.emplace(key, std::move(slot));
             return true;
         };
@@ -610,6 +631,7 @@ public:
         slot.targetTexts[destHost] = targetInfo;
         slot.connected = false;
         slot.state = "pending";
+        restartPacedGrain(slot); // the new target needs the grain header, which only the first batch carries
         publish();
         return true;
     }
@@ -630,6 +652,7 @@ public:
         mxlFabricsFreeTargetInfo(found->second);
         it->second.targets.erase(found);
         it->second.targetTexts.erase(destHost);
+        restartPacedGrain(it->second);
         publish();
     }
 
@@ -661,6 +684,28 @@ public:
     std::vector<FabricRow> rows() const
     {
         return rows_;
+    }
+
+    void setTransferObserver(TransferObserver observer)
+    {
+        transferObserver_ = std::move(observer);
+    }
+
+    // How long the domain thread may sleep before the next pump: until the next paced batch is
+    // due, at most the usual 2 ms.
+    std::chrono::steady_clock::duration waitHint() const
+    {
+        std::chrono::steady_clock::duration wait = std::chrono::milliseconds(2);
+        auto const now = std::chrono::steady_clock::now();
+        for (auto const& [_, slot] : initiators_)
+        {
+            if (slot.pacedEnd != 0)
+            {
+                auto const due = slot.pacedStart + slot.pacingSpread * slot.pacedBatch / std::min<int>(slot.pacingBatches, slot.pacedEnd);
+                wait = std::min(wait, due > now ? std::chrono::steady_clock::duration(due - now) : std::chrono::steady_clock::duration::zero());
+            }
+        }
+        return std::max<std::chrono::steady_clock::duration>(wait, std::chrono::microseconds(100));
     }
 
 private:
@@ -706,6 +751,10 @@ private:
         auto const progress = mxlFabricsInitiatorMakeProgressNonBlocking(slot.initiator);
         if (progress == MXL_ERR_NOT_READY || progress == MXL_ERR_INTERRUPTED)
         {
+            if (slot.notReadySince == std::chrono::steady_clock::time_point{})
+            {
+                slot.notReadySince = std::chrono::steady_clock::now();
+            }
             // NOT_READY also means transfers still in flight (verbs, most passes).
             // Only an initiator that never connected to its current targets is pending.
             if (!slot.connected)
@@ -732,7 +781,23 @@ private:
         }
         slot.connected = true;
         slot.inFlight = false;
-        slot.progressAt = std::chrono::steady_clock::now();
+        auto const now = std::chrono::steady_clock::now();
+        slot.progressAt = now;
+        if (slot.awaitingCompletion)
+        {
+            if (transferObserver_)
+            {
+                transferObserver_(slot.provider, std::chrono::duration<double>(now - slot.transferStart).count());
+            }
+            slot.awaitingCompletion = false;
+        }
+        // After a long wait (MXL connecting an endpoint again) a target may have missed the first
+        // batch of the paced grain, which carries the grain header.
+        if (slot.notReadySince != std::chrono::steady_clock::time_point{} && now - slot.notReadySince > std::chrono::milliseconds(100))
+        {
+            restartPacedGrain(slot);
+        }
+        slot.notReadySince = {};
         auto const errorsBefore = slot.errors;
         if (slot.continuous)
         {
@@ -758,6 +823,11 @@ private:
 
     void pumpGrains(InitiatorSlot& slot)
     {
+        if (slot.pacedEnd != 0)
+        {
+            pumpPacedBatch(slot);
+            return;
+        }
         if (!slot.primed)
         {
             slot.nextIndex = mxlGetCurrentIndex(&slot.info.common.grainRate);
@@ -787,6 +857,17 @@ private:
         {
             end = info.validSlices != 0 ? info.validSlices : info.totalSlices;
         }
+        // Only complete grains are paced; partial and invalid ones go out at once as before.
+        if (slot.pacingBatches > 1 && end > 1 && end == info.totalSlices)
+        {
+            slot.pacedEnd = end;
+            slot.pacedSent = 0;
+            slot.pacedBatch = 0;
+            slot.pacedStart = std::chrono::steady_clock::now();
+            slot.pacedBytes = info.grainSize != 0 ? info.grainSize : end;
+            pumpPacedBatch(slot);
+            return;
+        }
         auto const transfer = mxlFabricsInitiatorTransferGrain(slot.initiator, slot.nextIndex, 0, end);
         if (transfer == MXL_ERR_NOT_READY)
         {
@@ -802,6 +883,59 @@ private:
         slot.grains += 1;
         slot.bytes += info.grainSize != 0 ? info.grainSize : end;
         slot.nextIndex += 1;
+        slot.transferStart = std::chrono::steady_clock::now();
+        slot.awaitingCompletion = true;
+    }
+
+    // The next slice batch of the grain being paced, once its start is due. Batch k of n covers
+    // slices [k·end/n, (k+1)·end/n) and may start pacingSpread·k/n after the first; the next batch
+    // waits for MakeProgress to report the previous one complete.
+    void pumpPacedBatch(InitiatorSlot& slot)
+    {
+        int const batches = std::min<int>(slot.pacingBatches, slot.pacedEnd);
+        auto const now = std::chrono::steady_clock::now();
+        if (now < slot.pacedStart + slot.pacingSpread * slot.pacedBatch / batches)
+        {
+            return;
+        }
+        auto const start = slot.pacedSent;
+        auto const end = static_cast<std::uint16_t>(static_cast<std::uint32_t>(slot.pacedEnd) * static_cast<std::uint32_t>(slot.pacedBatch + 1) /
+                                                    static_cast<std::uint32_t>(batches));
+        auto const transfer = mxlFabricsInitiatorTransferGrain(slot.initiator, slot.nextIndex, start, end);
+        if (transfer == MXL_ERR_NOT_READY)
+        {
+            return;
+        }
+        if (transfer != MXL_STATUS_OK)
+        {
+            slot.errors += 1;
+            slot.lastError = "transfer " + statusText(transfer);
+            slot.state = "error";
+            slot.pacedEnd = 0; // the grain starts again from its first slice
+            return;
+        }
+        if (slot.pacedBatch == 0)
+        {
+            slot.transferStart = now;
+        }
+        slot.pacedSent = end;
+        slot.pacedBatch += 1;
+        if (slot.pacedSent >= slot.pacedEnd)
+        {
+            slot.grains += 1;
+            slot.bytes += slot.pacedBytes;
+            slot.nextIndex += 1;
+            slot.pacedEnd = 0;
+            slot.awaitingCompletion = true;
+        }
+    }
+
+    // Sends the grain being paced again from its first slice: a target that missed the first batch
+    // has no grain header (the destination takes the grain index from it).
+    static void restartPacedGrain(InitiatorSlot& slot)
+    {
+        slot.pacedEnd = 0;
+        slot.awaitingCompletion = false;
     }
 
     void pumpSamples(InitiatorSlot& slot)
@@ -968,8 +1102,14 @@ private:
                     slot.state = "error";
                     return;
                 }
-                slot.grains += 1;
-                slot.bytes += snapshot.grainSize;
+                // A paced grain arrives in several batches; each is committed (MXL keeps a partial
+                // grain open, readers of whole grains wait for the last slice), counted once.
+                if (index != slot.lastCounted)
+                {
+                    slot.grains += 1;
+                    slot.bytes += snapshot.grainSize;
+                    slot.lastCounted = index;
+                }
                 slot.head = index;
                 ++committed;
             }
@@ -1047,6 +1187,7 @@ private:
     std::map<std::string, InitiatorSlot> initiators_;
     std::vector<FabricRow> rows_;
     bool keepFlows_ = false;
+    TransferObserver transferObserver_;
 };
 
 struct Task
@@ -1085,7 +1226,7 @@ struct FabricDomain::Impl
             std::vector<Task> batch;
             {
                 std::unique_lock lock(mu);
-                cv.wait_for(lock, std::chrono::milliseconds(2), [&] { return stop || !queue.empty(); });
+                cv.wait_for(lock, session.waitHint(), [&] { return stop || !queue.empty(); });
                 if (stop && queue.empty())
                 {
                     break;
@@ -1274,6 +1415,11 @@ void FabricDomain::destroyInitiator(std::string const& key)
 void FabricDomain::keepFlowsOnExit()
 {
     impl_->call([](Session& session) { session.keepFlowsOnExit(); });
+}
+
+void FabricDomain::setTransferObserver(TransferObserver observer)
+{
+    impl_->call([&](Session& session) { session.setTransferObserver(std::move(observer)); });
 }
 
 std::vector<FabricRow> FabricDomain::rows() const
