@@ -314,13 +314,18 @@ void NmosObserver::poll(std::string const& base)
         receiver.control_href = deviceControl[receiver.device_id];
         if (!receiver.control_href.empty())
         {
-            auto const active = httpRequest("GET", receiver.control_href + "/single/receivers/" + receiver.id + "/active");
-            if (active.status == 200)
+            auto const url = receiverActiveUrl(receiver.control_href, receiver.id);
+            auto const active = httpRequest("GET", url);
+            auto parsed = active.status == 200 ? parseActive(active.body) : std::nullopt;
+            if (parsed)
             {
-                if (auto parsed = parseActive(active.body))
-                {
-                    receiver.active = *parsed;
-                }
+                receiver.active = *parsed;
+                activeFailed_.erase(receiver.id);
+            }
+            else if (activeFailed_.insert(receiver.id).second)
+            {
+                // Without /active the receiver counts as not routed: no demand, no replication.
+                log::warn("nmos_active_unavailable", {{"receiver_id", receiver.id}, {"url", url}, {"status", std::to_string(active.status)}});
             }
         }
         next.receivers.push_back(std::move(receiver));

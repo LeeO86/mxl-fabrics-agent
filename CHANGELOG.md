@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.1
+
+- A receiver's IS-05 `/active` is read at `<control href>/single/receivers/<id>/active` without a doubled slash. Devices advertise the href with a trailing `/` (nmos-cpp, FlowXer); FlowXer up to 9.16.33 answered the `//single/…` form with 404, so the agent took all its receivers as not routed and replicated none of their flows (small platform: the vision mixer's inputs stayed frozen mirrors, Program rendered no frames).
+- A receiver whose `/active` cannot be read is logged once (`nmos_active_unavailable` with URL and HTTP status) until it works again. It counts as not routed, which was silent before.
+
 ## 1.2.0
 
 - Transfer pacing is removed again. On the platform's E810 mesh over `verbs` it multiplied retransmissions about 1000-fold and replication broke (517 link restarts in 69 minutes, readers without grains); unpaced, the same links ran at 50 grains/s. MXL's target keeps one receive posted for the immediate data that ends every transfer and posts the next only when the agent reads the completion; with 8 batches per grain the next batch usually arrived before that (receiver not ready). MXL's public API has no transfer without an immediate, so the agent cannot work around it. `TRANSFER_PACING`, `TRANSFER_PACING_SPREAD` and `TRANSFER_PACING_BATCHES` are ignored (a set `TRANSFER_PACING` other than `off` logs `transfer_pacing_removed`); the gauges `transfer_pacing_batches` and `transfer_pacing_spread` are gone.
