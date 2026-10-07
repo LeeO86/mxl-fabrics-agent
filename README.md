@@ -157,7 +157,7 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | `LOCAL_NODE_CIDRS` | empty | Pod CIDR of this node when media functions use the pod network |
 | `WEB_PORT` | 8095 | UI, `/api/v1`, health, metrics |
 | `WEB_ENABLE` | true | `false` hides the UI and `PUT /api/v1/config`. Health, metrics, and `/api/v1` stay up |
-| `RT_PRIORITY` / `CPU_AFFINITY` | 0 / empty | Fabric thread scheduling |
+| `RT_PRIORITY` / `CPU_AFFINITY` | 0 / empty | Fabric thread scheduling. `RT_PRIORITY` (SCHED_FIFO) needs `SYS_NICE` in the container's capabilities (`--cap-add SYS_NICE`, Kubernetes `capabilities.add`); the image raises it from the binary's file capabilities |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` |
 | `METRICS_PER_FLOW` | true | Drop per-flow metric labels when false |
 | `SHUTDOWN_TIMEOUT_S` | 10 | SIGTERM budget. The process then exits 143 |
