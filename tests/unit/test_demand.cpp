@@ -2,6 +2,7 @@
 
 #include "config/config.hpp"
 #include "demand/derive.hpp"
+#include "nmos/observer.hpp"
 #include "util/cidr.hpp"
 
 using namespace mfa;
@@ -207,4 +208,13 @@ TEST_CASE("active parsing and demand states")
     CHECK(replicating == 1);
     CHECK(stale == 1);
     CHECK(unresolved == 1);
+}
+
+TEST_CASE("receiver /active url from a control href with or without the trailing slash")
+{
+    // FlowXer and nmos-cpp advertise ".../v1.2/"; FlowXer before 9.16.34 answered "//single" with 404,
+    // so the agent saw its receivers as not routed and replicated nothing (platform, 2026-10-07).
+    CHECK(receiverActiveUrl("http://10.42.1.26:3252/x-nmos/connection/v1.2/", "r1") == "http://10.42.1.26:3252/x-nmos/connection/v1.2/single/receivers/r1/active");
+    CHECK(receiverActiveUrl("http://h:1/x-nmos/connection/v1.1", "r2") == "http://h:1/x-nmos/connection/v1.1/single/receivers/r2/active");
+    CHECK(receiverActiveUrl("http://h:1/x-nmos/connection/v1.2//", "r3") == "http://h:1/x-nmos/connection/v1.2/single/receivers/r3/active");
 }

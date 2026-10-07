@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,6 +23,10 @@ struct NmosSnapshot
     std::vector<PeerSnapshot> agents;
     std::uint64_t poll_errors = 0;
 };
+
+// IS-05 /active of a receiver below a device's control href. The href usually ends in "/"
+// (nmos-cpp and FlowXer advertise it so); a doubled slash is not routed by every node.
+std::string receiverActiveUrl(std::string controlHref, std::string const& receiverId);
 
 class NmosObserver
 {
@@ -46,6 +51,7 @@ private:
     Wake wake_;
     mutable std::mutex mu_;
     NmosSnapshot snap_;
+    std::set<std::string> activeFailed_; // receivers whose /active failed at the last poll (poll thread)
     bool stop_ = false;
     std::thread thread_;
 };
