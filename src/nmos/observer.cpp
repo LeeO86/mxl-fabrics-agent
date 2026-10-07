@@ -30,15 +30,6 @@ std::vector<picojson::value> asArray(std::string const& body)
 }
 } // namespace
 
-std::string receiverActiveUrl(std::string controlHref, std::string const& receiverId)
-{
-    while (!controlHref.empty() && controlHref.back() == '/')
-    {
-        controlHref.pop_back();
-    }
-    return controlHref + "/single/receivers/" + receiverId + "/active";
-}
-
 NmosObserver::NmosObserver(Config cfg, LocalIdentity self, Wake wake)
     : cfg_(std::move(cfg))
     , self_(std::move(self))
