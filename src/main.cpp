@@ -5,6 +5,7 @@
 #include "reconcile/controller.hpp"
 #include "util/logging.hpp"
 #include "util/net.hpp"
+#include "util/threading.hpp"
 #include "version.hpp"
 
 #include <algorithm>
@@ -38,6 +39,8 @@ int main(int argc, char** argv)
 {
     (void)argc;
     (void)argv;
+    // Before any thread starts: the fabric thread's RT_PRIORITY needs SYS_NICE in effect.
+    auto const capabilities = mfa::raisePermittedCapabilities();
     // A mirror keeps one descriptor per grain (50 for 1 s at 50p), and eager mode
     // mirrors every flow of every peer. Docker's default soft limit of 1024 runs out
     // with a few dozen flows; mxlCreateFlowWriter then fails ("Too many open files").
@@ -126,7 +129,7 @@ int main(int argc, char** argv)
         {
             mfa::log::warn("provider_fallback_default", {{"from", cfg.default_provider}, {"to", "tcp"}});
         }
-        mfa::log::info("startup", {{"version", mfa::kVersion}, {"host_id", cfg.host_id}, {"mxl", mfa::kMxlPin}});
+        mfa::log::info("startup", {{"version", mfa::kVersion}, {"host_id", cfg.host_id}, {"mxl", mfa::kMxlPin}, {"capabilities", capabilities}});
         // 1.1.0 only: over verbs MXL's target keeps one receive for immediate data, and every paced
         // batch carries one, so pacing multiplied retransmissions. The setting is ignored now.
         if (char const* pacing = std::getenv("TRANSFER_PACING"); pacing != nullptr && std::string(pacing) != "off")

@@ -74,7 +74,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         ca-certificates curl \
         libibverbs1 librdmacm1 rdma-core ibverbs-providers ibverbs-utils \
         libcpprest2.10 libboost-chrono1.83.0t64 libboost-thread1.83.0 \
-        libssl3t64 libavahi-compat-libdnssd1 \
+        libssl3t64 libavahi-compat-libdnssd1 libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/lib/libfabric* /usr/local/lib/
 COPY --from=build /opt/mxl/lib/ /usr/local/lib/
@@ -82,7 +82,11 @@ COPY --from=build /src/build/mxl-fabrics-agent /usr/local/bin/mxl-fabrics-agent
 COPY --from=build /src/build/mxl-pattern-writer /usr/local/bin/mxl-pattern-writer
 COPY tests/integration/fake_nmos.py /usr/local/share/mxl-fabrics-agent/fake_nmos.py
 # Ubuntu 24.04 already has uid 1000 (user ubuntu). useradd --uid 1000 then exits 4.
+# File capabilities, permitted only (no effective bit): the agent raises them itself at start
+# (SYS_NICE for RT_PRIORITY, IPC_LOCK for locked memory). With the effective bit, execve fails
+# wherever the runtime does not grant them; this way a missing one only stays missing.
 RUN ldconfig \
+    && setcap cap_sys_nice,cap_ipc_lock+p /usr/local/bin/mxl-fabrics-agent \
     && if ! getent passwd 1000 >/dev/null; then \
          useradd --uid 1000 --no-create-home --shell /usr/sbin/nologin mxl; \
        fi

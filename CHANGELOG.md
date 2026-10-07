@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.2
+
+- `RT_PRIORITY` works for the non-root agent. The binary carries `cap_sys_nice` and `cap_ipc_lock` as permitted file capabilities (`setcap …+p`), and the agent raises them into its effective set at start, before any thread. Kubernetes `capabilities.add` only puts a capability into the bounding set; without an effective `SYS_NICE` the fabric thread got no `SCHED_FIFO` (platform: `rt_priority_failed "Operation not permitted"` on every agent). The effective bit is not set on the file, so a runtime that does not grant `SYS_NICE` still starts the agent (it then logs `rt_priority_failed` as before). The `startup` log line lists the effective capabilities (`capabilities`).
+- `deploy/mxl-fabrics-agent.yaml` adds `SYS_NICE` to `capabilities.add`.
+
 ## 1.2.1
 
 - A receiver's IS-05 `/active` is read at `<control href>/single/receivers/<id>/active` without a doubled slash. Devices advertise the href with a trailing `/` (nmos-cpp, FlowXer); FlowXer up to 9.16.33 answered the `//single/…` form with 404, so the agent took all its receivers as not routed and replicated none of their flows (small platform: the vision mixer's inputs stayed frozen mirrors, Program rendered no frames).
