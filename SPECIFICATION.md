@@ -445,9 +445,14 @@ handshake clears the destination's last handshake error (`recv`, `http …`).
   and drains target completions.
 - Initiator side: for each new grain index available in the origin reader
   (blocking wait with short timeout), transfer that grain to all targets.
-  Continuous (audio) flows use the corresponding sample-transfer API if the
-  pinned MXL provides it; if not, audio replication is listed as a known
-  deviation in `IMPLEMENTATION_PLAN.md`.
+  Continuous (audio) flows use MXL's sample transfer. One transfer carries
+  every sample written since the last one, up to what the targets' bounce
+  buffer entry holds (its size is in the target info), and starts one fabric
+  thread pass (2 ms) after the last one completed: over `verbs` MXL's target
+  posts the receive for the next immediate only when its agent drains the last
+  transfer. 1.2.2 sent one sync batch per pass (48 samples from the ST 2110
+  gateway): half of a 48 kHz flow arrived, 8 % over `verbs` on the platform.
+  For continuous flows `replication_grains_total` counts transfers.
 - No transfer pacing: a grain goes out as one transfer. 1.1.0 had an optional
   pacing (slice batches spread over part of the grain duration); over `verbs`
   MXL's target keeps one receive posted for the immediate data that ends every

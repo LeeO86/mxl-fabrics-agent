@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.3
+
+- Continuous (audio) flows replicate completely. 1.2.2 sent one sync batch per transfer and at most one transfer per pass of the fabric thread (2 ms). With the ST 2110 gateway's batch of 48 samples (1 ms) half of a 48 kHz flow arrived (lab, `tcp` and `verbs`), over `verbs` on the platform's E810 8 % (815 transfers in 10 s, `lag_grains` growing, 89 % zeros for the reader of the mirror). Now one transfer carries every sample written since the last one, up to the target's bounce buffer entry (MXL sizes it from the mirror's sync batch, 10 ms by default), and it starts one pass after the last one completed: over `verbs` MXL's target posts the receive for the next immediate only when its agent drains the last transfer, and a transfer that comes sooner meets "receiver not ready" (soft-RoCE, four audio flows: about 150 per second with 1.2.2, none now). Lab (one host, `tcp` and soft-RoCE, 2 ch 48 kHz, 200 ms history, one and four flows plus 1080p50): 48,000 of 48,000 samples/s on each mirror, none missed, the mirror about 4 ms behind the origin (1.2.2: about 22,500 samples/s, up to 200 ms behind); video unchanged at 50 grains/s; agent CPU unchanged.
+- `replication_bytes_total` of a continuous flow counts all channels (it counted 4 bytes per sample: 192 B for a transfer of 48 samples of 2 ch float, which carries 384 B).
+- The container workflow runs once per ref; a newer run cancels the older one. The v1.2.2 tag started it twice, and the second run pushed another image over the tag's digest.
+- README: keep `RT_PRIORITY` below 50. The kernel's threaded IRQs run at `SCHED_FIFO` 50, and at equal priority a NIC IRQ thread waits for the agent's pass (the platform uses 49).
+- `mxl-pattern-writer audio` writes a 2-channel 48 kHz pattern flow in batches of 48 samples, `mxl-pattern-writer samples` counts the correct samples of its mirror; `tests/integration/tcp_mesh.sh` requires 45,000 of 48,000 per second.
+
 ## 1.2.2
 
 - `RT_PRIORITY` works for the non-root agent. The binary carries `cap_sys_nice` and `cap_ipc_lock` as permitted file capabilities (`setcap …+p`), and the agent raises them into its effective set at start, before any thread. Kubernetes `capabilities.add` only puts a capability into the bounding set; without an effective `SYS_NICE` the fabric thread got no `SCHED_FIFO` (platform: `rt_priority_failed "Operation not permitted"` on every agent). The effective bit is not set on the file, so a runtime that does not grant `SYS_NICE` still starts the agent (it then logs `rt_priority_failed` as before). The `startup` log line lists the effective capabilities (`capabilities`).

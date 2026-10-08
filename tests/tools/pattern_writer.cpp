@@ -2,6 +2,7 @@
 #include <mxl/mxl.h>
 #include <mxl/time.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -212,6 +213,177 @@ int rateFlow(std::string const& domain, std::string const& flowId, int seconds, 
     return rate >= minRate ? 0 : 2;
 }
 
+// Value of sample `index` of channel `channel` in the audio pattern: never 0 (a missing sample) and
+// exact in a float.
+float audioSample(std::uint64_t index, std::uint32_t channel)
+{
+    return static_cast<float>((index + channel * 1000) % 8000000 + 1);
+}
+
+// A 2-channel 48 kHz float flow in its own domain with the given history, written in real time in
+// batches of `batch` samples with that sync and commit hint (48 = 1 ms, as the ST 2110 gateway writes).
+int writeAudio(std::string const& domain, std::string const& domainId, std::string const& flowId, int seconds, long long historyMs, int batch)
+{
+    std::filesystem::create_directories(domain);
+    writeFile(std::filesystem::path(domain) / "options.json",
+        "{\"urn:x-mxl:option:history_duration/v1.0\":" + std::to_string(historyMs * 1000000) + "}");
+    writeFile(std::filesystem::path(domain) / "domain_def.json", "{\"id\":\"" + domainId + "\"}");
+    std::string const def = std::string("{\"id\":\"") + flowId +
+                            "\",\"format\":\"urn:x-nmos:format:audio\",\"label\":\"pattern audio\",\"description\":\"integration writer\","
+                            "\"tags\":{\"urn:x-nmos:tag:grouphint/v1.0\":[\"pattern:Audio\"]},\"parents\":[],\"media_type\":\"audio/float32\","
+                            "\"sample_rate\":{\"numerator\":48000,\"denominator\":1},\"channel_count\":2,\"bit_depth\":32}";
+    auto const options = "{\"maxCommitBatchSizeHint\":" + std::to_string(batch) + ",\"maxSyncBatchSizeHint\":" + std::to_string(batch) + "}";
+    auto* instance = mxlCreateInstance(domain.c_str(), "");
+    if (instance == nullptr)
+    {
+        std::cerr << "mxlCreateInstance failed\n";
+        return 1;
+    }
+    mxlFlowWriter writer = nullptr;
+    mxlFlowConfigInfo info{};
+    bool created = false;
+    if (mxlCreateFlowWriter(instance, def.c_str(), options.c_str(), &writer, &info, &created) != MXL_STATUS_OK)
+    {
+        std::cerr << "mxlCreateFlowWriter failed\n";
+        return 1;
+    }
+    std::cout << "writing 2 ch 48 kHz in batches of " << batch << " to " << flowId << " for " << seconds << " s, history " << historyMs << " ms\n";
+    auto const end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    std::uint64_t head = mxlGetCurrentIndex(&info.common.grainRate);
+    while (std::chrono::steady_clock::now() < end)
+    {
+        if (mxlGetCurrentIndex(&info.common.grainRate) < head + batch)
+        {
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            continue;
+        }
+        mxlMutableWrappedMultiBufferSlice slice{};
+        if (mxlFlowWriterOpenSamples(writer, head + batch, batch, &slice) != MXL_STATUS_OK)
+        {
+            std::cerr << "open samples failed at " << head << "\n";
+            return 1;
+        }
+        for (std::uint32_t channel = 0; channel < slice.count; ++channel)
+        {
+            auto index = head;
+            for (auto const& fragment : slice.base.fragments)
+            {
+                auto* samples = reinterpret_cast<float*>(static_cast<std::uint8_t*>(fragment.pointer) + slice.stride * channel);
+                for (std::size_t i = 0; i < fragment.size / sizeof(float); ++i)
+                {
+                    samples[i] = audioSample(index++, channel);
+                }
+            }
+        }
+        if (mxlFlowWriterCommitSamples(writer) != MXL_STATUS_OK)
+        {
+            std::cerr << "commit samples failed\n";
+            return 1;
+        }
+        head += batch;
+    }
+    mxlReleaseFlowWriter(instance, writer);
+    mxlDestroyInstance(instance);
+    return 0;
+}
+
+// Counts the samples of a (mirrored) audio pattern flow that hold their pattern value on both
+// channels, for `seconds` after the first one. Fails below `minRate` samples per second.
+int sampleRateFlow(std::string const& domain, std::string const& flowId, int seconds, double minRate)
+{
+    auto* instance = mxlCreateInstance(domain.c_str(), "");
+    if (instance == nullptr)
+    {
+        return 1;
+    }
+    mxlFlowReader reader = nullptr;
+    for (int i = 0; i < 100 && mxlCreateFlowReader(instance, flowId.c_str(), nullptr, &reader) != MXL_STATUS_OK; ++i)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (reader == nullptr)
+    {
+        std::cerr << "no flow " << flowId << " in " << domain << "\n";
+        return 1;
+    }
+    std::size_t maxRead = 0;
+    mxlFlowReaderGetMaxReadLengthSamples(reader, &maxRead);
+    mxlFlowConfigInfo config{};
+    mxlFlowReaderGetConfigInfo(reader, &config);
+    auto head = [&] {
+        mxlFlowRuntimeInfo runtime{};
+        return mxlFlowReaderGetRuntimeInfo(reader, &runtime) == MXL_STATUS_OK && runtime.headIndex != MXL_UNDEFINED_INDEX ? runtime.headIndex
+                                                                                                                        : 0;
+    };
+    std::uint64_t index = 0;
+    auto const startBy = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (index == 0 && std::chrono::steady_clock::now() < startBy)
+    {
+        index = head();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (index == 0)
+    {
+        std::cerr << "no samples arrived\n";
+        return 1;
+    }
+    long long good = 0;
+    long long missed = 0;
+    // How far the mirror head is behind the current TAI sample index (the origin writes at it).
+    std::uint64_t lagSum = 0;
+    std::uint64_t lagMax = 0;
+    std::uint64_t passes = 0;
+    auto const end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    while (std::chrono::steady_clock::now() < end)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        auto const now = head();
+        auto const lag = mxlGetCurrentIndex(&config.common.grainRate) - now;
+        lagSum += lag;
+        lagMax = std::max(lagMax, lag);
+        ++passes;
+        if (now <= index)
+        {
+            continue;
+        }
+        if (now - index > maxRead)
+        {
+            missed += static_cast<long long>(now - index - maxRead);
+            index = now - maxRead;
+        }
+        auto const count = static_cast<std::size_t>(now - index);
+        mxlWrappedMultiBufferSlice slice{};
+        if (mxlFlowReaderGetSamplesNonBlocking(reader, now, count, &slice) != MXL_STATUS_OK || slice.count < 2)
+        {
+            missed += static_cast<long long>(count);
+            index = now;
+            continue;
+        }
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            bool ok = true;
+            for (std::uint32_t channel = 0; channel < 2; ++channel)
+            {
+                auto const offset = i * sizeof(float);
+                auto const& first = slice.base.fragments[0];
+                auto const* base = static_cast<std::uint8_t const*>(offset < first.size ? first.pointer : slice.base.fragments[1].pointer);
+                float value = 0;
+                std::memcpy(&value, base + slice.stride * channel + (offset < first.size ? offset : offset - first.size), sizeof(value));
+                ok = ok && value == audioSample(index + i, channel);
+            }
+            good += ok ? 1 : 0;
+            missed += ok ? 0 : 1;
+        }
+        index = now;
+    }
+    double const rate = static_cast<double>(good) / seconds;
+    std::cout << "samples " << good << " missed " << missed << " rate " << rate << "/s lag avg " << lagSum / std::max<std::uint64_t>(passes, 1)
+              << " max " << lagMax << " samples\n";
+    mxlReleaseFlowReader(instance, reader);
+    mxlDestroyInstance(instance);
+    return rate >= minRate ? 0 : 2;
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1 && std::string(argv[1]) == "read")
@@ -225,6 +397,14 @@ int main(int argc, char** argv)
     if (argc > 5 && std::string(argv[1]) == "rate")
     {
         return rateFlow(argv[2], argv[3], std::atoi(argv[4]), std::atof(argv[5]));
+    }
+    if (argc > 6 && std::string(argv[1]) == "audio")
+    {
+        return writeAudio(argv[2], argv[3], argv[4], std::atoi(argv[5]), std::atoll(argv[6]), argc > 7 ? std::atoi(argv[7]) : 48);
+    }
+    if (argc > 5 && std::string(argv[1]) == "samples")
+    {
+        return sampleRateFlow(argv[2], argv[3], std::atoi(argv[4]), std::atof(argv[5]));
     }
     std::string domain = argc > 1 ? argv[1] : "/dev/shm/mxl-a/src";
     std::string flowId = argc > 2 ? argv[2] : "11111111-1111-4111-8111-111111111111";
