@@ -81,7 +81,7 @@ The checked-in integration test is the single-machine demo: two MXL roots, two a
 LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/tcp_mesh.sh
 ```
 
-It checks that the eager mirror exists before the receiver is activated, that grain indices match, that disabling the receiver releases the target after `RELEASE_GRACE_MS`, that stopping the source is reported as peer down, that replication resumes, and that a flow id the source no longer has is `stale_reference`.
+It checks that the eager mirror exists before the receiver is activated, that grain indices match, that disabling the receiver releases the target after `RELEASE_GRACE_MS`, that stopping the source is reported as peer down, that replication resumes, that a flow id the source no longer has is `stale_reference`, that a 1080p50 flow with a 200 ms ring arrives at 50 grains/s, and that a 2-channel 48 kHz flow written in 1 ms batches arrives at 48,000 samples/s.
 
 `docker/docker-compose.demo.yaml` is the same shape in containers, plus Prometheus and Grafana. `docker/docker-compose.host.yaml` is one host of a real mesh: host networking, `/dev/infiniband`, `IPC_LOCK`, unlimited memlock, and the MXL root mounted read-write.
 
@@ -157,7 +157,7 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | `LOCAL_NODE_CIDRS` | empty | Pod CIDR of this node when media functions use the pod network |
 | `WEB_PORT` | 8095 | UI, `/api/v1`, health, metrics |
 | `WEB_ENABLE` | true | `false` hides the UI and `PUT /api/v1/config`. Health, metrics, and `/api/v1` stay up |
-| `RT_PRIORITY` / `CPU_AFFINITY` | 0 / empty | Fabric thread scheduling. `RT_PRIORITY` (SCHED_FIFO) needs `SYS_NICE` in the container's capabilities (`--cap-add SYS_NICE`, Kubernetes `capabilities.add`); the image raises it from the binary's file capabilities |
+| `RT_PRIORITY` / `CPU_AFFINITY` | 0 / empty | Fabric thread scheduling. `RT_PRIORITY` (SCHED_FIFO) needs `SYS_NICE` in the container's capabilities (`--cap-add SYS_NICE`, Kubernetes `capabilities.add`); the image raises it from the binary's file capabilities. Keep it below 50: the kernel's threaded IRQs run at SCHED_FIFO 50, and at equal priority a NIC IRQ thread waits for the agent's pass (the platform uses 49) |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` |
 | `METRICS_PER_FLOW` | true | Drop per-flow metric labels when false |
 | `SHUTDOWN_TIMEOUT_S` | 10 | SIGTERM budget. The process then exits 143 |

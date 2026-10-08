@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <mutex>
@@ -27,6 +28,9 @@ std::string statusText(mxlStatus status)
 {
     return std::to_string(static_cast<int>(status));
 }
+
+// The fabric thread makes a pass (initiator progress, target drains) at least this often.
+constexpr auto kPassInterval = std::chrono::milliseconds(2);
 
 struct PickedInterface
 {
@@ -125,6 +129,22 @@ std::string targetInfoToString(mxlFabricsTargetInfo info)
     return text;
 }
 
+// A continuous target receives each transfer into one entry of its bounce buffer: a 16-byte header
+// (MXL's AudioEntryHeader, head index and count), then the samples of all channels. MXL rejects a
+// transfer that does not fit. The target info carries the entry size; 0 when it does not.
+constexpr std::uint64_t kBounceEntryHeaderBytes = 16;
+
+std::uint64_t bounceEntryBytes(std::string const& targetInfo)
+{
+    auto const root = json::objectOrEmpty(json::parse(targetInfo));
+    auto const bounce = root.find("bounceBufferInfo");
+    if (bounce == root.end() || !bounce->second.is<picojson::object>())
+    {
+        return 0;
+    }
+    return std::strtoull(json::asString(bounce->second.get<picojson::object>(), "entrySize").value_or("").c_str(), nullptr, 10);
+}
+
 struct WriterSlot
 {
     mxlFlowWriter writer = nullptr;
@@ -174,7 +194,8 @@ struct InitiatorSlot
     bool primed = false;
     bool connected = false;
     bool inFlight = false;
-    std::chrono::steady_clock::time_point progressAt{}; // last MakeProgress that returned OK
+    std::chrono::steady_clock::time_point completedAt{}; // pass that saw the last sample transfer complete
+    std::chrono::steady_clock::time_point progressAt{};  // last MakeProgress that returned OK
     // grain_transfer_seconds: from a grain's transfer to its completion.
     std::chrono::steady_clock::time_point transferStart{};
     bool awaitingCompletion = false;
@@ -183,6 +204,7 @@ struct InitiatorSlot
     std::map<std::string, mxlFabricsTargetInfo> targets;
     // The target info each target was added with, to recognise a repeated request.
     std::map<std::string, std::string> targetTexts;
+    std::uint64_t entryBytes = 0; // smallest bounce buffer entry of the targets (continuous flows), 0 = unknown
 };
 
 class Session
@@ -611,6 +633,7 @@ public:
         }
         slot.targets.emplace(destHost, info);
         slot.targetTexts[destHost] = targetInfo;
+        updateEntryBytes(slot);
         slot.connected = false;
         slot.state = "pending";
         publish();
@@ -633,6 +656,7 @@ public:
         mxlFabricsFreeTargetInfo(found->second);
         it->second.targets.erase(found);
         it->second.targetTexts.erase(destHost);
+        updateEntryBytes(it->second);
         publish();
     }
 
@@ -684,6 +708,19 @@ public:
     }
 
 private:
+    static void updateEntryBytes(InitiatorSlot& slot)
+    {
+        slot.entryBytes = 0;
+        for (auto const& [_, text] : slot.targetTexts)
+        {
+            auto const bytes = bounceEntryBytes(text);
+            if (bytes != 0 && (slot.entryBytes == 0 || bytes < slot.entryBytes))
+            {
+                slot.entryBytes = bytes;
+            }
+        }
+    }
+
     void destroyTargetSlot(TargetSlot& slot)
     {
         if (slot.target != nullptr && fabrics_ != nullptr)
@@ -751,8 +788,11 @@ private:
             return;
         }
         slot.connected = true;
-        slot.inFlight = false;
         auto const now = std::chrono::steady_clock::now();
+        if (std::exchange(slot.inFlight, false))
+        {
+            slot.completedAt = now;
+        }
         slot.progressAt = now;
         if (slot.awaitingCompletion)
         {
@@ -837,33 +877,40 @@ private:
 
     void pumpSamples(InitiatorSlot& slot)
     {
+        // Over verbs MXL's target posts the receive for the next immediate only when its agent drains
+        // the last transfer, once per pass of the destination's fabric thread; a transfer that comes
+        // sooner meets "receiver not ready" and waits for the sender's retry timer. So a transfer
+        // waits a pass after the last one completed and carries every sample written since. 1.2.2
+        // sent one sync batch (48 samples from the ST 2110 gateway) per pass: half of a 48 kHz flow
+        // arrived, 8 % over verbs on the platform's E810.
+        if (std::chrono::steady_clock::now() - slot.completedAt < kPassInterval)
+        {
+            return;
+        }
+        mxlFlowRuntimeInfo runtime{};
+        if (mxlFlowReaderGetRuntimeInfo(slot.reader, &runtime) != MXL_STATUS_OK || runtime.headIndex == MXL_UNDEFINED_INDEX)
+        {
+            return;
+        }
+        if (!slot.primed)
+        {
+            slot.sampleHead = runtime.headIndex;
+            slot.primed = true;
+        }
+        if (runtime.headIndex <= slot.sampleHead)
+        {
+            return;
+        }
         std::size_t maxRead = 0;
         if (mxlFlowReaderGetMaxReadLengthSamples(slot.reader, &maxRead) != MXL_STATUS_OK || maxRead == 0)
         {
             maxRead = slot.info.common.maxSyncBatchSizeHint != 0 ? slot.info.common.maxSyncBatchSizeHint : 48;
         }
-        std::size_t batch = slot.info.common.maxSyncBatchSizeHint != 0 ? slot.info.common.maxSyncBatchSizeHint : maxRead;
-        if (batch > maxRead)
-        {
-            batch = maxRead;
-        }
-        if (!slot.primed)
-        {
-            mxlFlowRuntimeInfo runtime{};
-            mxlFlowReaderGetRuntimeInfo(slot.reader, &runtime);
-            slot.sampleHead = runtime.headIndex;
-            slot.primed = true;
-        }
+        auto count = static_cast<std::size_t>(std::min<std::uint64_t>(runtime.headIndex - slot.sampleHead, maxRead));
         mxlWrappedMultiBufferSlice payload{};
-        auto const status = mxlFlowReaderGetSamplesNonBlocking(slot.reader, slot.sampleHead, batch, &payload);
-        if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY || status == MXL_ERR_TIMEOUT || status == MXL_ERR_NOT_READY)
-        {
-            return;
-        }
+        auto const status = mxlFlowReaderGetSamplesNonBlocking(slot.reader, slot.sampleHead + count, count, &payload);
         if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
         {
-            mxlFlowRuntimeInfo runtime{};
-            mxlFlowReaderGetRuntimeInfo(slot.reader, &runtime);
             slot.sampleHead = runtime.headIndex;
             return;
         }
@@ -874,7 +921,16 @@ private:
             slot.state = "error";
             return;
         }
-        auto const transfer = mxlFabricsInitiatorTransferSamples(slot.initiator, slot.sampleHead, batch);
+        // Bytes of one sample over all channels. Without the targets' entry size the origin's sync
+        // batch is the limit (the transfer size of 1.2.2), or the reader's maximum without a hint.
+        auto const sampleBytes = (payload.base.fragments[0].size + payload.base.fragments[1].size) / count * payload.count;
+        std::size_t limit = slot.info.common.maxSyncBatchSizeHint != 0 ? slot.info.common.maxSyncBatchSizeHint : maxRead;
+        if (slot.entryBytes > kBounceEntryHeaderBytes)
+        {
+            limit = static_cast<std::size_t>((slot.entryBytes - kBounceEntryHeaderBytes) / sampleBytes);
+        }
+        count = std::min(count, limit);
+        auto const transfer = mxlFabricsInitiatorTransferSamples(slot.initiator, slot.sampleHead + count, count);
         if (transfer != MXL_STATUS_OK && transfer != MXL_ERR_NOT_READY)
         {
             slot.errors += 1;
@@ -885,8 +941,9 @@ private:
         if (transfer == MXL_STATUS_OK)
         {
             slot.grains += 1;
-            slot.bytes += batch * 4;
-            slot.sampleHead += batch;
+            slot.bytes += count * sampleBytes;
+            slot.sampleHead += count;
+            slot.inFlight = true;
         }
     }
 
@@ -942,7 +999,7 @@ private:
                     return;
                 }
                 slot.grains += 1;
-                slot.bytes += item.count * 4;
+                slot.bytes += (scratch.base.fragments[0].size + scratch.base.fragments[1].size) * scratch.count;
                 slot.head = item.head;
                 slot.lastBatch = item.count;
                 ++committed;
@@ -1117,7 +1174,7 @@ struct FabricDomain::Impl
             std::vector<Task> batch;
             {
                 std::unique_lock lock(mu);
-                cv.wait_for(lock, std::chrono::milliseconds(2), [&] { return stop || !queue.empty(); });
+                cv.wait_for(lock, kPassInterval, [&] { return stop || !queue.empty(); });
                 if (stop && queue.empty())
                 {
                     break;

@@ -202,4 +202,23 @@ if ! rate=$("$WRITER" rate "$B/mirror-$SMALL_DOMAIN" "$SMALL_FLOW" 10 45); then
   fail "200 ms ring flow: fewer than 45 of 50 grains/s"
 fi
 say "200 ms ring flow: $rate"
+
+# A 2-channel 48 kHz flow written in 1 ms batches with sync hint 48 (as the ST 2110 gateway
+# writes): every sample has to arrive. 1.2.2 sent one batch per 2 ms pass, half of them.
+AUDIO_DOMAIN="ffffffff-ffff-4fff-8fff-ffffffffffff"
+AUDIO_FLOW="33333333-3333-4333-8333-333333333333"
+"$WRITER" audio "$A/audio" "$AUDIO_DOMAIN" "$AUDIO_FLOW" 60 200 48 >"$BASE/writer4.log" 2>&1 &
+PIDS+=($!)
+sleep 1
+curl -sf --max-time 2 -X PUT http://127.0.0.1:18971/control \
+  -H 'content-type: application/json' \
+  -d "{\"master_enable\":true,\"mxl_domain_id\":\"$AUDIO_DOMAIN\",\"mxl_flow_id\":\"$AUDIO_FLOW\"}" >/dev/null
+if ! rate=$("$WRITER" samples "$B/mirror-$AUDIO_DOMAIN" "$AUDIO_FLOW" 10 45000); then
+  echo "$rate"
+  echo "--- A ---"; grep -v '"level":"debug"' "$LOGA" | tail -n 20
+  echo "--- B ---"; grep -v '"level":"debug"' "$LOGB" | tail -n 20
+  echo "--- reps A ---"; curl -sf http://127.0.0.1:18095/api/v1/replications || true
+  fail "audio flow: fewer than 45000 of 48000 samples/s"
+fi
+say "audio flow: $rate"
 say "passed"
