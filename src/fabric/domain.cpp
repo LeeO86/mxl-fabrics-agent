@@ -922,9 +922,9 @@ private:
             return;
         }
         // Bytes of one sample over all channels. Without the targets' entry size the origin's sync
-        // batch is the limit (the transfer size of 1.2.2).
+        // batch is the limit (the transfer size of 1.2.2), or the reader's maximum without a hint.
         auto const sampleBytes = (payload.base.fragments[0].size + payload.base.fragments[1].size) / count * payload.count;
-        std::size_t limit = slot.info.common.maxSyncBatchSizeHint;
+        std::size_t limit = slot.info.common.maxSyncBatchSizeHint != 0 ? slot.info.common.maxSyncBatchSizeHint : maxRead;
         if (slot.entryBytes > kBounceEntryHeaderBytes)
         {
             limit = static_cast<std::size_t>((slot.entryBytes - kBounceEntryHeaderBytes) / sampleBytes);
