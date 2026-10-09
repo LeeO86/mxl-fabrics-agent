@@ -111,7 +111,7 @@ onUnmounted(() => clearInterval(timer));
       <div class="card"><div class="k">MXL</div><div class="v" style="font-size:14px">{{ info.mxl_version }}</div></div>
       <div class="card"><div class="k">TAI offset</div><div class="v">{{ info.tai_offset_seconds }}s</div></div>
       <div class="card"><div class="k">Registry</div><div class="v">{{ status.nmos ? "up" : "down" }}</div></div>
-      <div class="card"><div class="k">Peers up</div><div class="v">{{ peers.filter(p => p.up).length }} / {{ peers.length }}</div></div>
+      <div class="card"><div class="k">Peers up</div><div class="v">{{ peers.filter(p => p.up && p.link_up !== false).length }} / {{ peers.length }}</div></div>
       <div class="card"><div class="k">Local domains</div><div class="v">{{ (inventory.domains || []).length }}</div></div>
       <div class="card"><div class="k">Replications</div><div class="v">{{ replications.length }}</div></div>
     </section>
@@ -189,7 +189,7 @@ onUnmounted(() => clearInterval(timer));
           <tr v-for="peer in peers" :key="peer.host_id">
             <td>{{ peer.host_id }}</td>
             <td>{{ peer.control_url }}</td>
-            <td>{{ peer.local_fabric_addr }} → {{ peer.remote_fabric_addr }}</td>
+            <td>{{ peer.local_fabric_addr }} → {{ peer.remote_fabric_addr }}<div v-if="peer.link_up === false"><span class="pill bad">link down</span> <span class="muted">{{ peer.link_error }}</span></div></td>
             <td>{{ peer.provider }}</td>
             <td><span :class="peer.up ? 'pill ok' : 'pill bad'">{{ peer.up ? "up" : "down" }}</span><div class="muted">{{ peer.error }}</div></td>
             <td><button @click="testPeer(peer.host_id)">Test connect</button></td>

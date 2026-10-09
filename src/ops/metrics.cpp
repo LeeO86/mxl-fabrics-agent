@@ -72,6 +72,16 @@ void Metrics::setGauge(std::string const& name, double value, std::map<std::stri
     gauges_.push_back(Series{name, labels, value});
 }
 
+void Metrics::setGauges(std::string const& name, std::vector<std::pair<std::map<std::string, std::string>, double>> const& series)
+{
+    std::lock_guard const lock{mu_};
+    std::erase_if(gauges_, [&](Series const& row) { return row.name == name; });
+    for (auto const& [labels, value] : series)
+    {
+        gauges_.push_back(Series{name, labels, value});
+    }
+}
+
 void Metrics::addCounter(std::string const& name, double value, std::map<std::string, std::string> const& labels)
 {
     std::lock_guard const lock{mu_};

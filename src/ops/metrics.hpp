@@ -12,6 +12,8 @@ class Metrics
 {
 public:
     void setGauge(std::string const& name, double value, std::map<std::string, std::string> const& labels = {});
+    /// Replaces every series of a gauge (labels that are gone, such as a former state, disappear).
+    void setGauges(std::string const& name, std::vector<std::pair<std::map<std::string, std::string>, double>> const& series);
     void addCounter(std::string const& name, double value, std::map<std::string, std::string> const& labels = {});
     /// A counter whose total is kept elsewhere (a replication's grains, bytes, errors, restarts).
     void setCounter(std::string const& name, double value, std::map<std::string, std::string> const& labels = {});

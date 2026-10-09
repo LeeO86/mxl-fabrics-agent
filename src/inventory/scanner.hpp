@@ -5,13 +5,12 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
 
 namespace mfa
 {
-Inventory scanOnce(std::string const& root, std::string const& hostId, std::set<std::string> const& peerLocalDomainIds);
+Inventory scanOnce(std::string const& root, std::string const& hostId);
 
 class DomainScanner
 {
@@ -21,7 +20,6 @@ public:
     DomainScanner(std::string root, std::string hostId, int intervalMs, Wake wake);
     ~DomainScanner();
 
-    void setPeerDomains(std::set<std::string> ids);
     Inventory snapshot() const;
     bool running() const { return running_.load(); }
     void start();
@@ -35,7 +33,6 @@ private:
     int intervalMs_;
     Wake wake_;
     mutable std::mutex mu_;
-    std::set<std::string> peers_;
     Inventory inventory_;
     std::string lastCanonical_;
     std::atomic<bool> running_{false};

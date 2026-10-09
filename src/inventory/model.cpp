@@ -2,6 +2,7 @@
 
 #include "util/jsonutil.hpp"
 
+#include <cmath>
 #include <sstream>
 
 namespace mfa
@@ -80,6 +81,7 @@ std::string Inventory::canonicalJson() const
             f["format"] = picojson::value(flow.format);
             f["media_type"] = picojson::value(flow.media_type);
             f["active"] = picojson::value(flow.active);
+            f["live"] = picojson::value(flow.live);
             picojson::object grain;
             grain["numerator"] = picojson::value(static_cast<double>(flow.grain_rate_num));
             grain["denominator"] = picojson::value(static_cast<double>(flow.grain_rate_den));
@@ -142,7 +144,7 @@ std::optional<MirrorMarker> readMirrorMarker(std::string const& domainDefJson)
     return out;
 }
 
-std::string classifyDomain(std::string const& domainDefJson, std::string const& ourHostId, bool idHeldByPeer)
+std::string classifyDomain(std::string const& domainDefJson, std::string const& ourHostId)
 {
     auto const marker = readMirrorMarker(domainDefJson);
     if (marker && marker->mirror)
@@ -153,11 +155,17 @@ std::string classifyDomain(std::string const& domainDefJson, std::string const& 
         }
         return "mirror";
     }
-    if (idHeldByPeer)
-    {
-        return "conflict";
-    }
     return "local";
+}
+
+bool headIsLive(std::uint64_t headIndex, std::int64_t rateNum, std::int64_t rateDen, double taiSeconds)
+{
+    if (headIndex == 0 || headIndex == UINT64_MAX || rateNum <= 0 || rateDen <= 0)
+    {
+        return false;
+    }
+    auto const rate = static_cast<double>(rateNum) / static_cast<double>(rateDen);
+    return std::abs(static_cast<double>(headIndex) - taiSeconds * rate) <= 5.0 * rate;
 }
 
 FlowRecord flowFromDef(std::string const& flowDefJson, std::string const& optionsJson, bool active, std::uint64_t payloadOverride,

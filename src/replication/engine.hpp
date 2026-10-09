@@ -56,6 +56,9 @@ public:
     ~ReplicationEngine();
 
     void updateConfig(Config const& cfg);
+    // Peers whose local fabric link is down, with the reason: their replications show link_down, and
+    // a destination drops its targets for them until the link is back.
+    void setLinksDown(std::map<std::string, std::string> down);
     void setPulls(std::vector<PullRequest> const& pulls);
     PostResult post(PostRequest const& request, std::string const& domainPath);
     bool eraseTarget(std::string const& replicationId, std::string const& destHostId);
@@ -88,6 +91,8 @@ private:
         bool source_active = false;                            // from the last pull request
         std::optional<std::uint64_t> origin_head;              // from the source's handshake answer (1.1.0 sources)
         std::chrono::steady_clock::time_point origin_moved_at{}; // when that head last changed
+        bool source_error = false;                             // the source's last answer was "error"
+        bool link_down = false;                                // torn down for a dead local fabric link
         bool fallback = false;
         std::string provider;
     };
@@ -100,6 +105,7 @@ private:
     HandshakeTable handshake_;
     std::map<std::string, std::shared_ptr<FabricDomain>> domains_;
     std::map<std::string, DestState> dest_;
+    std::map<std::string, std::string> linksDown_;
     std::map<std::string, std::uint64_t> sourceRestarts_;
     TransferObserver transferObserver_;
     int nextPort_;

@@ -54,6 +54,7 @@ Inventory parseInventoryJson(std::string const& body)
                 flow.format = json::asString(flowObj, "format").value_or("discrete");
                 flow.media_type = json::asString(flowObj, "media_type").value_or("");
                 flow.active = json::asBool(flowObj, "active").value_or(false);
+                flow.live = json::asBool(flowObj, "live").value_or(false);
                 if (flowObj.count("flow_def"))
                 {
                     flow.flow_def_json = flowObj.at("flow_def").serialize();

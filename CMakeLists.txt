@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(mxl-fabrics-agent VERSION 1.2.3 LANGUAGES CXX)
+project(mxl-fabrics-agent VERSION 1.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,6 +25,7 @@ set(MFA_CORE_SOURCES
     src/demand/derive.cpp
     src/mirror/lifecycle.cpp
     src/replication/handshake.cpp
+    src/replication/policy.cpp
     src/ops/metrics.cpp
     src/ops/httpserver.cpp
     src/peer/manager.cpp
@@ -46,6 +47,7 @@ if(MFA_BUILD_TESTS)
         tests/unit/test_handshake.cpp
         tests/unit/test_inventory.cpp
         tests/unit/test_metrics.cpp
+        tests/unit/test_policy.cpp
     )
     target_include_directories(unit-tests PRIVATE src third_party)
     target_link_libraries(unit-tests PRIVATE mfa-core)

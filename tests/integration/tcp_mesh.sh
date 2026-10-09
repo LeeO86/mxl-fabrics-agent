@@ -221,4 +221,45 @@ if ! rate=$("$WRITER" samples "$B/mirror-$AUDIO_DOMAIN" "$AUDIO_FLOW" 10 45000);
   fail "audio flow: fewer than 45000 of 48000 samples/s"
 fi
 say "audio flow: $rate"
+
+# A writer that restarts: MXL deletes the flow with its last writer, the next writer creates it again
+# (new inode). The source has to open the new flow; 1.2.3 stayed on the deleted one for good.
+RE_DOMAIN="abababab-abab-4bab-8bab-abababababab"
+RE_FLOW="44444444-4444-4444-8444-444444444444"
+"$WRITER" video "$A/recreate" "$RE_DOMAIN" "$RE_FLOW" 120 1000 8 >"$BASE/writer5.log" 2>&1 &
+PIDS+=($!)
+sleep 1
+curl -sf --max-time 2 -X PUT http://127.0.0.1:18971/control \
+  -H 'content-type: application/json' \
+  -d "{\"master_enable\":true,\"mxl_domain_id\":\"$RE_DOMAIN\",\"mxl_flow_id\":\"$RE_FLOW\"}" >/dev/null
+sleep 11 # the writer creates the flow again 8 s after it started
+if ! rate=$("$WRITER" rate "$B/mirror-$RE_DOMAIN" "$RE_FLOW" 10 45); then
+  echo "$rate"
+  echo "--- A ---"; grep -v '"level":"debug"' "$LOGA" | tail -n 20
+  echo "--- reps A ---"; curl -sf http://127.0.0.1:18095/api/v1/replications || true
+  fail "re-created flow: fewer than 45 of 50 grains/s"
+fi
+grep -q '"origin_changed"' "$LOGA" || fail "the source did not see the re-created flow"
+say "re-created flow: $rate"
+
+# The destination goes away: its connections close and MXL drops the targets at the source. The source
+# forgets them; 1.2.3 called MakeProgress without targets on every pass (about 500 "No more targets"
+# lines a second until the destination was back).
+before=$(grep -c 'No more targets' "$LOGA" || true)
+kill -TERM "${PIDS[2]}" 2>/dev/null || true
+wait "${PIDS[2]}" 2>/dev/null || true
+unset 'PIDS[2]'
+sleep 3
+after=$(grep -c 'No more targets' "$LOGA" || true)
+(( after - before <= 20 )) || fail "the source logged 'No more targets' $((after - before)) times in 3 s"
+say "destination gone: 'No more targets' $((after - before)) times in 3 s"
+env "${common[@]}" HOST_ID=node-b MXL_ROOT="$B" WEB_PORT=18096 NMOS_PORT=18242 FABRIC_PORT_BASE=23700 PEERS="$PEERS_B" \
+  "$BIN" >>"$LOGB" 2>&1 &
+PIDS+=($!)
+if ! rate=$("$WRITER" rate "$B/mirror-$RE_DOMAIN" "$RE_FLOW" 10 45); then
+  echo "$rate"
+  echo "--- B ---"; grep -v '"level":"debug"' "$LOGB" | tail -n 20
+  fail "replication did not resume after the destination restarted"
+fi
+say "destination back: $rate"
 say "passed"

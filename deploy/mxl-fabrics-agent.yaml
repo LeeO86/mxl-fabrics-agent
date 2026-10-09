@@ -41,7 +41,7 @@ spec:
         supplementalGroups: [1000]
       containers:
         - name: agent
-          image: ghcr.io/leeo86/mxl-fabrics-agent:1.2.3
+          image: ghcr.io/leeo86/mxl-fabrics-agent:1.3.0
           securityContext:
             capabilities:
               add: ["IPC_LOCK", "SYS_NICE"] # SYS_NICE: RT_PRIORITY (the image raises it from its file capabilities)

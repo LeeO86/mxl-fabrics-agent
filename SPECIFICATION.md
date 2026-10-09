@@ -174,16 +174,18 @@ Each domain is classified as:
 - **local** — no mirror marker (see §7.2);
 - **mirror** — carries the agent's mirror marker; these are never exported in
   the inventory (loop prevention);
-- **conflict** — a local domain whose id is also held by a local domain on
-  another host, or a mirror marker that does not belong to this agent. Conflicts
-  are reported (status, metric, log) and excluded from replication.
+- **conflict** — a mirror marker that does not belong to this agent. Conflicts
+  are reported (status, metric, log) and excluded from replication. A local
+  domain whose id another host also holds stays local (since 1.3.0); a
+  destination that sees a flow on several hosts picks one (§8.4).
 
 ### 5.3 Inventory record
 
 Per local domain: `domain_id`, `path`, `options` (verbatim `options.json`),
 and per flow: `flow_id`, `flow_def` (verbatim JSON), `format`
-(discrete/continuous), `media_type`, `active`, `grain_rate` or `sample_rate`,
-`ring_depth`, `payload_size`.
+(discrete/continuous), `media_type`, `active`, `live` (a writer holds it and
+its head index is within 5 s of the current TAI time), `grain_rate` or
+`sample_rate`, `ring_depth`, `payload_size`.
 
 ---
 
@@ -319,6 +321,11 @@ mirror is not created, and status/metric/log report `insufficient_space`.
   on it; in that case the mirror stays and is reported as `orphaned`.
 - Peer unreachable → mirrors stay (readers see no new grains), status `peer_down`,
   replication resumes automatically when the peer returns.
+- Origin writer restarts → MXL deletes the flow with its last writer and the
+  next writer creates it again with a new inode. The source checks the origin's
+  data file once a second (and at once on `MXL_ERR_FLOW_INVALID`); a changed or
+  deleted file closes its reader and initiator, and the next check opens the new
+  flow for the same targets. The destination keeps its target and mirror.
 - Format change at the source (mxl-decklink mints a new flow UUID): the new flow
   is mirrored like any new flow; the old one follows the "disappears" rule.
   Receivers still pointing at the old flow id are reported as `stale_reference`
@@ -373,6 +380,16 @@ The config therefore maps each peer to the local and remote fabric addresses:
 - Provider per link: `verbs` (RoCEv2) or `tcp`. `PROVIDER_FALLBACK=tcp` (default
   off) allows a link to fall back to `tcp` if `verbs` setup fails; the fallback
   is reported prominently.
+- Link state: on every reconciliation tick the agent checks the local interface
+  that holds the peer's `local_fabric_addr` (or `FABRIC_INTERFACE`): its carrier
+  (`/sys/class/net/<netdev>/carrier`), or that some interface holds the address
+  at all ("source interface unavailable"). While it is down the peer's link is
+  `link_down` with the reason: a destination drops its targets and the source's
+  connections for that peer and retries nothing; when the link is back it sets up
+  fresh ones. The source's replications to that peer show `link_down` too, and its
+  handshake answer says so, so the destination waits instead of rebuilding. One
+  log line per change (`peer_link_down`, `peer_link_up`). There is no relay over
+  a third host.
 
 ### 8.3 Control API (agent-to-agent, also used by the UI)
 
@@ -387,6 +404,7 @@ posture as the siblings: protected networks only).
 | POST | `/replications` | destination asks source to add a target: `{flow_id, domain_id, dest_host_id, target_info}` → `201 {replication_id}` |
 | DELETE | `/replications/{id}/targets/{dest_host_id}` | destination releases its target |
 | GET | `/replications` | active replications (both roles) |
+| GET | `/peers` | peers: control plane `up`, fabric `link_up`, `link_error`, `fabric_interface` |
 | GET | `/mirrors` | local mirrors and their state |
 | GET | `/demand` | local demand entries and the receivers behind them |
 | GET | `/config` | effective configuration, where each key came from, `restart_required` |
@@ -435,6 +453,23 @@ link. With a source that sends no `origin_head` (before 1.1.0) a writer on the
 origin flow counts as moving on. The wait doubles with each rebuild in a row (5, 10, 20, 40 s). A successful
 handshake clears the destination's last handshake error (`recv`, `http …`).
 
+Since 1.3.0 the answer also carries the source's `state` for that replication
+(`pending`, `active`, `error`, `link_down`) and its `error`, which the destination
+shows as `last_error`. A source in `error` (connected, but no transfer completed
+for 2 s) makes the destination rebuild after 1 s without a grain (1, 2, 4, 8 s in
+a row); `link_down` makes it wait for the link. When MXL drops a source's target
+because its connection shut down (closed by the destination, or after a failed
+transfer: libfabric's `verbs` provider shuts an endpoint down on a completion
+error), the source forgets it (`errors` + 1, `last_error`) and adds it again on
+the destination's next request; the destination's target listens again after a
+shutdown.
+
+When a flow (domain id and flow id) is offered by more than one peer (a function
+moved to another host and left its domain behind), the destination replicates
+from one: a `live` origin before one with a writer before the rest, among equals
+the current choice, else the lowest `host_id`. It logs `origin_conflict` when
+the set of hosts or the choice changes and exports `origin_conflicts`.
+
 ---
 
 ## 9. Replication engine
@@ -466,8 +501,9 @@ handshake clears the destination's last handshake error (`recv`, `http …`).
 - Optional real-time scheduling for the fabric thread: `RT_PRIORITY` (0 = off,
   default), `CPU_AFFINITY` (list).
 - Error handling per replication: on error, tear down only that replication,
-  back off exponentially (`250 ms` → `10 s`), retry. Never affect other
-  replications.
+  back off exponentially (`250 ms` → `30 s`, 10 s before 1.3.0), retry. Never
+  affect other replications. A repeated failure is logged when it starts or its
+  error changes, not per retry.
 - Timing: grain indices are TAI-based. All hosts MUST be TAI-disciplined
   (PTP/chrony with correct kernel TAI offset). The agent checks `CLOCK_TAI`
   offset sanity at startup and exposes it as a metric; replicated readers on
@@ -595,9 +631,12 @@ Tabs:
 | `flows` | gauge | kind (origin/mirror), state |
 | `tmpfs_free_bytes` / `tmpfs_size_bytes` | gauge | — |
 | `peers_up` | gauge | — |
-| `peer_up` | gauge | peer |
+| `peer_up` | gauge | peer, interface; 1 while the control plane answers and the local fabric link has carrier (control plane only and no `interface` before 1.3.0) |
+| `peer_rdma_retransmits_total` | counter | peer, device; `RetransSegs` of the RDMA device on the fabric interface (irdma), absent without one |
+| `origin_conflicts` | gauge | —; flows offered by more than one peer |
 | `demand_entries` | gauge | state |
 | `replications_active` | gauge | role (source/destination), provider |
+| `replication_state` | gauge (1) | flow_id, peer, role, state (`pending`, `active`, `error`, `link_down`, `idle`) |
 | `replication_grains_total` | counter | flow_id, peer, role |
 | `replication_bytes_total` | counter | flow_id, peer, role |
 | `replication_errors_total` | counter | flow_id, peer, role (no `kind`: errors are counted, not classified) |
@@ -691,7 +730,10 @@ Single machine, `tcp` provider over loopback, two simulated hosts:
 - test steps: IS-05 PATCH of the receiver → mirror exists before activation
   (eager) → grains arrive with identical indices → disable receiver → target
   released after grace → kill source agent → `peer_down` → restart →
-  replication resumes → format change at source → `stale_reference` reported.
+  replication resumes → format change at source → `stale_reference` reported →
+  origin writer re-creates its flow → replication resumes → destination agent
+  stopped → the source logs a few lines, not one per pass → destination back →
+  replication resumes.
 - `tests/integration/shutdown.sh`: start, `/readyz` after registration, SIGTERM,
   exit 143, the registry records DELETE, and only this agent's mirror directory
   is removed.

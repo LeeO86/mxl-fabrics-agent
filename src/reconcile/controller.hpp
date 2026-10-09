@@ -9,6 +9,7 @@
 #include "ops/metrics.hpp"
 #include "peer/manager.hpp"
 #include "replication/engine.hpp"
+#include "util/net.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -62,6 +63,14 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> originLost_;
     std::map<std::string, std::chrono::steady_clock::time_point> demandLost_;
     std::set<std::string> lastDemand_;
+    std::map<std::string, FabricLink> links_;  // per peer, from the last tick (mu_)
+    std::map<std::string, std::string> linkErrors_; // per peer, the last logged link error ("" = up)
+    struct OriginConflict
+    {
+        std::string hosts;  // the peers that hold the flow
+        std::string chosen; // the one replicated from
+    };
+    std::map<std::string, OriginConflict> originConflicts_; // per "domain/flow" held by more than one peer
     struct Event
     {
         std::string name;

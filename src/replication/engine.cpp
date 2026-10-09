@@ -1,11 +1,13 @@
 #include "replication/engine.hpp"
 
+#include "replication/policy.hpp"
 #include "util/httpclient.hpp"
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
 
 #include <algorithm>
 #include <filesystem>
+#include <utility>
 
 namespace mfa
 {
@@ -31,6 +33,12 @@ void ReplicationEngine::updateConfig(Config const& cfg)
 {
     std::lock_guard const lock{mu_};
     cfg_ = cfg;
+}
+
+void ReplicationEngine::setLinksDown(std::map<std::string, std::string> down)
+{
+    std::lock_guard const lock{mu_};
+    linksDown_ = std::move(down);
 }
 
 FabricEndpoint ReplicationEngine::endpoint(std::string const& peer) const
@@ -158,8 +166,10 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
         wanted[pullKey(pull)] = pull;
     }
     std::vector<std::pair<std::string, DestState>> drop;
+    std::map<std::string, std::string> linksDown;
     {
         std::lock_guard const lock{mu_};
+        linksDown = linksDown_;
         for (auto const& [key, state] : dest_)
         {
             if (wanted.count(key) == 0)
@@ -213,6 +223,35 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
         state.peer_boot = pull.peer_boot;
         state.peer_revision = pull.peer_revision;
         state.source_active = pull.source_active;
+        // A dead local fabric link (no carrier): drop the target and the source's connection now, and
+        // set up fresh ones when the link is back. No retries meanwhile; the peer's link_down is logged once.
+        if (auto const down = linksDown.find(pull.peer); down != linksDown.end())
+        {
+            if (!state.link_down)
+            {
+                if (auto dom = domain(pull.mirror_path))
+                {
+                    dom->destroyTarget(key);
+                }
+                if (!pull.control_url.empty() && !state.replication_id.empty())
+                {
+                    httpRequest("DELETE", pull.control_url + "/replications/" + state.replication_id + "/targets/" + cfg_.host_id);
+                }
+                state.target_info.clear();
+                state.stalls = 0;
+                state.backoff = std::chrono::milliseconds(250);
+                state.link_down = true;
+            }
+            state.state = "link_down";
+            state.last_error = down->second;
+            continue;
+        }
+        if (std::exchange(state.link_down, false))
+        {
+            state.state = "pending";
+            state.last_error.clear();
+            state.next_attempt = {};
+        }
         if (std::chrono::steady_clock::now() < state.next_attempt && state.state == "error")
         {
             continue;
@@ -224,13 +263,14 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
             state.last_error = dom ? dom->error() : "domain";
             continue;
         }
-        // A destination without a new grain for 5 s while it is in error or the origin moved on (a peer
-        // that hung, a queue pair out of retries, a closed connection that reports nothing) is set up
-        // again: the source gets new target info and replaces the dead connection. The wait doubles with
-        // each rebuild in a row (5, 10, 20, 40 s) so an unreachable source does not churn. "Moved on" is
-        // the origin head the source reports in the handshake; a holder that writes nothing (decklink
-        // without a signal) is not a dead link. Sources before 1.1.0 report no head: a writer counts.
-        if (!state.target_info.empty())
+        // A destination without a new grain while it is in error, the source reports an error (a transfer
+        // that does not complete) or the origin moved on (a peer that hung, a queue pair out of retries, a
+        // closed connection that reports nothing) is set up again: the source gets new target info and
+        // replaces the dead connection. See shouldRebuild for the waits. "Moved on" is the origin head the
+        // source reports in the handshake; a holder that writes nothing (decklink without a signal) is
+        // not a dead link. Sources before 1.1.0 report no head: a writer counts. A source whose own link
+        // to this host is down (link_down) waits for the link.
+        if (!state.target_info.empty() && state.state != "link_down")
         {
             auto const now = std::chrono::steady_clock::now();
             for (auto const& row : dom->rows())
@@ -239,22 +279,27 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
                 {
                     continue;
                 }
+                StallInput stall;
+                stall.sinceGrain = now - state.progress_at;
+                stall.stalls = state.stalls;
+                stall.destError = row.state == "error";
+                stall.sourceError = state.source_error;
+                // "Moved on": more than 1 s after the last grain, so the head read in the same pass as
+                // that grain does not count.
+                stall.originMoved = state.origin_head ? state.origin_moved_at > state.progress_at + std::chrono::seconds(1) : pull.source_active;
                 if (row.grains != state.seen_grains)
                 {
                     state.seen_grains = row.grains;
                     state.progress_at = now;
                     state.stalls = 0;
                 }
-                // "Moved on": more than 1 s after the last grain, so the head read in the same pass as
-                // that grain does not count.
-                else if ((row.state == "error" ||
-                          (state.origin_head ? state.origin_moved_at > state.progress_at + std::chrono::seconds(1) : pull.source_active)) &&
-                         now - state.progress_at > std::chrono::seconds(5LL << std::min<std::uint64_t>(state.stalls, 3)))
+                else if (shouldRebuild(stall))
                 {
-                    log::warn("replication_restarted",
-                              {{"peer", pull.peer}, {"flow_id", pull.flow_id}, {"state", row.state}, {"error", row.last_error}});
+                    log::warn("replication_restarted", {{"peer", pull.peer}, {"flow_id", pull.flow_id}, {"state", row.state},
+                                                           {"error", state.source_error ? state.last_error : row.last_error}});
                     dom->destroyTarget(key);
                     state.target_info.clear();
+                    state.source_error = false;
                     state.restarts += 1;
                     state.stalls += 1;
                 }
@@ -285,12 +330,16 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
             auto const setup = dom->setupTarget(key, pull.flow_id, ep, 256);
             if (!setup.ok)
             {
+                // One line when the error starts or changes, not one per retry.
+                if (state.state != "error" || state.last_error != setup.error)
+                {
+                    log::warn("target_setup_failed", {{"flow_id", pull.flow_id}, {"peer", pull.peer}, {"error", setup.error}});
+                }
                 state.state = "error";
                 state.last_error = setup.error;
-                state.backoff = std::min(state.backoff * 2, std::chrono::milliseconds(10000));
+                state.backoff = nextBackoff(state.backoff);
                 state.next_attempt = std::chrono::steady_clock::now() + state.backoff;
                 state.restarts += 1;
-                log::warn("target_setup_failed", {{"flow_id", pull.flow_id}, {"peer", pull.peer}, {"error", setup.error}});
                 continue;
             }
             state.target_info = setup.target_info;
@@ -315,21 +364,21 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
         if (response.status != 200 && response.status != 201)
         {
             state.state = "error";
+            state.source_error = false;
             state.last_error = response.error.empty() ? ("http " + std::to_string(response.status)) : response.error;
-            state.backoff = std::min(state.backoff * 2, std::chrono::milliseconds(10000));
-            if (state.backoff.count() < 250)
-            {
-                state.backoff = std::chrono::milliseconds(250);
-            }
+            state.backoff = nextBackoff(state.backoff);
             state.next_attempt = std::chrono::steady_clock::now() + state.backoff;
             continue;
         }
+        state.last_error.clear(); // the peer answered: an earlier "recv" or "http 500" is over
         auto const parsed = json::parse(response.body);
         if (parsed.is<picojson::object>())
         {
             auto const& obj = parsed.get<picojson::object>();
             state.replication_id = json::asString(obj, "replication_id").value_or(state.replication_id);
             state.state = json::asString(obj, "state").value_or("pending");
+            state.source_error = state.state == "error";
+            state.last_error = json::asString(obj, "error").value_or(""); // the source's reason (1.3.0)
             if (auto const head = obj.find("origin_head"); head != obj.end() && head->second.is<double>())
             {
                 auto const value = static_cast<std::uint64_t>(head->second.get<double>());
@@ -340,7 +389,6 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
                 state.origin_head = value;
             }
         }
-        state.last_error.clear(); // the peer answered: an earlier "recv" or "http 500" is over
         if (state.state == "active")
         {
             state.backoff = std::chrono::milliseconds(250);
@@ -390,17 +438,30 @@ PostResult ReplicationEngine::post(PostRequest const& request, std::string const
         return result;
     }
     result.origin_head = dom->originHead(result.replication_id);
+    // The source's state and reason go back to the destination: "error" (a transfer that does not
+    // complete) lets it set its target up again sooner, "link_down" makes it wait for the link.
+    result.state = "pending";
     for (auto const& row : dom->rows())
     {
-        if (row.key == result.replication_id && row.state == "active")
+        if (row.key == result.replication_id)
         {
-            result.state = "active";
-            std::lock_guard const lock{mu_};
-            handshake_.setTargetState(result.replication_id, request.dest_host_id, "active");
-            return result;
+            if (row.state == "active" || row.state == "error")
+            {
+                result.state = row.state;
+            }
+            result.error = row.last_error;
         }
     }
-    result.state = "pending";
+    std::lock_guard const lock{mu_};
+    if (auto const down = linksDown_.find(request.dest_host_id); down != linksDown_.end())
+    {
+        result.state = "link_down";
+        result.error = down->second;
+    }
+    if (result.state == "active")
+    {
+        handshake_.setTargetState(result.replication_id, request.dest_host_id, "active");
+    }
     return result;
 }
 
@@ -441,6 +502,11 @@ bool ReplicationEngine::eraseTarget(std::string const& replicationId, std::strin
 
 std::vector<ReplicaView> ReplicationEngine::status() const
 {
+    std::map<std::string, std::string> linksDown;
+    {
+        std::lock_guard const lock{mu_};
+        linksDown = linksDown_;
+    }
     std::vector<ReplicaView> out;
     for (auto const& [_, dom] : domains_)
     {
@@ -461,6 +527,11 @@ std::vector<ReplicaView> ReplicationEngine::status() const
             view.fallback = row.fallback;
             view.cq_depth = row.cq_depth;
             view.lag = static_cast<std::int64_t>(row.behind);
+            if (auto const down = linksDown.find(row.peer); row.role == "source" && down != linksDown.end())
+            {
+                view.state = "link_down";
+                view.last_error = down->second;
+            }
             out.push_back(std::move(view));
         }
     }
