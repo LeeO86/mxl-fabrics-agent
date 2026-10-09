@@ -1,6 +1,7 @@
 #include "reconcile/controller.hpp"
 
 #include "mirror/lifecycle.hpp"
+#include "replication/policy.hpp"
 #include "util/httpclient.hpp"
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
@@ -316,7 +317,62 @@ void Controller::tick()
             }
         }
     }
-    scanner_.setPeerDomains(peerDomains);
+    // The fabric link to each peer: carrier of the local interface of its fabric address. One log line
+    // when it goes down or comes back.
+    std::map<std::string, FabricLink> links;
+    std::map<std::string, std::string> linksDown;
+    for (auto const& peer : peerSnap)
+    {
+        auto const link = fabricLink(peer.local_addr.empty() ? cfg.fabric_interface : peer.local_addr);
+        auto& logged = linkErrors_[peer.host_id];
+        if (link.error != logged)
+        {
+            if (link.up)
+            {
+                log::info("peer_link_up", {{"peer", peer.host_id}, {"interface", link.netdev}});
+            }
+            else
+            {
+                log::warn("peer_link_down", {{"peer", peer.host_id}, {"interface", link.netdev}, {"reason", link.error}});
+            }
+            logged = link.error;
+        }
+        if (!link.up)
+        {
+            linksDown[peer.host_id] = link.error;
+        }
+        links[peer.host_id] = link;
+    }
+    engine_.setLinksDown(linksDown);
+    // Peers that hold the same flow (a function moved to another host and left its domain behind):
+    // replicate from one, preferring the origin that is being written. Logged when it starts or changes.
+    std::map<std::string, std::vector<OriginCandidate>> holders;
+    for (auto const& remote : remotes)
+    {
+        holders[remote.domain->domain_id + "/" + remote.flow->flow_id].push_back(
+            OriginCandidate{remote.peer->host_id, remote.flow->active, remote.flow->live});
+    }
+    std::map<std::string, OriginConflict> conflicts;
+    for (auto const& [key, candidates] : holders)
+    {
+        if (candidates.size() < 2)
+        {
+            continue;
+        }
+        auto const previous = originConflicts_.find(key);
+        OriginConflict conflict;
+        for (auto const& candidate : candidates)
+        {
+            conflict.hosts += (conflict.hosts.empty() ? "" : ",") + candidate.host + (candidate.live ? "(live)" : candidate.active ? "(writer)" : "");
+        }
+        conflict.chosen = chooseOrigin(candidates, previous != originConflicts_.end() ? previous->second.chosen : std::string());
+        if (previous == originConflicts_.end() || previous->second.hosts != conflict.hosts || previous->second.chosen != conflict.chosen)
+        {
+            log::warn("origin_conflict", {{"flow", key}, {"hosts", conflict.hosts}, {"chosen", conflict.chosen}});
+        }
+        conflicts[key] = conflict;
+    }
+    originConflicts_ = conflicts;
     auto const inventory = scanner_.snapshot();
     std::set<std::string> localIds;
     for (auto const& domain : inventory.domains)
@@ -344,6 +400,10 @@ void Controller::tick()
                 }
             }
         }
+        if (auto const conflict = conflicts.find(entry.domain_id + "/" + entry.flow_id); conflict != conflicts.end())
+        {
+            entry.source_host = conflict->second.chosen;
+        }
     }
     std::set<std::string> rawDemand;
     for (auto const& entry : demand.entries)
@@ -361,6 +421,10 @@ void Controller::tick()
     for (auto const& remote : remotes)
     {
         auto const key = remote.domain->domain_id + "/" + remote.flow->flow_id;
+        if (auto const conflict = conflicts.find(key); conflict != conflicts.end() && conflict->second.chosen != remote.peer->host_id)
+        {
+            continue;
+        }
         seen.insert(key);
         bool const originLive = remote.peer->up && remote.flow->active;
         if (!originLive)
@@ -500,6 +564,7 @@ void Controller::tick()
         std::lock_guard const lock{mu_};
         demand_ = std::move(demand);
         mirrors_ = std::move(mirrorViews);
+        links_ = std::move(links);
     }
     renderMetrics();
     publish("inventory", std::to_string(inventory.revision));
@@ -557,16 +622,31 @@ void Controller::renderMetrics()
         metrics_.setGauge("tmpfs_free_bytes", static_cast<double>(st.f_bavail) * static_cast<double>(st.f_frsize));
         metrics_.setGauge("tmpfs_size_bytes", static_cast<double>(st.f_blocks) * static_cast<double>(st.f_frsize));
     }
+    std::map<std::string, FabricLink> links;
+    {
+        std::lock_guard const lock{mu_};
+        links = links_;
+    }
+    // A peer is up when its control plane answers and the local fabric link to it has carrier.
     int up = 0;
+    std::vector<std::pair<std::map<std::string, std::string>, double>> peerUp;
     for (auto const& peer : peerSnap)
     {
-        if (peer.up)
+        auto const& link = links[peer.host_id];
+        bool const usable = peer.up && link.up;
+        if (usable)
         {
             ++up;
         }
-        metrics_.setGauge("peer_up", peer.up ? 1 : 0, {{"peer", peer.host_id}});
+        peerUp.push_back({{{"peer", peer.host_id}, {"interface", link.netdev}}, usable ? 1.0 : 0.0});
+        if (link.retransmits)
+        {
+            metrics_.setCounter("peer_rdma_retransmits_total", static_cast<double>(*link.retransmits), {{"peer", peer.host_id}, {"device", link.rdmaDevice}});
+        }
     }
+    metrics_.setGauges("peer_up", peerUp);
     metrics_.setGauge("peers_up", up);
+    metrics_.setGauge("origin_conflicts", static_cast<double>(originConflicts_.size()));
     metrics_.setGauge("nmos_registry_up", nmos.registry_up ? 1 : 0);
     metrics_.setGauge("tai_offset_seconds", tai_);
     std::map<std::string, int> demandStates;
@@ -579,6 +659,7 @@ void Controller::renderMetrics()
         metrics_.setGauge("demand_entries", count, {{"state", state}});
     }
     std::map<std::string, int> reps;
+    std::vector<std::pair<std::map<std::string, std::string>, double>> states;
     for (auto const& row : engine_.status())
     {
         if (row.state == "active" || row.state == "pending")
@@ -587,6 +668,7 @@ void Controller::renderMetrics()
         }
         if (cfg.metrics_per_flow)
         {
+            states.push_back({{{"flow_id", row.flow_id}, {"peer", row.peer}, {"role", row.role}, {"state", row.state}}, 1});
             metrics_.setGauge("replication_lag_grains", static_cast<double>(row.lag), {{"flow_id", row.flow_id}, {"peer", row.peer}});
             metrics_.setGauge("completion_queue_depth", row.cq_depth, {{"flow_id", row.flow_id}});
             // The totals live in the replication rows (they start again with a new replication).
@@ -605,6 +687,8 @@ void Controller::renderMetrics()
         auto const slash = key.find('/');
         metrics_.setGauge("replications_active", count, {{"role", key.substr(0, slash)}, {"provider", key.substr(slash + 1)}});
     }
+    // One series per replication with its current state (1); a former state disappears.
+    metrics_.setGauges("replication_state", states);
 }
 
 void Controller::stream(SseEmit const& emit)
@@ -834,6 +918,10 @@ HttpResponse Controller::handle(HttpRequest const& request)
         picojson::object response;
         response["replication_id"] = picojson::value(result.replication_id);
         response["state"] = picojson::value(result.state);
+        if (!result.error.empty())
+        {
+            response["error"] = picojson::value(result.error);
+        }
         if (result.origin_head)
         {
             response["origin_head"] = picojson::value(static_cast<double>(*result.origin_head));
@@ -859,13 +947,22 @@ HttpResponse Controller::handle(HttpRequest const& request)
     }
     if (request.method == "GET" && request.path == "/api/v1/peers")
     {
+        std::map<std::string, FabricLink> links;
+        {
+            std::lock_guard const lock{mu_};
+            links = links_;
+        }
         picojson::array arr;
         for (auto const& peer : peers_.snapshot())
         {
+            auto const& link = links[peer.host_id];
             picojson::object obj;
             obj["host_id"] = picojson::value(peer.host_id);
             obj["control_url"] = picojson::value(peer.control_url);
             obj["up"] = picojson::value(peer.up);
+            obj["link_up"] = picojson::value(link.up);
+            obj["link_error"] = picojson::value(link.error);
+            obj["fabric_interface"] = picojson::value(link.netdev);
             obj["boot_id"] = picojson::value(peer.boot_id);
             obj["provider"] = picojson::value(peer.provider);
             obj["local_fabric_addr"] = picojson::value(peer.local_addr);

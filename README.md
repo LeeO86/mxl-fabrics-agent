@@ -25,7 +25,7 @@ Two agents on one host (the loopback demo) must use different `WEB_PORT`, `NMOS_
 
 ## What a media function needs
 
-1. Receivers resolve `mxl_domain_id` by scanning domains under the MXL root. Mirror domains are siblings of local domains (`mirror-<source-domain-id>`). The id is the `id` inside `domain_def.json`, not the directory name.
+1. Receivers resolve `mxl_domain_id` by scanning domains under the MXL root. Mirror domains are siblings of local domains (`mirror-<source-domain-id>`). The id is the `id` inside `domain_def.json`, not the directory name. A function that moves to another host should remove its old domain: while two hosts hold the same flow, a destination replicates from the one that is being written and logs `origin_conflict`.
 2. If a flow is not present yet, the reader retries with backoff instead of failing permanently.
 3. Readers tolerate a flow that exists but has no new grains yet.
 4. Media functions do not build with `MXL_ENABLE_FABRICS_OFI`.
@@ -52,6 +52,8 @@ Check the device with `ibv_devinfo`. Put the fabric addresses in the peer map. O
 ```
 
 One origin flow sent to both peers uses one reader and initiator per local address. MTU must match on each link. `PROVIDER_FALLBACK=tcp` retries a link on TCP if verbs setup fails and marks that replication `fallback: true`.
+
+The agent watches each peer's link: the carrier of the local interface that holds `local_fabric_addr` (or `FABRIC_INTERFACE`), and that some interface holds the address at all. A dead link is `link_down` with the reason in `/api/v1/peers` and `/api/v1/replications`, `mxl_fabrics_agent_peer_up{peer,interface}` is 0, and the log has one `peer_link_down` line. The destination then drops its targets for that peer and retries nothing; when the link is back (`peer_link_up`) it sets up fresh ones. `mxl_fabrics_agent_peer_rdma_retransmits_total{peer,device}` is the RDMA device's `RetransSegs` (irdma): a lossy link shows there first. Flows are not relayed over a third host.
 
 RoCEv2 on ConnectX can use the Mellanox QoS example in the MXL Fabrics getting-started guide (DSCP 26, PFC priority 3). E810 RoCEv2 is selected in the `irdma` driver; use the same DSCP/PFC policy on the switch or the direct link.
 
@@ -81,7 +83,7 @@ The checked-in integration test is the single-machine demo: two MXL roots, two a
 LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/tcp_mesh.sh
 ```
 
-It checks that the eager mirror exists before the receiver is activated, that grain indices match, that disabling the receiver releases the target after `RELEASE_GRACE_MS`, that stopping the source is reported as peer down, that replication resumes, that a flow id the source no longer has is `stale_reference`, that a 1080p50 flow with a 200 ms ring arrives at 50 grains/s, and that a 2-channel 48 kHz flow written in 1 ms batches arrives at 48,000 samples/s.
+It checks that the eager mirror exists before the receiver is activated, that grain indices match, that disabling the receiver releases the target after `RELEASE_GRACE_MS`, that stopping the source is reported as peer down, that replication resumes, that a flow id the source no longer has is `stale_reference`, that a 1080p50 flow with a 200 ms ring arrives at 50 grains/s, that a 2-channel 48 kHz flow written in 1 ms batches arrives at 48,000 samples/s, that a flow its writer creates again (new inode) replicates again, and that a destination that goes away costs the source a few log lines, not one per pass.
 
 `docker/docker-compose.demo.yaml` is the same shape in containers, plus Prometheus and Grafana. `docker/docker-compose.host.yaml` is one host of a real mesh: host networking, `/dev/infiniband`, `IPC_LOCK`, unlimited memlock, and the MXL root mounted read-write.
 
@@ -193,7 +195,7 @@ All of these are on `WEB_PORT`.
 | GET | `/api/v1/replications` | Active replications |
 | POST | `/api/v1/replications` | Peer asks this host to send a flow |
 | DELETE | `/api/v1/replications/{id}/targets/{dest}` | Peer releases a target |
-| GET | `/api/v1/peers` | Peer link status |
+| GET | `/api/v1/peers` | Peer status: control plane `up`, fabric `link_up`, `link_error`, `fabric_interface` |
 | POST | `/api/v1/peers/{id}/test` | Control-plane and local target check |
 | GET | `/api/v1/events` | Server-sent events |
 | GET | `/api/v1/config` | Effective configuration, origin, and `restart_required` |

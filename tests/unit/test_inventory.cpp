@@ -13,10 +13,9 @@ TEST_CASE("mirror marker classification")
     auto const own = R"({"id":"dom","x-mxl-fabrics-agent":{"mirror":true,"source_host_id":"a","owner_host_id":"me"}})";
     auto const foreign = R"({"id":"dom","x-mxl-fabrics-agent":{"mirror":true,"source_host_id":"a","owner_host_id":"other"}})";
     auto const local = R"({"id":"dom","label":"decklink"})";
-    CHECK(classifyDomain(own, "me", false) == "mirror");
-    CHECK(classifyDomain(foreign, "me", false) == "conflict");
-    CHECK(classifyDomain(local, "me", false) == "local");
-    CHECK(classifyDomain(local, "me", true) == "conflict");
+    CHECK(classifyDomain(own, "me") == "mirror");
+    CHECK(classifyDomain(foreign, "me") == "conflict");
+    CHECK(classifyDomain(local, "me") == "local");
 }
 
 TEST_CASE("flow record from a descriptor")
@@ -42,7 +41,7 @@ TEST_CASE("scanner classifies directories")
         std::ofstream(root / "mirror-dom" / "domain_def.json")
             << R"({"id":"dom-remote","x-mxl-fabrics-agent":{"mirror":true,"source_host_id":"a","owner_host_id":"me"}})";
     }
-    auto inventory = scanOnce(root.string(), "me", {});
+    auto inventory = scanOnce(root.string(), "me");
     int local = 0;
     int mirror = 0;
     for (auto const& domain : inventory.domains)

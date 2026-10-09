@@ -14,7 +14,10 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
@@ -263,5 +266,92 @@ bool pathIsTmpfs(std::string const& path)
         return false;
     }
     return st.f_type == 0x01021994;
+}
+
+namespace
+{
+std::string firstLine(std::string const& path)
+{
+    std::ifstream in(path);
+    std::string line;
+    std::getline(in, line);
+    return line;
+}
+
+std::string interfaceWith(std::string const& addr)
+{
+    std::string wanted;
+    if (!parseIpLiteral(addr, &wanted))
+    {
+        return {};
+    }
+    ifaddrs* list = nullptr;
+    if (getifaddrs(&list) != 0)
+    {
+        return {};
+    }
+    std::string found;
+    for (auto* it = list; it != nullptr && found.empty(); it = it->ifa_next)
+    {
+        if (it->ifa_addr == nullptr || it->ifa_name == nullptr)
+        {
+            continue;
+        }
+        char text[INET6_ADDRSTRLEN] = {};
+        if (it->ifa_addr->sa_family == AF_INET)
+        {
+            inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(it->ifa_addr)->sin_addr, text, sizeof(text));
+        }
+        else if (it->ifa_addr->sa_family == AF_INET6)
+        {
+            inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6*>(it->ifa_addr)->sin6_addr, text, sizeof(text));
+        }
+        std::string normalized;
+        if (text[0] != 0 && parseIpLiteral(text, &normalized) && normalized == wanted)
+        {
+            found = it->ifa_name;
+        }
+    }
+    freeifaddrs(list);
+    return found;
+}
+} // namespace
+
+FabricLink fabricLink(std::string const& addr, std::string const& sysNet, std::string const& sysIb)
+{
+    FabricLink link;
+    if (addr.empty())
+    {
+        return link;
+    }
+    std::error_code ec;
+    link.netdev = addr.find('/') == std::string::npos && std::filesystem::is_directory(sysNet + "/" + addr, ec) ? addr : interfaceWith(addr);
+    if (link.netdev.empty())
+    {
+        link.up = false;
+        link.error = "source interface unavailable: no local interface has " + addr;
+        return link;
+    }
+    auto const dir = sysNet + "/" + link.netdev;
+    if (firstLine(dir + "/carrier") != "1")
+    {
+        auto const oper = firstLine(dir + "/operstate");
+        link.up = false;
+        link.error = "no carrier on " + link.netdev + (oper.empty() ? "" : " (" + oper + ")");
+    }
+    for (auto const& entry : std::filesystem::directory_iterator(dir + "/device/infiniband", ec))
+    {
+        link.rdmaDevice = entry.path().filename().string();
+        break;
+    }
+    if (!link.rdmaDevice.empty())
+    {
+        auto const count = firstLine(sysIb + "/" + link.rdmaDevice + "/ports/1/hw_counters/RetransSegs");
+        if (!count.empty())
+        {
+            link.retransmits = std::strtoull(count.c_str(), nullptr, 10);
+        }
+    }
+    return link;
 }
 } // namespace mfa

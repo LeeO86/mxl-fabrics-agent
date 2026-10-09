@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -44,36 +45,50 @@ bool flowActive(fs::path const& dataFile)
     return active;
 }
 
-std::uint64_t payloadFromData(fs::path const& dataFile)
+struct DataHeader
 {
+    std::uint32_t grainCount = 0;
+    std::uint64_t headIndex = 0;
+};
+
+DataHeader readDataHeader(fs::path const& dataFile)
+{
+    DataHeader header;
     int fd = ::open(dataFile.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
     {
-        return 0;
+        return header;
     }
     // mxlFlowInfo is 2048 bytes. grainSize lives in each grain, not the flow header.
-    // Ring depth is config.discrete.grainCount at a stable offset for version 1:
-    // 8 byte prefix + 128 byte common + 16 byte sliceSizes.
-    unsigned char buf[160];
+    // At stable offsets for version 1: ring depth is config.discrete.grainCount (8 byte prefix + 128 byte
+    // common + 16 byte sliceSizes), the head index runtime.headIndex (8 + 192 byte config).
+    unsigned char buf[208];
     auto const n = ::pread(fd, buf, sizeof(buf), 0);
     ::close(fd);
     if (n < static_cast<ssize_t>(sizeof(buf)))
     {
-        return 0;
+        return header;
     }
     std::uint32_t version = 0;
     std::memcpy(&version, buf, 4);
     if (version != 1)
     {
-        return 0;
+        return header;
     }
-    std::uint32_t grainCount = 0;
-    std::memcpy(&grainCount, buf + 8 + 128 + 16, 4);
-    return grainCount;
+    std::memcpy(&header.grainCount, buf + 8 + 128 + 16, 4);
+    std::memcpy(&header.headIndex, buf + 8 + 192, 8);
+    return header;
+}
+
+double taiNowSeconds()
+{
+    timespec ts{};
+    ::clock_gettime(CLOCK_TAI, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
 }
 } // namespace
 
-Inventory scanOnce(std::string const& root, std::string const& hostId, std::set<std::string> const& peerLocalDomainIds)
+Inventory scanOnce(std::string const& root, std::string const& hostId)
 {
     Inventory inventory;
     inventory.host_id = hostId;
@@ -96,22 +111,7 @@ Inventory scanOnce(std::string const& root, std::string const& hostId, std::set<
         }
         found.emplace_back(entry.path().string(), readFile(defPath));
     }
-    std::set<std::string> localIds;
-    for (auto const& [path, def] : found)
-    {
-        auto const rootJson = json::parse(def);
-        if (!rootJson.is<picojson::object>())
-        {
-            continue;
-        }
-        auto const id = json::asString(rootJson.get<picojson::object>(), "id").value_or("");
-        auto const marker = readMirrorMarker(def);
-        if (id.empty() || (marker && marker->mirror))
-        {
-            continue;
-        }
-        localIds.insert(id);
-    }
+    auto const tai = taiNowSeconds();
     for (auto const& [path, def] : found)
     {
         auto const rootJson = json::parse(def);
@@ -124,12 +124,11 @@ Inventory scanOnce(std::string const& root, std::string const& hostId, std::set<
         {
             continue;
         }
-        bool const held = peerLocalDomainIds.count(id) != 0 && localIds.count(id) != 0;
         DomainRecord domain;
         domain.domain_id = id;
         domain.path = path;
         domain.options_json = readFile(fs::path(path) / "options.json");
-        domain.kind = classifyDomain(def, hostId, held && !(readMirrorMarker(def) && readMirrorMarker(def)->mirror));
+        domain.kind = classifyDomain(def, hostId);
         if (auto marker = readMirrorMarker(def))
         {
             domain.mirror = marker->mirror;
@@ -158,11 +157,12 @@ Inventory scanOnce(std::string const& root, std::string const& hostId, std::set<
             }
             bool const active = flowActive(flowEntry.path() / "data");
             auto flow = flowFromDef(defJson, domain.options_json, active);
-            auto const depth = payloadFromData(flowEntry.path() / "data");
-            if (depth != 0)
+            auto const header = readDataHeader(flowEntry.path() / "data");
+            if (header.grainCount != 0)
             {
-                flow.ring_depth = depth;
+                flow.ring_depth = header.grainCount;
             }
+            flow.live = active && headIsLive(header.headIndex, flow.grain_rate_num, flow.grain_rate_den, tai);
             domain.flows.push_back(std::move(flow));
         }
         inventory.domains.push_back(std::move(domain));
@@ -180,12 +180,6 @@ DomainScanner::DomainScanner(std::string root, std::string hostId, int intervalM
 DomainScanner::~DomainScanner()
 {
     stop();
-}
-
-void DomainScanner::setPeerDomains(std::set<std::string> ids)
-{
-    std::lock_guard const lock{mu_};
-    peers_ = std::move(ids);
 }
 
 Inventory DomainScanner::snapshot() const
@@ -220,12 +214,7 @@ void DomainScanner::loop()
     }
     while (!stop_.load())
     {
-        std::set<std::string> peers;
-        {
-            std::lock_guard const lock{mu_};
-            peers = peers_;
-        }
-        auto next = scanOnce(root_, host_, peers);
+        auto next = scanOnce(root_, host_);
         std::string canonical = next.canonicalJson();
         bool changed = false;
         {

@@ -14,6 +14,7 @@ struct FlowRecord
     std::string format; // discrete or continuous
     std::string media_type;
     bool active = false;
+    bool live = false; // its head index is at the current time: a writer is writing it
     std::int64_t grain_rate_num = 0;
     std::int64_t grain_rate_den = 1;
     std::int64_t sample_rate_num = 0;
@@ -52,7 +53,9 @@ struct MirrorMarker
 };
 
 std::optional<MirrorMarker> readMirrorMarker(std::string const& domainDefJson);
-std::string classifyDomain(std::string const& domainDefJson, std::string const& ourHostId, bool idHeldByPeer);
+std::string classifyDomain(std::string const& domainDefJson, std::string const& ourHostId);
+// True when a flow's head index is within 5 s of the current TAI time at the flow's rate.
+bool headIsLive(std::uint64_t headIndex, std::int64_t rateNum, std::int64_t rateDen, double taiSeconds);
 FlowRecord flowFromDef(std::string const& flowDefJson, std::string const& optionsJson, bool active, std::uint64_t payloadOverride = 0,
     std::uint64_t ringOverride = 0);
 } // namespace mfa

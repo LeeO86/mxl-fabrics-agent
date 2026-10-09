@@ -1,5 +1,6 @@
 #include "fabric/domain.hpp"
 
+#include "replication/policy.hpp"
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
 #include "util/threading.hpp"
@@ -15,6 +16,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <mutex>
 #include <thread>
@@ -41,6 +43,7 @@ struct PickedInterface
     mxlFabricsProvider provider = MXL_FABRICS_PROVIDER_TCP;
     std::uint64_t flags = MXL_FABRICS_IFACE_CAP_REMOTE_WRITE;
     std::uint64_t maxMessage = 0;
+    std::string domain; // libfabric domain (RDMA device) of that address, from the interface list
     std::string error;
 };
 
@@ -87,6 +90,10 @@ PickedInterface pickInterface(mxlFabricsInstance fabrics, std::string const& pro
     picked.service = service.empty() ? (match->address.service != nullptr ? match->address.service : "") : service;
     picked.flags = match->caps.flags != 0 ? match->caps.flags : static_cast<std::uint64_t>(MXL_FABRICS_IFACE_CAP_REMOTE_WRITE);
     picked.maxMessage = match->caps.maxMessageSize;
+    if (match->attr != nullptr)
+    {
+        picked.domain = json::asString(json::objectOrEmpty(json::parse(match->attr)), "fi_domain_name").value_or("");
+    }
     picked.ok = true;
     mxlFabricsFreeInterfaceList(list);
     if (picked.node.empty() && !node.empty())
@@ -179,8 +186,12 @@ struct TargetSlot
 struct InitiatorSlot
 {
     std::string flowId;
+    FabricEndpoint endpoint; // where reader and initiator were opened (provider after a fallback), to open them again
     mxlFabricsInitiator initiator = nullptr;
     mxlFlowReader reader = nullptr;
+    std::uint64_t inode = 0; // the origin's data file when the reader was opened
+    std::chrono::steady_clock::time_point checkedAt{}; // last check of that file
+    bool reopen = false;     // the reader reported the origin flow invalid (re-created)
     bool continuous = false;
     mxlFlowConfigInfo info{};
     std::string provider;
@@ -467,6 +478,9 @@ public:
             slot.cqDepth = cqDepth;
             slot.state = "pending";
             targets_[key] = slot;
+            // The device a target or initiator uses, to compare with the device of a queue pair (rdma res).
+            log::info("fabric_endpoint", {{"role", "destination"}, {"flow_id", flowId}, {"provider", provider}, {"address", picked.node},
+                                             {"domain", picked.domain}});
             result.ok = true;
             result.target_info = std::move(text);
             result.provider_used = provider;
@@ -505,82 +519,104 @@ public:
         {
             return true;
         }
-        auto attempt = [&](std::string const& provider, bool fallback) -> bool {
-            PickedInterface picked = pickInterface(fabrics_, provider, endpoint.node, endpoint.service);
-            if (!picked.ok)
-            {
-                if (error != nullptr)
-                {
-                    *error = picked.error;
-                }
-                return false;
-            }
-            mxlFlowReader reader = nullptr;
-            auto status = mxlCreateFlowReader(instance_, flowId.c_str(), nullptr, &reader);
-            if (status != MXL_STATUS_OK || reader == nullptr)
-            {
-                if (error != nullptr)
-                {
-                    *error = "mxlCreateFlowReader failed (" + statusText(status) + ")";
-                }
-                return false;
-            }
-            mxlFlowConfigInfo info{};
-            mxlFlowReaderGetConfigInfo(reader, &info);
-            mxlFabricsInitiator initiator = nullptr;
-            status = mxlFabricsCreateInitiator(fabrics_, &initiator);
-            if (status != MXL_STATUS_OK || initiator == nullptr)
-            {
-                mxlReleaseFlowReader(instance_, reader);
-                if (error != nullptr)
-                {
-                    *error = "mxlFabricsCreateInitiator failed";
-                }
-                return false;
-            }
-            auto const iface = makeConfig(picked);
-            mxlFabricsInitiatorConfig config{};
-            config.version = MXL_FABRICS_API_VERSION;
-            config.interface = iface;
-            config.reader = reader;
-            status = mxlFabricsInitiatorSetup(initiator, &config, nullptr);
-            if (status != MXL_STATUS_OK)
-            {
-                mxlFabricsDestroyInitiator(fabrics_, initiator);
-                mxlReleaseFlowReader(instance_, reader);
-                if (error != nullptr)
-                {
-                    *error = "mxlFabricsInitiatorSetup failed (" + statusText(status) + ")";
-                }
-                return false;
-            }
-            InitiatorSlot slot;
-            slot.flowId = flowId;
-            slot.initiator = initiator;
-            slot.reader = reader;
-            slot.info = info;
-            slot.continuous = !mxlIsDiscreteDataFormat(static_cast<int>(info.common.format));
-            slot.provider = provider;
-            slot.fallback = fallback;
-            slot.state = "pending";
-            initiators_.emplace(key, std::move(slot));
-            return true;
-        };
-        if (attempt(endpoint.provider, false))
+        InitiatorSlot slot;
+        slot.flowId = flowId;
+        slot.endpoint = endpoint;
+        if (!openInitiator(slot, error))
         {
-            publish();
-            return true;
-        }
-        if (endpoint.allowTcpFallback && endpoint.provider == "verbs")
-        {
+            if (!endpoint.allowTcpFallback || endpoint.provider != "verbs")
+            {
+                return false;
+            }
             log::warn("provider_fallback", {{"from", "verbs"}, {"to", "tcp"}, {"flow_id", flowId}, {"role", "source"}});
-            if (attempt("tcp", true))
+            slot.endpoint.provider = "tcp";
+            slot.fallback = true;
+            if (!openInitiator(slot, error))
             {
-                publish();
-                return true;
+                return false;
             }
         }
-        return false;
+        slot.provider = slot.endpoint.provider;
+        slot.checkedAt = std::chrono::steady_clock::now();
+        initiators_.emplace(key, std::move(slot));
+        publish();
+        return true;
+    }
+
+    // Opens the slot's reader on the origin flow and an initiator for it on the slot's endpoint.
+    bool openInitiator(InitiatorSlot& slot, std::string* error)
+    {
+        // Before the reader opens it: a flow created again in between is then seen as a new inode.
+        auto const inode = fileInode(dataPath(slot.flowId));
+        if (inode == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = "origin flow not found";
+            }
+            return false;
+        }
+        PickedInterface picked = pickInterface(fabrics_, slot.endpoint.provider, slot.endpoint.node, slot.endpoint.service);
+        if (!picked.ok)
+        {
+            if (error != nullptr)
+            {
+                *error = picked.error;
+            }
+            return false;
+        }
+        mxlFlowReader reader = nullptr;
+        auto status = mxlCreateFlowReader(instance_, slot.flowId.c_str(), nullptr, &reader);
+        if (status != MXL_STATUS_OK || reader == nullptr)
+        {
+            if (error != nullptr)
+            {
+                *error = "mxlCreateFlowReader failed (" + statusText(status) + ")";
+            }
+            return false;
+        }
+        mxlFlowConfigInfo info{};
+        mxlFlowReaderGetConfigInfo(reader, &info);
+        mxlFabricsInitiator initiator = nullptr;
+        status = mxlFabricsCreateInitiator(fabrics_, &initiator);
+        if (status != MXL_STATUS_OK || initiator == nullptr)
+        {
+            mxlReleaseFlowReader(instance_, reader);
+            if (error != nullptr)
+            {
+                *error = "mxlFabricsCreateInitiator failed";
+            }
+            return false;
+        }
+        auto const iface = makeConfig(picked);
+        mxlFabricsInitiatorConfig config{};
+        config.version = MXL_FABRICS_API_VERSION;
+        config.interface = iface;
+        config.reader = reader;
+        status = mxlFabricsInitiatorSetup(initiator, &config, nullptr);
+        if (status != MXL_STATUS_OK)
+        {
+            mxlFabricsDestroyInitiator(fabrics_, initiator);
+            mxlReleaseFlowReader(instance_, reader);
+            if (error != nullptr)
+            {
+                *error = "mxlFabricsInitiatorSetup failed (" + statusText(status) + ")";
+            }
+            return false;
+        }
+        log::info("fabric_endpoint", {{"role", "source"}, {"flow_id", slot.flowId}, {"provider", slot.endpoint.provider}, {"address", picked.node},
+                                         {"domain", picked.domain}});
+        slot.initiator = initiator;
+        slot.reader = reader;
+        slot.inode = inode;
+        slot.info = info;
+        slot.continuous = !mxlIsDiscreteDataFormat(static_cast<int>(info.common.format));
+        return true;
+    }
+
+    std::string dataPath(std::string const& flowId) const
+    {
+        return (std::filesystem::path(path_) / (flowId + ".mxl-flow") / "data").string();
     }
 
     bool addInitiatorTarget(std::string const& key, std::string const& destHost, std::string const& targetInfo, std::string* error)
@@ -606,7 +642,10 @@ public:
             {
                 return true;
             }
-            mxlFabricsInitiatorRemoveTarget(slot.initiator, existing->second);
+            if (slot.initiator != nullptr)
+            {
+                mxlFabricsInitiatorRemoveTarget(slot.initiator, existing->second);
+            }
             mxlFabricsFreeTargetInfo(existing->second);
             slot.targets.erase(existing);
             slot.targetTexts.erase(destHost);
@@ -621,7 +660,8 @@ public:
             }
             return false;
         }
-        auto const add = mxlFabricsInitiatorAddTarget(slot.initiator, info);
+        // Without an initiator (the origin flow is gone) the target is added when the flow is back.
+        auto const add = slot.initiator != nullptr ? mxlFabricsInitiatorAddTarget(slot.initiator, info) : MXL_STATUS_OK;
         if (add != MXL_STATUS_OK)
         {
             mxlFabricsFreeTargetInfo(info);
@@ -652,7 +692,10 @@ public:
         {
             return;
         }
-        mxlFabricsInitiatorRemoveTarget(it->second.initiator, found->second);
+        if (it->second.initiator != nullptr)
+        {
+            mxlFabricsInitiatorRemoveTarget(it->second.initiator, found->second);
+        }
         mxlFabricsFreeTargetInfo(found->second);
         it->second.targets.erase(found);
         it->second.targetTexts.erase(destHost);
@@ -742,26 +785,103 @@ private:
         }
         slot.targets.clear();
         slot.targetTexts.clear();
+        closeInitiator(slot);
+    }
+
+    // Closes initiator (and with it the connections) and reader; the targets stay to be added again.
+    void closeInitiator(InitiatorSlot& slot)
+    {
         if (slot.initiator != nullptr && fabrics_ != nullptr)
         {
             mxlFabricsDestroyInitiator(fabrics_, slot.initiator);
-            slot.initiator = nullptr;
         }
+        slot.initiator = nullptr;
         if (slot.reader != nullptr && instance_ != nullptr)
         {
             mxlReleaseFlowReader(instance_, slot.reader);
-            slot.reader = nullptr;
         }
+        slot.reader = nullptr;
+        slot.primed = false;
+        slot.connected = false;
+        slot.inFlight = false;
+        slot.awaitingCompletion = false;
     }
 
-    void pumpInitiator(std::string const&, InitiatorSlot& slot)
+    // A writer that restarts releases the origin flow (MXL deletes it with its last writer) and creates
+    // it again with a new inode; the reader stays on the deleted one, whose head stands still. Once a
+    // second, and at once when the reader reports the flow invalid, the data file is checked. A changed
+    // or deleted one closes reader and initiator; a check later (1 s, so the destinations have seen
+    // the connection close and listen again) the flow is opened again, once it exists, for the same targets.
+    void checkOrigin(std::string const& key, InitiatorSlot& slot)
     {
-        if (slot.initiator == nullptr || slot.targets.empty())
+        auto const now = std::chrono::steady_clock::now();
+        if (!slot.reopen && now - slot.checkedAt < std::chrono::seconds(1))
+        {
+            return;
+        }
+        slot.checkedAt = now;
+        bool const invalid = std::exchange(slot.reopen, false);
+        std::string reason;
+        if (slot.initiator != nullptr)
+        {
+            reason = originChange(dataPath(slot.flowId), slot.inode);
+            if (reason.empty() && invalid)
+            {
+                reason = "origin flow re-created"; // the reader says so
+            }
+        }
+        if (!reason.empty())
+        {
+            log::warn("origin_changed", {{"replication_id", key}, {"flow_id", slot.flowId}, {"reason", reason}});
+            closeInitiator(slot);
+            slot.state = "pending";
+            slot.lastError = reason;
+            return;
+        }
+        if (slot.initiator != nullptr || !openInitiator(slot, nullptr))
+        {
+            return;
+        }
+        for (auto const& [_, info] : slot.targets)
+        {
+            mxlFabricsInitiatorAddTarget(slot.initiator, info);
+        }
+        log::info("origin_reopened", {{"replication_id", key}, {"flow_id", slot.flowId}});
+    }
+
+    void pumpInitiator(std::string const& key, InitiatorSlot& slot)
+    {
+        if (slot.targets.empty())
+        {
+            return;
+        }
+        checkOrigin(key, slot);
+        if (slot.initiator == nullptr)
         {
             return;
         }
         auto const progress = mxlFabricsInitiatorMakeProgressNonBlocking(slot.initiator);
-        if (progress == MXL_ERR_NOT_READY || progress == MXL_ERR_INTERRUPTED)
+        if (progress == MXL_ERR_INTERRUPTED)
+        {
+            // MXL drops a target whose connection shut down: closed by the destination, or after a
+            // failed transfer (libfabric's verbs provider shuts the endpoint down on a completion
+            // error). With none left every MakeProgress only logs "No more targets" (39,000 lines in
+            // 15 min on the platform). The targets are forgotten here; the destination repeats its
+            // request on its next pass, and its target, which listens again, gets a new connection.
+            for (auto& [_, info] : slot.targets)
+            {
+                mxlFabricsFreeTargetInfo(info);
+            }
+            slot.targets.clear();
+            slot.targetTexts.clear();
+            updateEntryBytes(slot);
+            slot.connected = false;
+            slot.errors += 1;
+            slot.lastError = "connection shut down (failed transfer or closed by the destination)";
+            log::warn("source_connection_lost", {{"replication_id", key}, {"flow_id", slot.flowId}});
+            return;
+        }
+        if (progress == MXL_ERR_NOT_READY)
         {
             // NOT_READY also means transfers still in flight (verbs, most passes).
             // Only an initiator that never connected to its current targets is pending.
@@ -842,6 +962,11 @@ private:
         if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
         {
             slot.nextIndex = mxlGetCurrentIndex(&slot.info.common.grainRate);
+            return;
+        }
+        if (status == MXL_ERR_FLOW_INVALID)
+        {
+            slot.reopen = true; // a writer created the flow again (1.2.3 counted this error on every pass)
             return;
         }
         if (status != MXL_STATUS_OK)

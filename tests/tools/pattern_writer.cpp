@@ -70,8 +70,11 @@ int readFlow(std::string const& domain, std::string const& flowId, int seconds)
 }
 
 // A 1080p50 v210 flow in its own domain with the given history, written in real
-// time for `seconds`; each grain carries its index in the first 8 bytes.
-int writeVideo(std::string const& domain, std::string const& domainId, std::string const& flowId, int seconds, long long historyMs)
+// time for `seconds`; each grain carries its index in the first 8 bytes. With `recreateAfter`
+// (seconds, > 0) the writer is released and created again then, as by a function that restarts:
+// MXL deletes the flow with its last writer and the new writer creates it with a new inode.
+int writeVideo(std::string const& domain, std::string const& domainId, std::string const& flowId, int seconds, long long historyMs,
+    int recreateAfter)
 {
     std::filesystem::create_directories(domain);
     writeFile(std::filesystem::path(domain) / "options.json",
@@ -101,9 +104,22 @@ int writeVideo(std::string const& domain, std::string const& domainId, std::stri
     }
     std::cout << "writing 1080p50 v210 to " << flowId << " for " << seconds << " s, history " << historyMs << " ms\n";
     auto const end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    auto const recreateAt = std::chrono::steady_clock::now() + std::chrono::seconds(recreateAfter);
+    bool recreate = recreateAfter > 0;
     std::uint64_t last = 0;
     while (std::chrono::steady_clock::now() < end)
     {
+        if (recreate && std::chrono::steady_clock::now() >= recreateAt)
+        {
+            recreate = false;
+            mxlReleaseFlowWriter(instance, writer);
+            if (mxlCreateFlowWriter(instance, def.c_str(), nullptr, &writer, &info, &created) != MXL_STATUS_OK)
+            {
+                std::cerr << "mxlCreateFlowWriter failed\n";
+                return 1;
+            }
+            std::cout << "re-created " << flowId << " (created " << created << ")\n";
+        }
         auto const index = mxlGetCurrentIndex(&info.common.grainRate);
         if (index == last)
         {
@@ -392,7 +408,7 @@ int main(int argc, char** argv)
     }
     if (argc > 6 && std::string(argv[1]) == "video")
     {
-        return writeVideo(argv[2], argv[3], argv[4], std::atoi(argv[5]), std::atoll(argv[6]));
+        return writeVideo(argv[2], argv[3], argv[4], std::atoi(argv[5]), std::atoll(argv[6]), argc > 7 ? std::atoi(argv[7]) : 0);
     }
     if (argc > 5 && std::string(argv[1]) == "rate")
     {

@@ -39,6 +39,7 @@ struct PostResult
     int status = 201;
     std::string replication_id;
     std::string state;
+    std::string error; // the source's last error for this replication, so the destination shows it
     bool created = false;
     bool replaced = false;
     // The origin flow's head index, so the destination can tell a dead link from a source
