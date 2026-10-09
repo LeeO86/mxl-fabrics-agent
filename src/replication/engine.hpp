@@ -44,6 +44,7 @@ struct ReplicaView
     std::uint64_t restarts = 0;
     std::uint64_t head = 0;
     std::int64_t lag = 0;
+    std::uint64_t gaps = 0; // source: origin indexes never written, passed over
     std::string last_error;
     bool fallback = false;
     int cq_depth = 0;

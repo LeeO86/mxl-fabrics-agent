@@ -25,6 +25,19 @@ struct StallInput
 // reports the error. The wait doubles with each rebuild in a row, three times at most.
 bool shouldRebuild(StallInput const& in);
 
+// True when `index`, the grain a source wants to send next, is one its origin never wrote while a later
+// grain exists (`head`, UINT64_MAX while none is written). A writer that skips indexes (one that is
+// late and jumps to the current grain) leaves them: MXL marks them invalid with no valid slice when the
+// writer opens the next grain (`invalidEmpty`); a slot that still holds another index (`slotIndex`, a
+// writer that opened the flow again) or that is not complete below the head (`!readable`) was not
+// written either. The head itself is the writer's latest grain and is sent, also when it is invalid.
+bool originGap(std::uint64_t index, std::uint64_t head, bool readable, bool invalidEmpty, std::uint64_t slotIndex);
+
+// True when a provider that has no interface for a local fabric address should list its interfaces
+// again: a local interface holds the address and has carrier (`linkUp`, `netdev` from fabricLink), and the
+// last new list is at least 5 s old. libfabric's verbs provider keeps the list of its first fi_getinfo.
+bool rescanDue(bool linkUp, std::string const& netdev, std::chrono::steady_clock::duration sinceLast);
+
 // Inode of a file, 0 when it does not exist.
 std::uint64_t fileInode(std::string const& path);
 

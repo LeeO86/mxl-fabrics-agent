@@ -72,9 +72,11 @@ int readFlow(std::string const& domain, std::string const& flowId, int seconds)
 // A 1080p50 v210 flow in its own domain with the given history, written in real
 // time for `seconds`; each grain carries its index in the first 8 bytes. With `recreateAfter`
 // (seconds, > 0) the writer is released and created again then, as by a function that restarts:
-// MXL deletes the flow with its last writer and the new writer creates it with a new inode.
+// MXL deletes the flow with its last writer and the new writer creates it with a new inode. With
+// `gapEvery` (> 0) it writes that many grains, then leaves `gapLength` indexes unwritten, and so on,
+// as a writer that is late and jumps to the current grain (mxl-replay's playout, FlowXer).
 int writeVideo(std::string const& domain, std::string const& domainId, std::string const& flowId, int seconds, long long historyMs,
-    int recreateAfter)
+    int recreateAfter, int gapEvery, int gapLength)
 {
     std::filesystem::create_directories(domain);
     writeFile(std::filesystem::path(domain) / "options.json",
@@ -127,6 +129,10 @@ int writeVideo(std::string const& domain, std::string const& domainId, std::stri
             continue;
         }
         last = index;
+        if (gapEvery > 0 && index % (gapEvery + gapLength) >= static_cast<std::uint64_t>(gapEvery))
+        {
+            continue;
+        }
         mxlGrainInfo grain{};
         std::uint8_t* payload = nullptr;
         if (mxlFlowWriterOpenGrain(writer, index, &grain, &payload) != MXL_STATUS_OK)
@@ -408,7 +414,8 @@ int main(int argc, char** argv)
     }
     if (argc > 6 && std::string(argv[1]) == "video")
     {
-        return writeVideo(argv[2], argv[3], argv[4], std::atoi(argv[5]), std::atoll(argv[6]), argc > 7 ? std::atoi(argv[7]) : 0);
+        return writeVideo(argv[2], argv[3], argv[4], std::atoi(argv[5]), std::atoll(argv[6]), argc > 7 ? std::atoi(argv[7]) : 0,
+            argc > 8 ? std::atoi(argv[8]) : 0, argc > 9 ? std::atoi(argv[9]) : 3);
     }
     if (argc > 5 && std::string(argv[1]) == "rate")
     {

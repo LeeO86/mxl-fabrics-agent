@@ -43,6 +43,7 @@ struct FabricRow
     std::uint64_t errors = 0;
     std::uint64_t head = 0;
     std::uint64_t behind = 0; // destination: grains from head to the flow's current TAI index (0 before the first grain)
+    std::uint64_t gaps = 0;   // source: origin indexes passed over because the writer never wrote them
     std::string last_error;
     int cq_depth = 0;
     bool fallback = false;
