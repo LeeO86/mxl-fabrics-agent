@@ -387,9 +387,17 @@ The config therefore maps each peer to the local and remote fabric addresses:
   `link_down` with the reason: a destination drops its targets and the source's
   connections for that peer and retries nothing; when the link is back it sets up
   fresh ones. The source's replications to that peer show `link_down` too, and its
-  handshake answer says so, so the destination waits instead of rebuilding. One
-  log line per change (`peer_link_down`, `peer_link_up`). There is no relay over
-  a third host.
+  handshake answer says so, so the destination waits instead of rebuilding; the
+  source sets nothing up for that peer meanwhile (since 1.3.1). One log line per
+  change (`peer_link_down`, `peer_link_up`). There is no relay over a third host.
+- Address list (since 1.3.1): libfabric's `verbs` provider lists its devices and
+  their addresses once per process, at the first `fi_getinfo`, and answers from
+  that list. An address that was missing then and comes back later (networkd
+  after a link flap) is not in it. When a provider has no interface for a local
+  fabric address that a local interface holds with carrier, the agent builds
+  the list again (`fi_getinfo` with `FI_RESCAN`, at most once per 5 s, log
+  `fabric_interfaces_rescanned`) and tries once more. The other replications go
+  on.
 
 ### 8.3 Control API (agent-to-agent, also used by the UI)
 
@@ -455,8 +463,10 @@ handshake clears the destination's last handshake error (`recv`, `http …`).
 
 Since 1.3.0 the answer also carries the source's `state` for that replication
 (`pending`, `active`, `error`, `link_down`) and its `error`, which the destination
-shows as `last_error`. A source in `error` (connected, but no transfer completed
-for 2 s) makes the destination rebuild after 1 s without a grain (1, 2, 4, 8 s in
+shows as `last_error`. A source that cannot set up the replication answers 500
+with the reason in `error`, which the destination shows as `http 500: <reason>`
+(since 1.3.1; a bare `http 500` before). A source in `error` (connected, but no
+transfer completed for 2 s) makes the destination rebuild after 1 s without a grain (1, 2, 4, 8 s in
 a row); `link_down` makes it wait for the link. When MXL drops a source's target
 because its connection shut down (closed by the destination, or after a failed
 transfer: libfabric's `verbs` provider shuts an endpoint down on a completion
@@ -488,6 +498,16 @@ the set of hosts or the choice changes and exports `origin_conflicts`.
   transfer. 1.2.2 sent one sync batch per pass (48 samples from the ST 2110
   gateway): half of a 48 kHz flow arrived, 8 % over `verbs` on the platform.
   For continuous flows `replication_grains_total` counts transfers.
+- Indexes the origin never wrote are passed over (since 1.3.1). A writer that is
+  late and jumps to the current grain (mxl-replay's playout, FlowXer) leaves
+  indexes unwritten; MXL marks them invalid with no valid slice when the writer
+  opens the next grain. While a later grain exists, the source skips such an
+  index, and one whose slot holds another index or is not complete, up to the
+  next written grain; the mirror writer marks the skipped indexes invalid in
+  turn. The head grain is always sent. `origin_gaps` in `/api/v1/replications`
+  and `replication_origin_gaps_total` count them. Up to 1.3.0 each was sent as
+  an empty grain: one transfer and one immediate more, back to back with the
+  next grain, which over `verbs` meets "receiver not ready" (see pacing below).
 - No transfer pacing: a grain goes out as one transfer. 1.1.0 had an optional
   pacing (slice batches spread over part of the grain duration); over `verbs`
   MXL's target keeps one receive posted for the immediate data that ends every
@@ -641,6 +661,7 @@ Tabs:
 | `replication_bytes_total` | counter | flow_id, peer, role |
 | `replication_errors_total` | counter | flow_id, peer, role (no `kind`: errors are counted, not classified) |
 | `replication_restarts_total` | counter | flow_id, peer |
+| `replication_origin_gaps_total` | counter | flow_id, peer; source: origin indexes never written, passed over (since 1.3.1) |
 | `replication_lag_grains` | gauge | flow_id, peer |
 | `grain_transfer_seconds` | histogram | provider; source grains, transfer to completion |
 | `setup_seconds` | histogram | phase (target_setup, handshake, first_grain) (not implemented yet) |

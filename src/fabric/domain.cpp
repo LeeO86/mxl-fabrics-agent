@@ -3,6 +3,7 @@
 #include "replication/policy.hpp"
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
+#include "util/net.hpp"
 #include "util/threading.hpp"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <mxl/flow.h>
 #include <mxl/mxl.h>
 #include <mxl/time.h>
+#include <rdma/fabric.h>
 
 #include <chrono>
 #include <condition_variable>
@@ -47,7 +49,39 @@ struct PickedInterface
     std::string error;
 };
 
-PickedInterface pickInterface(mxlFabricsInstance fabrics, std::string const& providerName, std::string const& node, std::string const& service)
+// libfabric's verbs provider lists its devices and their addresses once, at the first fi_getinfo of the
+// process (vrb_getinfo → vrb_init_info, libfabric 2.3.1), and answers every later call from that list
+// (vrb_get_srcaddr_devs). An address that an interface got after that, such as one networkd set again
+// after a link flap, is missing until fi_getinfo with FI_RESCAN builds the list anew; the provider swaps
+// it under its lock, and open fabrics keep their own copy. At most once per 5 s for the whole process.
+bool rescanInterfaces(std::string const& providerName, std::string const& node)
+{
+    static std::mutex mu;
+    static std::chrono::steady_clock::time_point last{};
+    auto const link = fabricLink(node);
+    std::lock_guard const lock{mu};
+    auto const now = std::chrono::steady_clock::now();
+    if (!rescanDue(link.up, link.netdev, now - last))
+    {
+        return false;
+    }
+    last = now;
+    auto* hints = fi_allocinfo();
+    if (hints == nullptr)
+    {
+        return false;
+    }
+    hints->fabric_attr->prov_name = ::strdup(providerName.c_str());
+    fi_info* info = nullptr;
+    auto const status = fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), nullptr, nullptr, FI_RESCAN, hints, &info);
+    fi_freeinfo(info);
+    fi_freeinfo(hints);
+    log::info("fabric_interfaces_rescanned", {{"provider", providerName}, {"address", node}, {"interface", link.netdev}, {"status", std::to_string(status)}});
+    return true;
+}
+
+PickedInterface pickInterface(mxlFabricsInstance fabrics, std::string const& providerName, std::string const& node, std::string const& service,
+    bool rescan = true)
 {
     PickedInterface picked;
     picked.providerName = providerName;
@@ -83,6 +117,10 @@ PickedInterface pickInterface(mxlFabricsInstance fabrics, std::string const& pro
     if (match == nullptr)
     {
         mxlFabricsFreeInterfaceList(list);
+        if (rescan && !node.empty() && rescanInterfaces(providerName, node))
+        {
+            return pickInterface(fabrics, providerName, node, service, false);
+        }
         picked.error = "provider " + providerName + " has no interface for " + (node.empty() ? std::string("any address") : node);
         return picked;
     }
@@ -200,6 +238,7 @@ struct InitiatorSlot
     std::uint64_t bytes = 0;
     std::uint64_t errors = 0;
     std::uint64_t head = 0;
+    std::uint64_t gaps = 0; // origin indexes passed over because the writer never wrote them
     std::uint64_t nextIndex = 0;
     std::uint64_t sampleHead = 0;
     bool primed = false;
@@ -954,7 +993,21 @@ private:
         }
         mxlGrainInfo info{};
         std::uint8_t* payload = nullptr;
-        auto const status = mxlFlowReaderGetGrainNonBlocking(slot.reader, slot.nextIndex, &info, &payload);
+        auto read = [&] { return mxlFlowReaderGetGrainNonBlocking(slot.reader, slot.nextIndex, &info, &payload); };
+        auto status = read();
+        // Indexes the origin never wrote (a writer that is late jumps to the current grain) are passed
+        // over up to the next written grain. 1.3.0 sent each as an empty grain, a transfer and an
+        // immediate more, back to back with the next one.
+        mxlFlowRuntimeInfo runtime{};
+        auto const head = mxlFlowReaderGetRuntimeInfo(slot.reader, &runtime) == MXL_STATUS_OK ? runtime.headIndex : MXL_UNDEFINED_INDEX;
+        while ((status == MXL_STATUS_OK || status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY) &&
+               originGap(slot.nextIndex, head, status == MXL_STATUS_OK, (info.flags & MXL_GRAIN_FLAG_INVALID) != 0 && info.validSlices == 0,
+                   info.index))
+        {
+            slot.nextIndex += 1;
+            slot.gaps += 1;
+            status = read();
+        }
         if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY || status == MXL_ERR_TIMEOUT || status == MXL_ERR_NOT_READY)
         {
             return;
@@ -1242,6 +1295,7 @@ private:
             row.bytes = slot.bytes;
             row.errors = slot.errors;
             row.head = slot.head;
+            row.gaps = slot.gaps;
             row.last_error = slot.lastError;
             row.fallback = slot.fallback;
             if (!slot.targets.empty())

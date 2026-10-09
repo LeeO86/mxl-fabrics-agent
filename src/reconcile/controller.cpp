@@ -680,6 +680,10 @@ void Controller::renderMetrics()
             {
                 metrics_.setCounter("replication_restarts_total", static_cast<double>(row.restarts), {{"flow_id", row.flow_id}, {"peer", row.peer}});
             }
+            else
+            {
+                metrics_.setCounter("replication_origin_gaps_total", static_cast<double>(row.gaps), {{"flow_id", row.flow_id}, {"peer", row.peer}});
+            }
         }
     }
     for (auto const& [key, count] : reps)
@@ -870,6 +874,7 @@ HttpResponse Controller::handle(HttpRequest const& request)
             obj["restarts"] = picojson::value(static_cast<double>(row.restarts));
             obj["head_index"] = picojson::value(static_cast<double>(row.head));
             obj["lag_grains"] = picojson::value(static_cast<double>(row.lag));
+            obj["origin_gaps"] = picojson::value(static_cast<double>(row.gaps));
             obj["last_error"] = picojson::value(row.last_error);
             obj["fallback"] = picojson::value(row.fallback);
             arr.push_back(picojson::value(obj));

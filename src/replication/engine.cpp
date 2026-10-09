@@ -365,7 +365,9 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
         {
             state.state = "error";
             state.source_error = false;
-            state.last_error = response.error.empty() ? ("http " + std::to_string(response.status)) : response.error;
+            auto const reason = json::asString(json::objectOrEmpty(json::parse(response.body)), "error").value_or("");
+            state.last_error = !response.error.empty() ? response.error
+                                                       : "http " + std::to_string(response.status) + (reason.empty() ? "" : ": " + reason);
             state.backoff = nextBackoff(state.backoff);
             state.next_attempt = std::chrono::steady_clock::now() + state.backoff;
             continue;
@@ -414,28 +416,37 @@ PostResult ReplicationEngine::post(PostRequest const& request, std::string const
     {
         std::lock_guard const lock{mu_};
         result = handshake_.post(stored);
+        // While the source's own fabric link to the destination is down it answers link_down with the
+        // reason and sets nothing up. 1.3.0 tried, and without the address answered a bare 500.
+        if (auto const down = linksDown_.find(request.dest_host_id); down != linksDown_.end())
+        {
+            result.state = "link_down";
+            result.error = down->second;
+            return result;
+        }
     }
+    // A failure goes back with its reason, which the destination shows.
+    auto failed = [&](std::string const& error) {
+        result.status = 500;
+        result.state = "error";
+        result.error = error;
+        return result;
+    };
     auto dom = domain(domainPath);
     if (!dom || !dom->ok())
     {
-        result.status = 500;
-        result.state = "error";
-        return result;
+        return failed(dom ? dom->error() : "no domain");
     }
     std::string error;
     if (!dom->ensureInitiator(result.replication_id, request.flow_id, ep, &error))
     {
-        result.status = 500;
-        result.state = "error";
         log::warn("initiator_failed", {{"flow_id", request.flow_id}, {"error", error}});
-        return result;
+        return failed(error);
     }
     if (!dom->addInitiatorTarget(result.replication_id, request.dest_host_id, request.target_info, &error))
     {
-        result.status = 500;
-        result.state = "error";
         log::warn("add_target_failed", {{"flow_id", request.flow_id}, {"peer", request.dest_host_id}, {"error", error}});
-        return result;
+        return failed(error);
     }
     result.origin_head = dom->originHead(result.replication_id);
     // The source's state and reason go back to the destination: "error" (a transfer that does not
@@ -453,11 +464,6 @@ PostResult ReplicationEngine::post(PostRequest const& request, std::string const
         }
     }
     std::lock_guard const lock{mu_};
-    if (auto const down = linksDown_.find(request.dest_host_id); down != linksDown_.end())
-    {
-        result.state = "link_down";
-        result.error = down->second;
-    }
     if (result.state == "active")
     {
         handshake_.setTargetState(result.replication_id, request.dest_host_id, "active");
@@ -523,6 +529,7 @@ std::vector<ReplicaView> ReplicationEngine::status() const
             view.bytes = row.bytes;
             view.errors = row.errors;
             view.head = row.head;
+            view.gaps = row.gaps;
             view.last_error = row.last_error;
             view.fallback = row.fallback;
             view.cq_depth = row.cq_depth;

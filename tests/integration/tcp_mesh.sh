@@ -262,4 +262,24 @@ if ! rate=$("$WRITER" rate "$B/mirror-$RE_DOMAIN" "$RE_FLOW" 10 45); then
   fail "replication did not resume after the destination restarted"
 fi
 say "destination back: $rate"
+
+# A writer that leaves indexes unwritten (late, then on at the current grain: mxl-replay, FlowXer). The
+# source passes over them (1.3.0 sent each as an empty grain): every written grain arrives (10 of 13
+# indexes, 38.5 grains/s) and the gaps are counted.
+GAP_DOMAIN="cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd"
+GAP_FLOW="55555555-5555-4555-8555-555555555555"
+"$WRITER" video "$A/gaps" "$GAP_DOMAIN" "$GAP_FLOW" 60 200 0 10 3 >"$BASE/writer6.log" 2>&1 &
+PIDS+=($!)
+sleep 1
+curl -sf --max-time 2 -X PUT http://127.0.0.1:18971/control \
+  -H 'content-type: application/json' \
+  -d "{\"master_enable\":true,\"mxl_domain_id\":\"$GAP_DOMAIN\",\"mxl_flow_id\":\"$GAP_FLOW\"}" >/dev/null
+if ! rate=$("$WRITER" rate "$B/mirror-$GAP_DOMAIN" "$GAP_FLOW" 10 35); then
+  echo "$rate"
+  echo "--- A ---"; grep -v '"level":"debug"' "$LOGA" | tail -n 20
+  echo "--- reps A ---"; curl -sf http://127.0.0.1:18095/api/v1/replications || true
+  fail "flow with gaps: fewer than 35 of 38.5 grains/s"
+fi
+curl -sf --max-time 2 http://127.0.0.1:18095/api/v1/replications | grep -q '"origin_gaps":[1-9]' || fail "the source counted no origin gaps"
+say "flow with gaps: $rate"
 say "passed"

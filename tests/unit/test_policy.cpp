@@ -80,6 +80,21 @@ TEST_CASE("a re-created or deleted origin flow is seen by its inode")
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("a source passes over origin indexes the writer never wrote")
+{
+    // Head 105; the writer jumped from 101 to 105 and MXL marked 102-104 invalid with no valid slice.
+    CHECK(originGap(102, 105, true, true, 102));
+    CHECK_FALSE(originGap(101, 105, true, false, 101)); // a written grain
+    CHECK_FALSE(originGap(105, 105, true, true, 105));  // the head is sent, also when invalid
+    CHECK_FALSE(originGap(106, 105, false, false, 0));  // not written yet: wait for it
+    // A slot that still holds an older grain (a writer that opened the flow again).
+    CHECK(originGap(103, 105, true, false, 93));
+    // Below the head and not complete: never written (a slot of a new flow).
+    CHECK(originGap(103, 105, false, false, 0));
+    // Nothing written at all.
+    CHECK_FALSE(originGap(103, UINT64_MAX, false, false, 0));
+}
+
 TEST_CASE("the origin that is being written wins when several hosts hold a flow")
 {
     std::vector<OriginCandidate> stale{{"mxl-host-01", true, false}, {"mxl-host-03", true, true}};
@@ -137,5 +152,30 @@ TEST_CASE("fabric link state from carrier and RDMA counters")
     auto gone = fabricLink("198.51.100.77", net, ib);
     CHECK_FALSE(gone.up);
     CHECK(gone.error == "source interface unavailable: no local interface has 198.51.100.77");
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("a provider without an interface for a held address lists its interfaces again")
+{
+    auto const root = std::filesystem::temp_directory_path() / "mfa-rescan-test";
+    std::filesystem::remove_all(root);
+    auto const net = (root / "net").string();
+    auto const ib = (root / "ib").string();
+
+    writeFile(root / "net" / "eth9" / "carrier", "1\n");
+    auto up = fabricLink("eth9", net, ib);
+    CHECK(rescanDue(up.up, up.netdev, 1h)); // the address is back with carrier: a stale list
+    CHECK_FALSE(rescanDue(up.up, up.netdev, 4s)); // at most once per 5 s
+    CHECK(rescanDue(up.up, up.netdev, 5s));
+
+    writeFile(root / "net" / "eth9" / "carrier", "0\n");
+    auto noCarrier = fabricLink("eth9", net, ib);
+    CHECK_FALSE(rescanDue(noCarrier.up, noCarrier.netdev, 1h)); // link_down, not a stale list
+
+    auto gone = fabricLink("198.51.100.77", net, ib);
+    CHECK_FALSE(rescanDue(gone.up, gone.netdev, 1h)); // no interface holds the address
+
+    auto none = fabricLink("", net, ib);
+    CHECK_FALSE(rescanDue(none.up, none.netdev, 1h)); // no address configured
     std::filesystem::remove_all(root);
 }
