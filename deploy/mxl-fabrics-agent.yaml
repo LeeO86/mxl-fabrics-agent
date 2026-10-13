@@ -46,6 +46,11 @@ spec:
           securityContext:
             capabilities:
               add: ["IPC_LOCK", "SYS_NICE", "SYS_PTRACE"] # SYS_NICE: RT_PRIORITY; SYS_PTRACE: mirror reader check (the image raises both from its file capabilities)
+            # The runtime's default AppArmor profile denies ptrace read of processes outside it: the
+            # mirror reader check then sees no media function and the agent removes no mirror.
+            # Before Kubernetes 1.30: annotation container.apparmor.security.beta.kubernetes.io/agent: unconfined
+            appArmorProfile:
+              type: Unconfined
           resources:
             limits:
               rdma/infiniband: 1
