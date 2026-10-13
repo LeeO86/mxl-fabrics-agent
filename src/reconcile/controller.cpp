@@ -675,7 +675,8 @@ std::vector<Controller::MirrorDomainView> Controller::cleanupMirrors(Config cons
                              now - mirrorIdleSince_[id] >= std::chrono::seconds(cfg.mirror_idle_grace_s);
         auto const plan = planMirrorDomain(input);
         view.state = plan.state;
-        if (view.on_disk && (plan.remove || plan.refused) && now - started_ >= std::chrono::seconds(30))
+        // The scanner's snapshot may still list a domain that DELETE removed meanwhile.
+        if (view.on_disk && (plan.remove || plan.refused) && now - started_ >= std::chrono::seconds(30) && fs::is_directory(view.path))
         {
             candidates.push_back(id);
             plans[id] = plan;
