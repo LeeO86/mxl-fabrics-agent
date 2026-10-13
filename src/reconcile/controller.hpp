@@ -3,6 +3,7 @@
 #include "config/store.hpp"
 #include "demand/derive.hpp"
 #include "inventory/scanner.hpp"
+#include "mirror/readers.hpp"
 #include "nmos/node.hpp"
 #include "nmos/observer.hpp"
 #include "ops/httpserver.hpp"
@@ -41,6 +42,30 @@ private:
     void renderMetrics();
     HttpResponse testPeer(std::string const& hostId);
 
+    // One destination mirror domain, for the cleanup and GET /api/v1/mirrors.
+    struct MirrorDomainView
+    {
+        std::string domain_id;
+        std::string path;
+        std::string source_host_id;
+        bool on_disk = false;
+        bool source_up = false;
+        bool origin_on_peer = false;
+        bool origin_local = false;
+        bool demand = false;
+        std::string state;
+        std::int64_t created_unix = 0;    // mtime of its domain_def.json, 0 = unknown
+        std::int64_t idle_since_unix = 0; // since when it has had no demand, 0 = it has
+        std::vector<std::pair<FlowRecord, std::string>> flows; // with the per-flow mirror state
+    };
+    std::vector<MirrorDomainView> cleanupMirrors(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
+        bool truthOk, std::set<std::string> const& localIds, std::set<std::string> const& peerDomains,
+        std::set<std::string> const& wanted, std::vector<DomainRecord> const& flowViews);
+    // Closes the agent's writers of a mirror domain and removes it when no other process maps it.
+    // Returns "" when removed, else why not (with the readers).
+    std::string removeMirrorDomain(std::string const& domainId, std::string const& path, std::string const& reason,
+        std::vector<ReaderProcess>* readers);
+
     std::shared_ptr<ConfigStore> store_;
     std::string bootId_;
     ReplicationEngine engine_;
@@ -63,6 +88,12 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> originLost_;
     std::map<std::string, std::chrono::steady_clock::time_point> demandLost_;
     std::set<std::string> lastDemand_;
+    std::mutex tickMu_; // one tick or one DELETE /api/v1/mirrors at a time
+    std::chrono::steady_clock::time_point started_{};
+    std::chrono::steady_clock::time_point nextReaderScan_{};
+    std::map<std::string, std::chrono::steady_clock::time_point> mirrorIdleSince_; // per mirror domain without demand
+    std::map<std::string, std::string> mirrorLogged_; // per mirror domain, the last logged cleanup decision
+    std::vector<MirrorDomainView> mirrorDomains_;     // from the last tick (mu_)
     std::map<std::string, FabricLink> links_;  // per peer, from the last tick (mu_)
     std::map<std::string, std::string> linkErrors_; // per peer, the last logged link error ("" = up)
     struct OriginConflict

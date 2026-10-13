@@ -35,6 +35,8 @@ struct Config
     std::vector<std::string> mirror_exclude_domains;
     std::vector<std::string> mirror_exclude_flows;
     int mirror_grace_s = 10;
+    int mirror_idle_grace_s = 300;       // drop a mirror domain after this long without demand (0 = never)
+    bool mirror_cleanup_dry_run = false; // mirror cleanup only logs what it would remove
     int tmpfs_reserve_mb = 512;
     bool cleanup_mirrors_on_exit = false;
     std::string default_provider = "verbs";

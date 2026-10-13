@@ -137,6 +137,8 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | `MIRROR_INCLUDE_DOMAINS` / `MIRROR_INCLUDE_FLOWS` | empty | Extra allow lists. Empty means no extra filter |
 | `MIRROR_EXCLUDE_DOMAINS` / `MIRROR_EXCLUDE_FLOWS` | empty | Deny lists |
 | `MIRROR_GRACE_S` | 10 | Keep a mirror after the origin disappears |
+| `MIRROR_IDLE_GRACE_S` | 300 | Drop a mirror domain after this many seconds without demand (`0`: never) |
+| `MIRROR_CLEANUP_DRY_RUN` | false | Mirror cleanup only logs `mirror_domain_would_remove` |
 | `TMPFS_RESERVE_MB` | 512 | Free space left on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | On shutdown, remove mirror domains this agent owns. Alias: `CLEANUP_MIRRORS_ON_EXIT`. With false the mirror flows stay, and readers on the host keep reading them after a restart |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |
@@ -191,7 +193,8 @@ All of these are on `WEB_PORT`.
 | GET | `/` | Admin UI, unless `WEB_ENABLE=false` |
 | GET | `/api/v1/info` | Version, host id, boot id |
 | GET | `/api/v1/inventory` | Local domains and flows |
-| GET | `/api/v1/mirrors` | Mirror domains |
+| GET | `/api/v1/mirrors` | Mirror domains: origin, flows, demand, readers, age, cleanup state |
+| DELETE | `/api/v1/mirrors/{domain_id}` | Remove a mirror domain; 409 while another process maps it |
 | GET | `/api/v1/demand` | Local IS-05 demand |
 | GET | `/api/v1/replications` | Active replications |
 | POST | `/api/v1/replications` | Peer asks this host to send a flow |
@@ -205,10 +208,33 @@ All of these are on `WEB_PORT`.
 | GET | `/api/v1/config/export` | One JSON document of the effective configuration. No secrets exist to omit |
 | POST | `/api/v1/config/import` | Restore that document into the file layer. Environment variables still win |
 
+## Mirror cleanup
+
+The agent drops whole destination mirror domains (`<MXL root>/mirror-<domain id>`): it closes its own writers and targets of the domain, removes its flows, then the directory. Each tick gives every mirror domain on disk one state:
+
+| State | When | What happens |
+| --- | --- | --- |
+| `same_node` | The origin domain is on this node (a function moved here) | Removed at once. The agent never creates a mirror of a local origin. Readers must find the origin, not a frozen copy with the same flow ids |
+| `orphan` | No peer that is up lists the origin domain, and its source peer is not a known peer that is down | Removed at once |
+| `active` | A receiver wants one of its flows, a replication is held, or `MIRROR_MODE=eager` mirrors a live origin | Kept |
+| `idle` | None of that | Removed after `MIRROR_IDLE_GRACE_S` without demand |
+
+Safety:
+
+- Only directories named `mirror-<domain id>` whose `domain_def.json` carries this agent's mirror marker. Origin domains, other agents' mirrors and anything else under the root are never touched.
+- Nothing is removed while a process other than the agent maps one of its files. The agent reads `/proc/<pid>/maps` of every process and matches device and inode, so the mount namespace of the reader does not matter. MXL readers take no lock, so the maps are the only sign of a reader. When the agent cannot see every process (its own PID namespace, or a `maps` file it may not read), it removes nothing and says so (`readers_known: false`, `readers_error`). On the platform the agent therefore needs `hostPID: true` and `SYS_PTRACE` (the image raises it from its file capabilities, like `SYS_NICE`); an AppArmor profile that denies `ptrace read` has the same effect as a missing capability.
+- The check runs again after the agent closed its own writers, right before the files go.
+- Orphans are decided only 30 s after start and, with NMOS, while the registry answers: a registry outage does not make every mirror an orphan. Nothing is removed in the first 30 s.
+- `MIRROR_CLEANUP_DRY_RUN=true` logs `mirror_domain_would_remove` and removes nothing (also for `DELETE`).
+
+Logs: `mirror_domain_removed` (domain, path, reason, flows), `mirror_domain_busy` (refused, with the reader pids), `mirror_domain_would_remove` (dry run). Metrics: `mxl_fabrics_agent_mirror_domains{state}`, `mxl_fabrics_agent_mirror_domains_removed_total{reason}` and `mxl_fabrics_agent_mirror_domains_refused_total{reason}`; `reason` is `same_node`, `orphan`, `idle` or `api`.
+
+`GET /api/v1/mirrors` lists one entry per mirror domain: `domain_id`, `path`, `origin` (`host_id`, `peer_up`, `on_peer`, `local`), `state`, `on_disk`, `demand`, `idle_since` (Unix seconds, `null` with demand), `age_s` (since its `domain_def.json` was written), `readers` (`pid`, `comm`), `readers_known`, and `flows` (`flow_id`, `media_type`, `format`, `active`, the per-flow mirror `state`). `DELETE /api/v1/mirrors/{domain_id}` removes one with the same checks: 404 when this agent has no such mirror, 409 with `readers` or `error` while it is mapped or the readers are unknown, 200 with `removed: true` otherwise. A mirror that is still wanted (`eager`, demand) comes back on the next tick.
+
 This agent has no IS-05 senders or receivers. It does not accept connection patches. It only reads other nodes' active connections.
 
 ## Running on the platform
 
-The platform runs one agent per node as a DaemonSet on the host network. Host networking is required for RDMA and for the fabric addresses in the peer map. `deploy/mxl-fabrics-agent.yaml` shows the contract: no `hostIPC`, `IPC_LOCK` for memory registration, the MXL root hostPath at `/Volumes/mxl`, a writable `/config` volume, probes on `/livez` and `/readyz`, and `terminationGracePeriodSeconds` greater than `SHUTDOWN_TIMEOUT_S`.
+The platform runs one agent per node as a DaemonSet on the host network. Host networking is required for RDMA and for the fabric addresses in the peer map. `deploy/mxl-fabrics-agent.yaml` shows the contract: no `hostIPC`, `hostPID` and `SYS_PTRACE` for the mirror reader check, `IPC_LOCK` for memory registration, the MXL root hostPath at `/Volumes/mxl`, a writable `/config` volume, probes on `/livez` and `/readyz`, and `terminationGracePeriodSeconds` greater than `SHUTDOWN_TIMEOUT_S`.
 
 Set `NMOS_HOST_ADDRESS` to the node IP, `NMOS_DNS_SD=false`, and `NMOS_REGISTRY_PORT` to the platform registration port (the query port defaults to that port plus 1). Set `LOCAL_NODE_CIDRS` to the node's pod CIDR. Set `MXL_CLEANUP_ON_EXIT=true` so this node's mirrors disappear on shutdown, or `false` so readers on the node keep their mirror flows across an agent restart. Leave `NMOS_SEED` unset to keep the existing node id, which is UUIDv5 of `HOST_ID`. Setting `NMOS_SEED` changes that id.

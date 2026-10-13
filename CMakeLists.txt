@@ -24,6 +24,7 @@ set(MFA_CORE_SOURCES
     src/inventory/scanner.cpp
     src/demand/derive.cpp
     src/mirror/lifecycle.cpp
+    src/mirror/readers.cpp
     src/replication/handshake.cpp
     src/replication/policy.cpp
     src/ops/metrics.cpp
@@ -44,6 +45,7 @@ if(MFA_BUILD_TESTS)
         tests/unit/test_config.cpp
         tests/unit/test_demand.cpp
         tests/unit/test_lifecycle.cpp
+        tests/unit/test_mirror_cleanup.cpp
         tests/unit/test_handshake.cpp
         tests/unit/test_inventory.cpp
         tests/unit/test_metrics.cpp

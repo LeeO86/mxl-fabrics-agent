@@ -334,6 +334,16 @@ mirror is not created, and status/metric/log report `insufficient_space`.
 - On agent startup, existing mirror domains with this agent's marker are
   adopted (re-opened as writer) or removed if no longer wanted. Mirror domains
   with a foreign `owner_host_id` are left untouched and reported as conflict.
+- Whole mirror domains (1.4.0): `same_node` (the origin domain is on this node)
+  and `orphan` (no up peer lists the origin and its source peer is not a known
+  peer that is down) are removed at once; `idle` (no demand, no held
+  replication, not eager-mirrored) after `MIRROR_IDLE_GRACE_S` (default 300,
+  `0` never); `active` stays. A mirror of a local origin is never created.
+  Removal closes the agent's writers and targets first, then removes the flows
+  and the directory, and MUST NOT happen while a process other than the agent
+  maps one of its files (`/proc/<pid>/maps`, device and inode) or while the
+  agent cannot check every process. Orphans are decided only 30 s after start
+  and, with NMOS, while the registry answers. `MIRROR_CLEANUP_DRY_RUN` only logs.
 - On clean shutdown (SIGTERM) the agent stops replications and, if
   `MXL_CLEANUP_ON_EXIT=true` (alias `CLEANUP_MIRRORS_ON_EXIT`, default false),
   removes only mirror directories it owns. With `false` it keeps the mirror
@@ -413,7 +423,8 @@ posture as the siblings: protected networks only).
 | DELETE | `/replications/{id}/targets/{dest_host_id}` | destination releases its target |
 | GET | `/replications` | active replications (both roles) |
 | GET | `/peers` | peers: control plane `up`, fabric `link_up`, `link_error`, `fabric_interface` |
-| GET | `/mirrors` | local mirrors and their state |
+| GET | `/mirrors` | local mirror domains: origin, flows, demand, readers, age, cleanup state |
+| DELETE | `/mirrors/{domain_id}` | remove a mirror domain; 409 while another process maps it |
 | GET | `/demand` | local demand entries and the receivers behind them |
 | GET | `/config` | effective configuration, where each key came from, `restart_required` |
 | GET | `/config/env` | the same configuration as `KEY=value` lines |
@@ -555,6 +566,8 @@ include/exclude lists apply at runtime.
 | `MIRROR_INCLUDE_DOMAINS` / `MIRROR_INCLUDE_FLOWS` | empty | allow lists; empty does not filter |
 | `MIRROR_EXCLUDE_DOMAINS` / `MIRROR_EXCLUDE_FLOWS` | empty | deny lists |
 | `MIRROR_GRACE_S` | 10 | keep mirror after origin disappears |
+| `MIRROR_IDLE_GRACE_S` | 300 | drop a mirror domain after this long without demand; `0` never |
+| `MIRROR_CLEANUP_DRY_RUN` | false | mirror cleanup only logs |
 | `TMPFS_RESERVE_MB` | 512 | minimum free space on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | remove own mirrors on SIGTERM. Alias: `CLEANUP_MIRRORS_ON_EXIT` |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |

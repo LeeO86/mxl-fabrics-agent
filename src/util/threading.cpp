@@ -42,6 +42,10 @@ std::string raisePermittedCapabilities()
     {
         effective += effective.empty() ? "ipc_lock" : ",ipc_lock";
     }
+    if (has(CAP_SYS_PTRACE))
+    {
+        effective += effective.empty() ? "sys_ptrace" : ",sys_ptrace";
+    }
     return effective.empty() ? "none" : effective;
 }
 
