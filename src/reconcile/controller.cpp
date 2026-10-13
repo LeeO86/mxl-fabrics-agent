@@ -676,7 +676,7 @@ std::vector<Controller::MirrorDomainView> Controller::cleanupMirrors(Config cons
         auto const plan = planMirrorDomain(input);
         view.state = plan.state;
         // The scanner's snapshot may still list a domain that DELETE removed meanwhile.
-        if (view.on_disk && (plan.remove || plan.refused) && now - started_ >= std::chrono::seconds(30) && fs::is_directory(view.path))
+        if (view.on_disk && plan.remove && now - started_ >= std::chrono::seconds(30) && fs::is_directory(view.path))
         {
             candidates.push_back(id);
             plans[id] = plan;
@@ -738,22 +738,7 @@ std::string Controller::removeMirrorDomain(std::string const& domainId, std::str
     auto const check = [&]() -> std::string {
         std::map<FileKey, std::string> files;
         collectFiles(path, path, files);
-        auto const scan = scanReaders(files, "/proc", static_cast<int>(::getpid()));
-        if (auto const it = scan.readers.find(path); it != scan.readers.end())
-        {
-            *readers = it->second;
-            std::string pids;
-            for (auto const& reader : it->second)
-            {
-                pids += (pids.empty() ? "" : ",") + std::to_string(reader.pid) + "(" + reader.comm + ")";
-            }
-            return "mapped by " + pids;
-        }
-        if (!scan.complete)
-        {
-            return "reader check incomplete: " + scan.error;
-        }
-        return {};
+        return removalBlocker(scanReaders(files, "/proc", static_cast<int>(::getpid())), path, readers);
     };
     if (auto const busy = check(); !busy.empty())
     {

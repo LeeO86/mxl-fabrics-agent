@@ -119,11 +119,6 @@ MirrorDomainPlan planMirrorDomain(MirrorDomainInput const& in)
         }
         plan.reason = "idle";
     }
-    if (in.readers > 0 || !in.readers_known)
-    {
-        plan.refused = true;
-        return plan;
-    }
     plan.remove = true;
     return plan;
 }

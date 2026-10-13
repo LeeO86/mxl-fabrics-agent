@@ -34,4 +34,7 @@ bool nestedPidNamespace(std::string const& statusText);
 void collectFiles(std::string const& dir, std::string const& owner, std::map<FileKey, std::string>& files);
 // The processes other than selfPid that map one of the files.
 ReaderScan scanReaders(std::map<FileKey, std::string> const& files, std::string const& procRoot, int selfPid);
+// Why owner may not be removed ("" = it may): mapped by another process, or the scan could not see
+// every process. Fills readers with the processes that map it.
+std::string removalBlocker(ReaderScan const& scan, std::string const& owner, std::vector<ReaderProcess>* readers);
 } // namespace mfa

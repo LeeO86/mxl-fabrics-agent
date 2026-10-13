@@ -149,4 +149,23 @@ ReaderScan scanReaders(std::map<FileKey, std::string> const& files, std::string 
     }
     return scan;
 }
+
+std::string removalBlocker(ReaderScan const& scan, std::string const& owner, std::vector<ReaderProcess>* readers)
+{
+    if (auto const it = scan.readers.find(owner); it != scan.readers.end() && !it->second.empty())
+    {
+        *readers = it->second;
+        std::string pids;
+        for (auto const& reader : it->second)
+        {
+            pids += (pids.empty() ? "" : ",") + std::to_string(reader.pid) + "(" + reader.comm + ")";
+        }
+        return "mapped by " + pids;
+    }
+    if (!scan.complete)
+    {
+        return "reader check incomplete: " + scan.error;
+    }
+    return {};
+}
 } // namespace mfa

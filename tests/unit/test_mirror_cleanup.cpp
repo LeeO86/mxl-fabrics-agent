@@ -90,7 +90,6 @@ TEST_CASE("mirror domain: active while there is demand")
     auto const plan = planMirrorDomain(in);
     CHECK(plan.state == "active");
     CHECK_FALSE(plan.remove);
-    CHECK_FALSE(plan.refused);
 }
 
 TEST_CASE("mirror domain: idle is kept for the grace time, then removed")
@@ -108,26 +107,19 @@ TEST_CASE("mirror domain: idle is kept for the grace time, then removed")
 
 TEST_CASE("mirror domain: a reader refuses the removal")
 {
-    for (auto const kind : {0, 1, 2})
-    {
-        auto in = liveOrigin();
-        in.origin_local = kind == 0;
-        in.origin_on_peer = kind != 1;
-        in.idle_expired = kind == 2;
-        in.readers = 1;
-        auto plan = planMirrorDomain(in);
-        CHECK_FALSE(plan.remove);
-        CHECK(plan.refused);
-        in.readers = 0;
-        in.readers_known = false; // processes the agent cannot see: refuse as well
-        plan = planMirrorDomain(in);
-        CHECK_FALSE(plan.remove);
-        CHECK(plan.refused);
-        in.readers_known = true;
-        plan = planMirrorDomain(in);
-        CHECK(plan.remove);
-        CHECK_FALSE(plan.refused);
-    }
+    ReaderScan scan;
+    std::vector<ReaderProcess> readers;
+    CHECK(removalBlocker(scan, "/mxl/mirror-d1", &readers).empty());
+    CHECK(readers.empty());
+    scan.readers["/mxl/mirror-d1"] = {ReaderProcess{4242, "vmix"}};
+    CHECK(removalBlocker(scan, "/mxl/mirror-d1", &readers) == "mapped by 4242(vmix)");
+    REQUIRE(readers.size() == 1);
+    CHECK(readers[0].pid == 4242);
+    readers.clear();
+    CHECK(removalBlocker(scan, "/mxl/mirror-d2", &readers).empty()); // another mirror is free
+    scan.complete = false; // processes the agent cannot see: refuse every removal
+    scan.error = "pid namespace";
+    CHECK(removalBlocker(scan, "/mxl/mirror-d2", &readers) == "reader check incomplete: pid namespace");
 }
 
 TEST_CASE("mirror cleanup settings")
