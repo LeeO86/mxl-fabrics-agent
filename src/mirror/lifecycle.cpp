@@ -90,4 +90,36 @@ MirrorPlan planMirror(MirrorInput const& in)
     plan.state = plan.replicate ? "replicating" : "idle";
     return plan;
 }
+
+MirrorDomainPlan planMirrorDomain(MirrorDomainInput const& in)
+{
+    MirrorDomainPlan plan;
+    if (in.origin_local)
+    {
+        // A frozen copy next to the live origin: readers must find the origin.
+        plan.state = "same_node";
+        plan.reason = "same_node";
+    }
+    else if (!in.origin_on_peer && !in.source_peer_down)
+    {
+        plan.state = "orphan";
+        plan.reason = "orphan";
+    }
+    else if (in.demand)
+    {
+        plan.state = "active";
+        return plan;
+    }
+    else
+    {
+        plan.state = "idle";
+        if (!in.idle_expired)
+        {
+            return plan;
+        }
+        plan.reason = "idle";
+    }
+    plan.remove = true;
+    return plan;
+}
 } // namespace mfa

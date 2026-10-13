@@ -255,7 +255,7 @@ std::vector<std::string> configKeys()
 {
     return {"HOST_ID", "MXL_DOMAIN_SCAN_PATH", "MXL_ROOT", "STATE_DIR", "SCAN_INTERVAL_MS", "MIRROR_MODE",
         "MIRROR_INCLUDE_DOMAINS", "MIRROR_INCLUDE_FLOWS", "MIRROR_EXCLUDE_DOMAINS", "MIRROR_EXCLUDE_FLOWS", "MIRROR_GRACE_S",
-        "TMPFS_RESERVE_MB", "MXL_CLEANUP_ON_EXIT", "CLEANUP_MIRRORS_ON_EXIT", "DEFAULT_PROVIDER", "PROVIDER_FALLBACK",
+        "MIRROR_IDLE_GRACE_S", "MIRROR_CLEANUP_DRY_RUN", "TMPFS_RESERVE_MB", "MXL_CLEANUP_ON_EXIT", "CLEANUP_MIRRORS_ON_EXIT", "DEFAULT_PROVIDER", "PROVIDER_FALLBACK",
         "FABRIC_INTERFACE", "FABRIC_PORT_BASE", "FABRIC_PORT_COUNT", "PEERS", "PEER_POLL_INTERVAL_MS", "RELEASE_GRACE_MS",
         "NMOS_ENABLE", "NMOS_SEED", "NMOS_LABEL", "NMOS_TAGS", "NMOS_DNS_SD", "NMOS_HOST_ADDRESS", "NMOS_REGISTRY_ADDRESS",
         "NMOS_REGISTRY_PORT", "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT", "NMOS_POLL_INTERVAL_MS", "NMOS_PORT", "LOCAL_NODE_IDS",
@@ -266,7 +266,8 @@ std::vector<std::string> configKeys()
 bool isRuntimeKey(std::string const& key)
 {
     static std::set<std::string> const keys = {"PEERS", "MIRROR_MODE", "MIRROR_INCLUDE_DOMAINS", "MIRROR_INCLUDE_FLOWS",
-        "MIRROR_EXCLUDE_DOMAINS", "MIRROR_EXCLUDE_FLOWS", "MIRROR_GRACE_S", "TMPFS_RESERVE_MB", "RELEASE_GRACE_MS",
+        "MIRROR_EXCLUDE_DOMAINS", "MIRROR_EXCLUDE_FLOWS", "MIRROR_GRACE_S", "MIRROR_IDLE_GRACE_S", "MIRROR_CLEANUP_DRY_RUN",
+        "TMPFS_RESERVE_MB", "RELEASE_GRACE_MS",
         "PEER_POLL_INTERVAL_MS", "METRICS_PER_FLOW"};
     return keys.count(key) != 0;
 }
@@ -299,6 +300,8 @@ Config parseConfig(std::map<std::string, std::string> const& values)
     cfg.mirror_exclude_domains = splitComma(valueOr(values, "MIRROR_EXCLUDE_DOMAINS", ""));
     cfg.mirror_exclude_flows = splitComma(valueOr(values, "MIRROR_EXCLUDE_FLOWS", ""));
     cfg.mirror_grace_s = parseInt("MIRROR_GRACE_S", valueOr(values, "MIRROR_GRACE_S", "10"), 0, 86400);
+    cfg.mirror_idle_grace_s = parseInt("MIRROR_IDLE_GRACE_S", valueOr(values, "MIRROR_IDLE_GRACE_S", "300"), 0, 86400);
+    cfg.mirror_cleanup_dry_run = parseBool("MIRROR_CLEANUP_DRY_RUN", valueOr(values, "MIRROR_CLEANUP_DRY_RUN", "false"));
     cfg.tmpfs_reserve_mb = parseInt("TMPFS_RESERVE_MB", valueOr(values, "TMPFS_RESERVE_MB", "512"), 0, 1024 * 1024);
     cfg.cleanup_mirrors_on_exit = parseBool("MXL_CLEANUP_ON_EXIT", valueOr(aligned, "MXL_CLEANUP_ON_EXIT", "false"));
     cfg.default_provider = valueOr(values, "DEFAULT_PROVIDER", "verbs");
@@ -461,6 +464,8 @@ std::map<std::string, std::string> configToMap(Config const& cfg)
     values["MIRROR_EXCLUDE_DOMAINS"] = joinComma(cfg.mirror_exclude_domains);
     values["MIRROR_EXCLUDE_FLOWS"] = joinComma(cfg.mirror_exclude_flows);
     values["MIRROR_GRACE_S"] = std::to_string(cfg.mirror_grace_s);
+    values["MIRROR_IDLE_GRACE_S"] = std::to_string(cfg.mirror_idle_grace_s);
+    values["MIRROR_CLEANUP_DRY_RUN"] = cfg.mirror_cleanup_dry_run ? "true" : "false";
     values["TMPFS_RESERVE_MB"] = std::to_string(cfg.tmpfs_reserve_mb);
     values["MXL_CLEANUP_ON_EXIT"] = cfg.cleanup_mirrors_on_exit ? "true" : "false";
     values["CLEANUP_MIRRORS_ON_EXIT"] = cfg.cleanup_mirrors_on_exit ? "true" : "false";

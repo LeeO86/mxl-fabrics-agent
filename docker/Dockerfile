@@ -83,10 +83,11 @@ COPY --from=build /src/build/mxl-pattern-writer /usr/local/bin/mxl-pattern-write
 COPY tests/integration/fake_nmos.py /usr/local/share/mxl-fabrics-agent/fake_nmos.py
 # Ubuntu 24.04 already has uid 1000 (user ubuntu). useradd --uid 1000 then exits 4.
 # File capabilities, permitted only (no effective bit): the agent raises them itself at start
-# (SYS_NICE for RT_PRIORITY, IPC_LOCK for locked memory). With the effective bit, execve fails
+# (SYS_NICE for RT_PRIORITY, IPC_LOCK for locked memory, SYS_PTRACE to read /proc/<pid>/maps of
+# media functions for the mirror reader check). With the effective bit, execve fails
 # wherever the runtime does not grant them; this way a missing one only stays missing.
 RUN ldconfig \
-    && setcap cap_sys_nice,cap_ipc_lock+p /usr/local/bin/mxl-fabrics-agent \
+    && setcap cap_sys_nice,cap_ipc_lock,cap_sys_ptrace+p /usr/local/bin/mxl-fabrics-agent \
     && if ! getent passwd 1000 >/dev/null; then \
          useradd --uid 1000 --no-create-home --shell /usr/sbin/nologin mxl; \
        fi

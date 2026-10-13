@@ -9,7 +9,9 @@
 #include "util/uuid.hpp"
 #include "version.hpp"
 
+#include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -167,6 +169,7 @@ Controller::~Controller()
 
 void Controller::start()
 {
+    started_ = std::chrono::steady_clock::now();
     auto const cfg = store_->get();
     if (cfg.nmos_enable)
     {
@@ -279,6 +282,7 @@ void Controller::loop()
 
 void Controller::tick()
 {
+    std::lock_guard const tickLock{tickMu_};
     auto const cfg = store_->get();
     engine_.updateConfig(cfg);
     peers_.updateConfig(cfg);
@@ -417,6 +421,7 @@ void Controller::tick()
     std::set<std::string> seen;
     std::vector<PullRequest> pulls;
     std::vector<DomainRecord> mirrorViews;
+    std::set<std::string> wantedDomains; // mirror domains with demand (a receiver, a held replication, eager mode)
     auto const free = freeMb(cfg.mxl_root);
     for (auto const& remote : remotes)
     {
@@ -476,6 +481,10 @@ void Controller::tick()
         input.grace_holding = graceHolding;
         input.grace_expired = graceExpired;
         auto const plan = planMirror(input);
+        if (plan.create || wanted || input.hold_replication)
+        {
+            wantedDomains.insert(remote.domain->domain_id);
+        }
         if (plan.remove && exists)
         {
             engine_.releaseWriter(path, remote.flow->flow_id);
@@ -560,14 +569,215 @@ void Controller::tick()
     }
     lastDemand_ = std::move(rawDemand);
     engine_.setPulls(pulls);
+    // Whole mirror domains, after setPulls has dropped the targets they no longer need. Orphans only
+    // once the peers are known: 30 s after start and, with NMOS, while the registry answers.
+    bool const truthOk = now - started_ >= std::chrono::seconds(30) && (!cfg.nmos_enable || nmos.registry_up);
+    auto domainViews = cleanupMirrors(cfg, inventory, peerSnap, truthOk, localIds, peerDomains, wantedDomains, mirrorViews);
     {
         std::lock_guard const lock{mu_};
+        mirrorDomains_ = std::move(domainViews);
         demand_ = std::move(demand);
         mirrors_ = std::move(mirrorViews);
         links_ = std::move(links);
     }
     renderMetrics();
     publish("inventory", std::to_string(inventory.revision));
+}
+
+std::vector<Controller::MirrorDomainView> Controller::cleanupMirrors(Config const& cfg, Inventory const& inventory,
+    std::vector<PeerSnapshot> const& peerSnap, bool truthOk, std::set<std::string> const& localIds,
+    std::set<std::string> const& peerDomains, std::set<std::string> const& wanted, std::vector<DomainRecord> const& flowViews)
+{
+    auto const now = std::chrono::steady_clock::now();
+    auto const wallNow = std::chrono::system_clock::now();
+    std::map<std::string, MirrorDomainView> views;
+    for (auto const& domain : inventory.domains)
+    {
+        // Only our own mirror directories (mirror-<domain id> with our marker): never an origin, a
+        // mirror of another agent or anything else below the root.
+        if (domain.kind != "mirror" || fs::path(domain.path).filename().string() != "mirror-" + domain.domain_id)
+        {
+            continue;
+        }
+        auto& view = views[domain.domain_id];
+        view.domain_id = domain.domain_id;
+        view.path = domain.path;
+        view.source_host_id = domain.source_host_id;
+        view.on_disk = true;
+        struct stat st{};
+        if (::stat((fs::path(domain.path) / "domain_def.json").c_str(), &st) == 0)
+        {
+            view.created_unix = static_cast<std::int64_t>(st.st_mtime);
+        }
+        for (auto const& flow : domain.flows)
+        {
+            view.flows.emplace_back(flow, "");
+        }
+    }
+    for (auto const& flowView : flowViews)
+    {
+        auto& view = views[flowView.domain_id];
+        view.domain_id = flowView.domain_id;
+        if (view.path.empty())
+        {
+            view.path = flowView.path;
+        }
+        if (view.source_host_id.empty())
+        {
+            view.source_host_id = flowView.source_host_id;
+        }
+        for (auto const& flow : flowView.flows)
+        {
+            auto const it = std::find_if(view.flows.begin(), view.flows.end(), [&](auto const& f) { return f.first.flow_id == flow.flow_id; });
+            if (it == view.flows.end())
+            {
+                view.flows.emplace_back(flow, flowView.options_json);
+            }
+            else
+            {
+                it->second = flowView.options_json;
+            }
+        }
+    }
+    std::vector<std::string> candidates;
+    std::map<std::string, MirrorDomainPlan> plans;
+    for (auto& [id, view] : views)
+    {
+        view.origin_local = localIds.count(id) != 0;
+        view.origin_on_peer = peerDomains.count(id) != 0;
+        bool sourceKnownDown = false;
+        for (auto const& peer : peerSnap)
+        {
+            if (peer.host_id == view.source_host_id)
+            {
+                view.source_up = peer.up;
+                sourceKnownDown = !peer.up;
+            }
+        }
+        view.demand = wanted.count(id) != 0;
+        if (view.demand)
+        {
+            mirrorIdleSince_.erase(id);
+        }
+        else
+        {
+            auto const since = mirrorIdleSince_.try_emplace(id, now).first->second;
+            view.idle_since_unix = std::chrono::duration_cast<std::chrono::seconds>(
+                (wallNow - std::chrono::duration_cast<std::chrono::system_clock::duration>(now - since)).time_since_epoch())
+                                       .count();
+        }
+        MirrorDomainInput input;
+        input.origin_local = view.origin_local;
+        input.origin_on_peer = view.origin_on_peer || !truthOk; // not an orphan until the peers are known
+        input.source_peer_down = sourceKnownDown;
+        input.demand = view.demand;
+        input.idle_expired = !view.demand && cfg.mirror_idle_grace_s > 0 &&
+                             now - mirrorIdleSince_[id] >= std::chrono::seconds(cfg.mirror_idle_grace_s);
+        auto const plan = planMirrorDomain(input);
+        view.state = plan.state;
+        // The scanner's snapshot may still list a domain that DELETE removed meanwhile.
+        if (view.on_disk && plan.remove && now - started_ >= std::chrono::seconds(30) && fs::is_directory(view.path))
+        {
+            candidates.push_back(id);
+            plans[id] = plan;
+        }
+    }
+    for (auto it = mirrorIdleSince_.begin(); it != mirrorIdleSince_.end();)
+    {
+        it = views.count(it->first) == 0 ? mirrorIdleSince_.erase(it) : std::next(it);
+    }
+    for (auto it = mirrorLogged_.begin(); it != mirrorLogged_.end();)
+    {
+        it = views.count(it->first) == 0 ? mirrorLogged_.erase(it) : std::next(it);
+    }
+    // Removal candidates: check the readers (at most every 2 s), then remove what no other process maps.
+    if (!candidates.empty() && now >= nextReaderScan_)
+    {
+        nextReaderScan_ = now + std::chrono::seconds(2);
+        for (auto const& id : candidates)
+        {
+            auto const& view = views[id];
+            auto const reason = plans[id].reason;
+            if (cfg.mirror_cleanup_dry_run)
+            {
+                if (mirrorLogged_[id] != "dry_run:" + reason)
+                {
+                    log::info("mirror_domain_would_remove", {{"domain_id", id}, {"path", view.path}, {"reason", reason}});
+                    mirrorLogged_[id] = "dry_run:" + reason;
+                }
+                continue;
+            }
+            std::vector<ReaderProcess> readers;
+            auto const refused = removeMirrorDomain(id, view.path, reason, &readers);
+            if (refused.empty())
+            {
+                mirrorIdleSince_.erase(id);
+                mirrorLogged_.erase(id);
+                metrics_.addCounter("mirror_domains_removed_total", 1, {{"reason", reason}});
+                continue;
+            }
+            if (mirrorLogged_[id] != "refused:" + reason + ":" + refused)
+            {
+                log::warn("mirror_domain_busy", {{"domain_id", id}, {"path", view.path}, {"reason", reason}, {"refused", refused}});
+                metrics_.addCounter("mirror_domains_refused_total", 1, {{"reason", reason}});
+                mirrorLogged_[id] = "refused:" + reason + ":" + refused;
+            }
+        }
+    }
+    std::vector<MirrorDomainView> result;
+    for (auto& [id, view] : views)
+    {
+        result.push_back(std::move(view));
+    }
+    return result;
+}
+
+std::string Controller::removeMirrorDomain(std::string const& domainId, std::string const& path, std::string const& reason,
+    std::vector<ReaderProcess>* readers)
+{
+    auto const check = [&]() -> std::string {
+        std::map<FileKey, std::string> files;
+        collectFiles(path, path, files);
+        return removalBlocker(scanReaders(files, "/proc", static_cast<int>(::getpid())), path, readers);
+    };
+    if (auto const busy = check(); !busy.empty())
+    {
+        return busy;
+    }
+    // The agent's own writers and targets first, then a last reader check right before the files go.
+    std::vector<std::string> flows;
+    std::error_code ec;
+    for (auto const& entry : fs::directory_iterator(path, ec))
+    {
+        auto const name = entry.path().filename().string();
+        if (name.size() > 9 && name.substr(name.size() - 9) == ".mxl-flow")
+        {
+            flows.push_back(name.substr(0, name.size() - 9));
+        }
+    }
+    for (auto const& flowId : flows)
+    {
+        engine_.releaseWriter(path, flowId);
+    }
+    engine_.releaseDomain(path);
+    if (auto const busy = check(); !busy.empty())
+    {
+        return busy;
+    }
+    std::string removed;
+    for (auto const& flowId : flows)
+    {
+        fs::remove_all(fs::path(path) / (flowId + ".mxl-flow"), ec);
+        removed += (removed.empty() ? "" : ",") + flowId;
+    }
+    fs::remove_all(path, ec);
+    if (ec)
+    {
+        log::warn("mirror_domain_remove_failed", {{"domain_id", domainId}, {"path", path}, {"error", ec.message()}});
+        return "remove failed: " + ec.message();
+    }
+    log::info("mirror_domain_removed", {{"domain_id", domainId}, {"path", path}, {"reason", reason}, {"flows", removed}});
+    return {};
 }
 
 void Controller::renderMetrics()
@@ -614,6 +824,26 @@ void Controller::renderMetrics()
     metrics_.setGauge("domains", local, {{"kind", "local"}});
     metrics_.setGauge("domains", mirror, {{"kind", "mirror"}});
     metrics_.setGauge("domains", conflict, {{"kind", "conflict"}});
+    {
+        // Destination mirror domains on disk by cleanup state.
+        std::map<std::string, int> byState{{"active", 0}, {"idle", 0}, {"orphan", 0}, {"same_node", 0}};
+        {
+            std::lock_guard const lock{mu_};
+            for (auto const& view : mirrorDomains_)
+            {
+                if (view.on_disk)
+                {
+                    ++byState[view.state];
+                }
+            }
+        }
+        std::vector<std::pair<std::map<std::string, std::string>, double>> series;
+        for (auto const& [state, count] : byState)
+        {
+            series.push_back({{{"state", state}}, static_cast<double>(count)});
+        }
+        metrics_.setGauges("mirror_domains", series);
+    }
     metrics_.setGauge("flows", originActive, {{"kind", "origin"}, {"state", "active"}});
     metrics_.setGauge("flows", originIdle, {{"kind", "origin"}, {"state", "inactive"}});
     struct statvfs st{};
@@ -801,29 +1031,124 @@ HttpResponse Controller::handle(HttpRequest const& request)
     }
     if (request.method == "GET" && request.path == "/api/v1/mirrors")
     {
-        std::lock_guard const lock{mu_};
+        std::vector<MirrorDomainView> views;
+        {
+            std::lock_guard const lock{mu_};
+            views = mirrorDomains_;
+        }
+        // Readers now: every process other than the agent that maps a file of a mirror domain.
+        std::map<FileKey, std::string> files;
+        for (auto const& view : views)
+        {
+            if (view.on_disk)
+            {
+                collectFiles(view.path, view.path, files);
+            }
+        }
+        auto const scan = scanReaders(files, "/proc", static_cast<int>(::getpid()));
+        auto const nowUnix = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         picojson::array arr;
-        for (auto const& mirror : mirrors_)
+        for (auto const& view : views)
         {
             picojson::object obj;
-            obj["domain_id"] = picojson::value(mirror.domain_id);
-            obj["path"] = picojson::value(mirror.path);
-            obj["source_host_id"] = picojson::value(mirror.source_host_id);
-            obj["state"] = picojson::value(mirror.options_json);
+            obj["domain_id"] = picojson::value(view.domain_id);
+            obj["path"] = picojson::value(view.path);
+            obj["source_host_id"] = picojson::value(view.source_host_id);
+            picojson::object origin;
+            origin["host_id"] = picojson::value(view.source_host_id);
+            origin["peer_up"] = picojson::value(view.source_up);
+            origin["on_peer"] = picojson::value(view.origin_on_peer);
+            origin["local"] = picojson::value(view.origin_local);
+            obj["origin"] = picojson::value(origin);
+            obj["state"] = picojson::value(view.state);
+            obj["on_disk"] = picojson::value(view.on_disk);
+            obj["demand"] = picojson::value(view.demand);
+            obj["idle_since"] = view.idle_since_unix > 0 ? picojson::value(static_cast<double>(view.idle_since_unix)) : picojson::value();
+            obj["age_s"] = view.created_unix > 0 ? picojson::value(static_cast<double>(nowUnix - view.created_unix)) : picojson::value();
+            picojson::array readers;
+            if (auto const it = scan.readers.find(view.path); it != scan.readers.end())
+            {
+                for (auto const& reader : it->second)
+                {
+                    picojson::object r;
+                    r["pid"] = picojson::value(static_cast<double>(reader.pid));
+                    r["comm"] = picojson::value(reader.comm);
+                    readers.push_back(picojson::value(r));
+                }
+            }
+            obj["readers"] = picojson::value(readers);
+            obj["readers_known"] = picojson::value(scan.complete);
+            if (!scan.complete)
+            {
+                obj["readers_error"] = picojson::value(scan.error);
+            }
             picojson::array flows;
-            for (auto const& flow : mirror.flows)
+            for (auto const& [flow, state] : view.flows)
             {
                 picojson::object f;
                 f["flow_id"] = picojson::value(flow.flow_id);
                 f["media_type"] = picojson::value(flow.media_type);
                 f["format"] = picojson::value(flow.format);
                 f["active"] = picojson::value(flow.active);
+                f["state"] = picojson::value(state);
                 flows.push_back(picojson::value(f));
             }
             obj["flows"] = picojson::value(flows);
             arr.push_back(picojson::value(obj));
         }
         return json(200, picojson::value(arr).serialize());
+    }
+    if (request.method == "DELETE" && request.path.rfind("/api/v1/mirrors/", 0) == 0)
+    {
+        auto const id = request.path.substr(std::string("/api/v1/mirrors/").size());
+        std::lock_guard const tickLock{tickMu_};
+        auto const cfg = store_->get();
+        DomainRecord const* found = nullptr;
+        auto const inventory = scanner_.snapshot();
+        for (auto const& domain : inventory.domains)
+        {
+            if (domain.domain_id == id && domain.kind == "mirror" && fs::path(domain.path).filename().string() == "mirror-" + id)
+            {
+                found = &domain;
+            }
+        }
+        picojson::object body;
+        body["domain_id"] = picojson::value(id);
+        if (found == nullptr || !fs::is_directory(found->path))
+        {
+            body["error"] = picojson::value("no mirror domain of this agent with this id");
+            return json(404, picojson::value(body).serialize());
+        }
+        body["path"] = picojson::value(found->path);
+        if (cfg.mirror_cleanup_dry_run)
+        {
+            log::info("mirror_domain_would_remove", {{"domain_id", id}, {"path", found->path}, {"reason", "api"}});
+            body["removed"] = picojson::value(false);
+            body["dry_run"] = picojson::value(true);
+            return json(200, picojson::value(body).serialize());
+        }
+        std::vector<ReaderProcess> readers;
+        auto const refused = removeMirrorDomain(id, found->path, "api", &readers);
+        if (!refused.empty())
+        {
+            metrics_.addCounter("mirror_domains_refused_total", 1, {{"reason", "api"}});
+            log::warn("mirror_domain_busy", {{"domain_id", id}, {"path", found->path}, {"reason", "api"}, {"refused", refused}});
+            body["removed"] = picojson::value(false);
+            body["error"] = picojson::value(refused);
+            picojson::array pids;
+            for (auto const& reader : readers)
+            {
+                picojson::object r;
+                r["pid"] = picojson::value(static_cast<double>(reader.pid));
+                r["comm"] = picojson::value(reader.comm);
+                pids.push_back(picojson::value(r));
+            }
+            body["readers"] = picojson::value(pids);
+            return json(409, picojson::value(body).serialize());
+        }
+        metrics_.addCounter("mirror_domains_removed_total", 1, {{"reason", "api"}});
+        body["removed"] = picojson::value(true);
+        return json(200, picojson::value(body).serialize());
     }
     if (request.method == "GET" && request.path == "/api/v1/demand")
     {
