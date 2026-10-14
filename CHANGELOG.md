@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Mirror health for the platform's re-routing. Each destination mirror flow gets a state (`live`, `pending`, `stale`, `idle`, `absent`) with a reason, the age of its newest grain and a rebuild count. `stale`: grains are due (a replication is wanted and the origin is live) but none came for `MIRROR_STALE_MS` (new, default 2000, `0` never) while the origin has newer ones or the source peer or link is down. `rebuilt`: the mirror's data file is a new one (another inode, or back after it was gone); MXL readers stay on the file they opened and see no new grain, so the platform has to activate them again. The agent only reports; choosing sources stays with the controller (IS-05).
+- `GET /api/v1/mirrors`: `flows[].health` with `state`, `reason`, `last_grain_age_ms`, `stale_since`, `stale_after_ms`, `rebuilds`, `last_rebuild`, `last_rebuild_reason`. SSE event `mirror` (`stale`, `recovered`, `rebuilt`). Logs `mirror_stale`, `mirror_recovered`, `mirror_rebuilt`.
+- New metrics (existing ones unchanged): `mirror_stale{domain_id,flow_id,peer}` (0/1), `mirror_state{domain_id,flow_id,peer,state}`, `mirror_last_grain_age_seconds{domain_id,flow_id,peer}`, `mirror_rebuilds_total{domain_id,flow_id,peer}`, `mirrors_stale`.
+- `GET /api/v1/inventory` carries each local flow's `head_index`, read when the request is answered and not part of `revision`. A destination uses it to tell a mirror that misses grains from an origin that writes none (`idle`, `origin_silent`); with an older source the origin's `live` flag stands in.
+- README: "Mirror health" with the platform contract (what to watch, when to re-route).
+
 ## 1.4.1
 
 - `lag_ms` in `GET /api/v1/replications` and the gauge `replication_lag_ms{flow_id,peer}`: the destination's lag in milliseconds, from the same index distance as `lag_grains` at the flow's rate (samples ÷ sample rate for continuous flows, grains × grain period for discrete ones), rounded to whole microseconds. For audio `lag_grains` counts transfer batches and divides by the size of the last one, so a batch of one sample made 47 "grains" out of about 1 ms. `lag_grains` and `replication_lag_grains` are unchanged. The web UI shows both.

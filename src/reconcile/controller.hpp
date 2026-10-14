@@ -3,6 +3,7 @@
 #include "config/store.hpp"
 #include "demand/derive.hpp"
 #include "inventory/scanner.hpp"
+#include "mirror/health.hpp"
 #include "mirror/readers.hpp"
 #include "nmos/node.hpp"
 #include "nmos/observer.hpp"
@@ -102,6 +103,13 @@ private:
         std::string chosen; // the one replicated from
     };
     std::map<std::string, OriginConflict> originConflicts_; // per "domain/flow" held by more than one peer
+    // Stale and rebuilt destination mirror flows. The tracker is used under tickMu_, its copy for the API
+    // and the metrics under mu_.
+    void observeMirrors(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
+        std::vector<MirrorObservation> observations, std::set<std::string> const& seen);
+    void reportMirrorEvents(std::vector<MirrorEvent> const& events, int staleMs);
+    MirrorHealthTracker mirrorHealth_;
+    std::map<std::string, MirrorHealth> mirrorHealthView_;
     struct Event
     {
         std::string name;

@@ -139,6 +139,7 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | `MIRROR_GRACE_S` | 10 | Keep a mirror after the origin disappears |
 | `MIRROR_IDLE_GRACE_S` | 300 | Drop a mirror domain after this many seconds without demand (`0`: never) |
 | `MIRROR_CLEANUP_DRY_RUN` | false | Mirror cleanup only logs `mirror_domain_would_remove` |
+| `MIRROR_STALE_MS` | 2000 | A mirror flow without a new grain for this long while grains are due is `stale` (see Mirror health). `0`: never |
 | `TMPFS_RESERVE_MB` | 512 | Free space left on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | On shutdown, remove mirror domains this agent owns. Alias: `CLEANUP_MIRRORS_ON_EXIT`. With false the mirror flows stay, and readers on the host keep reading them after a restart |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |
@@ -192,8 +193,8 @@ All of these are on `WEB_PORT`.
 | GET | `/statusz` | Short JSON status |
 | GET | `/` | Admin UI, unless `WEB_ENABLE=false` |
 | GET | `/api/v1/info` | Version, host id, boot id |
-| GET | `/api/v1/inventory` | Local domains and flows |
-| GET | `/api/v1/mirrors` | Mirror domains: origin, flows, demand, readers, age, cleanup state |
+| GET | `/api/v1/inventory` | Local domains and flows, with each flow's `head_index` at the time of the request |
+| GET | `/api/v1/mirrors` | Mirror domains: origin, flows (with `health`: stale, rebuilt), demand, readers, age, cleanup state |
 | DELETE | `/api/v1/mirrors/{domain_id}` | Remove a mirror domain; 409 while another process maps it |
 | GET | `/api/v1/demand` | Local IS-05 demand |
 | GET | `/api/v1/replications` | Active replications: state, `grains`, `head_index`, `lag_grains` (transfer batches for continuous flows), `lag_ms` (samples ÷ sample rate, or grains × grain period), `origin_gaps`, errors |
@@ -201,7 +202,7 @@ All of these are on `WEB_PORT`.
 | DELETE | `/api/v1/replications/{id}/targets/{dest}` | Peer releases a target |
 | GET | `/api/v1/peers` | Peer status: control plane `up`, fabric `link_up`, `link_error`, `fabric_interface` |
 | POST | `/api/v1/peers/{id}/test` | Control-plane and local target check |
-| GET | `/api/v1/events` | Server-sent events |
+| GET | `/api/v1/events` | Server-sent events: `inventory`, `replication`, `peer`, `mirror` |
 | GET | `/api/v1/config` | Effective configuration, origin, and `restart_required` |
 | GET | `/api/v1/config/env` | `KEY=value` form |
 | PUT | `/api/v1/config` | Patch the file layer. Hidden when `WEB_ENABLE=false` |
@@ -232,6 +233,44 @@ Logs: `mirror_domain_removed` (domain, path, reason, flows), `mirror_domain_busy
 `GET /api/v1/mirrors` lists one entry per mirror domain: `domain_id`, `path`, `origin` (`host_id`, `peer_up`, `on_peer`, `local`), `state`, `on_disk`, `demand`, `idle_since` (Unix seconds, `null` with demand), `age_s` (since its `domain_def.json` was written), `readers` (`pid`, `comm`), `readers_known`, and `flows` (`flow_id`, `media_type`, `format`, `active`, the per-flow mirror `state`). `DELETE /api/v1/mirrors/{domain_id}` removes one with the same checks: 404 when this agent has no such mirror, 409 with `readers` or `error` while it is mapped or the readers are unknown, 200 with `removed: true` otherwise. A mirror that is still wanted (`eager`, demand) comes back on the next tick.
 
 This agent has no IS-05 senders or receivers. It does not accept connection patches. It only reads other nodes' active connections.
+
+## Mirror health
+
+The agent says when a destination mirror flow no longer carries its source. It does not re-route: choosing a receiver's source is the controller's job over IS-05.
+
+Each reconcile pass (about every 200 ms) gives every mirror flow one state:
+
+| State | When |
+| --- | --- |
+| `live` | Grains are due and the newest one is younger than `MIRROR_STALE_MS` |
+| `pending` | Grains are due, but for less than `MIRROR_STALE_MS` so far (a replication that just started, or a rebuilt flow) |
+| `stale` | Grains are due, none came for `MIRROR_STALE_MS`, and the origin has newer ones (or the source peer or link is down) |
+| `idle` | No grains are due: no receiver wants the flow, or the origin is not written |
+| `absent` | The flow is not on disk |
+
+"Grains are due" means a replication of the flow is wanted (a receiver on this host, or a held replication) and the origin is live in the source's inventory. While the source peer or its fabric link is down they stay due as long as the receiver does. The age of the newest grain is the mirror's head index against the current TAI index at the flow's rate, so it includes the replication lag. A source's `/api/v1/inventory` now carries each flow's `head_index`; the destination uses it to tell a mirror that misses grains (`stale`) from an origin that writes none (`idle`, `origin_silent`: a writer without input signal). With an older source the origin's `live` flag stands in, so a source that stops writing can show `stale` for up to about 5 s plus `PEER_POLL_INTERVAL_MS`. Detection takes up to `MIRROR_STALE_MS` or one peer poll, whichever is longer.
+
+`reason`: `no_new_grains`, `no_first_grain`, `peer_down`, `link_down` (stale); `no_demand`, `origin_inactive`, `origin_not_live`, `origin_missing`, `origin_silent`, `peer_down` (idle); the removal reason (absent).
+
+A mirror is **rebuilt** when its data file is a new one: another inode, or the file back after it was gone. MXL readers keep the file they opened, so a reader of the old one sees no new grain again (the MXL inode quirk). The rebuild reason is why the agent removed it: `origin_gone` (origin inactive longer than `MIRROR_GRACE_S`), `no_demand`, `excluded`, `mirror_domain_idle`, `mirror_domain_orphan`, `mirror_domain_same_node`, `mirror_domain_api`, or `replaced` when something else removed or replaced it. Counts and times are kept in memory for 24 h after a mirror was last seen; an agent restart starts them again. Link loss and an origin writer that re-creates its flow do not rebuild the mirror: the destination keeps its target and mirror flow, which then goes `stale` and back to `live`.
+
+`GET /api/v1/mirrors` has `health` on each flow: `state`, `reason`, `last_grain_age_ms` (`null` before the first grain), `stale_since` (Unix seconds or `null`), `stale_after_ms`, `rebuilds`, `last_rebuild` (Unix seconds or `null`), `last_rebuild_reason`.
+
+Metrics (labels `domain_id`, `flow_id`, `peer` = source host):
+
+- `mxl_fabrics_agent_mirror_stale` gauge, 1 while `stale`, else 0
+- `mxl_fabrics_agent_mirror_state` gauge, 1 for the current `state` label (`live`, `pending`, `stale`, `idle`)
+- `mxl_fabrics_agent_mirror_last_grain_age_seconds` gauge, absent before the first grain
+- `mxl_fabrics_agent_mirror_rebuilds_total` counter
+- `mxl_fabrics_agent_mirrors_stale` gauge, no labels: mirror flows that are `stale`
+
+With `METRICS_PER_FLOW=false` only `mirrors_stale` and an unlabelled `mirror_rebuilds_total` remain. Absent mirrors have no `mirror_stale`, `mirror_state` or age series.
+
+Logs: `mirror_stale` (warn: `domain_id`, `flow_id`, `peer`, `reason`, `last_grain_age_ms`, `stale_after_ms`), `mirror_recovered` (info: the new `state` and `reason`, `stale_ms`; `state=live` is a real recovery), `mirror_rebuilt` (warn: `reason`, `rebuilds`, `old_inode`, `inode`). The same three go out as the SSE event `mirror` with `event` = `stale`, `recovered` or `rebuilt` and the `health` fields.
+
+### Platform contract
+
+Watch `mxl_fabrics_agent_mirror_stale` and `increase(mxl_fabrics_agent_mirror_rebuilds_total[…])` per `domain_id`/`flow_id` on each destination host, or subscribe to the `mirror` SSE event. A receiver on that host that reads a `stale` mirror gets no new grains: after the platform's own hold-off (a few seconds absorbs a replication restart) it may route the receiver to another source over IS-05. When the rebuild counter rises, every receiver on that host that reads the flow should be activated again over IS-05, also with the same sender, so the media function opens the new file. `idle` with `origin_silent` is a source without signal, not a mirror fault: re-routing to another path of the same source does not help. `stale` with `peer_down` or `link_down` means the path to the source is gone. The agent itself never PATCHes IS-05.
 
 ## Running on the platform
 

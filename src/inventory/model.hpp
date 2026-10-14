@@ -15,6 +15,9 @@ struct FlowRecord
     std::string media_type;
     bool active = false;
     bool live = false; // its head index is at the current time: a writer is writing it
+    // The head index when /api/v1/inventory was answered (not part of the revision). Peer flows
+    // from a newer agent carry it; local scans leave it empty.
+    std::optional<std::uint64_t> head_index;
     std::int64_t grain_rate_num = 0;
     std::int64_t grain_rate_den = 1;
     std::int64_t sample_rate_num = 0;
