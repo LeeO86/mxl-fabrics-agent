@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.0
 
 - Mirror health for the platform's re-routing. Each destination mirror flow gets a state (`live`, `pending`, `stale`, `idle`, `absent`) with a reason, the age of its newest grain and a rebuild count. `stale`: grains are due (a replication is wanted and the origin is live) but none came for `MIRROR_STALE_MS` (new, default 2000, `0` never) while the origin has newer ones or the source peer or link is down. `rebuilt`: the mirror's data file is a new one (another inode, or back after it was gone); MXL readers stay on the file they opened and see no new grain, so the platform has to activate them again. The agent only reports; choosing sources stays with the controller (IS-05).
 - `GET /api/v1/mirrors`: `flows[].health` with `state`, `reason`, `last_grain_age_ms`, `stale_since`, `stale_after_ms`, `rebuilds`, `last_rebuild`, `last_rebuild_reason`. SSE event `mirror` (`stale`, `recovered`, `rebuilt`). Logs `mirror_stale`, `mirror_recovered`, `mirror_rebuilt`.
