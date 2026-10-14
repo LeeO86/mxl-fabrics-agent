@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.4.1
 
 - `lag_ms` in `GET /api/v1/replications` and the gauge `replication_lag_ms{flow_id,peer}`: the destination's lag in milliseconds, from the same index distance as `lag_grains` at the flow's rate (samples ÷ sample rate for continuous flows, grains × grain period for discrete ones), rounded to whole microseconds. For audio `lag_grains` counts transfer batches and divides by the size of the last one, so a batch of one sample made 47 "grains" out of about 1 ms. `lag_grains` and `replication_lag_grains` are unchanged. The web UI shows both.
+- The deploy example uses the `1.4.1` image.
 
 ## 1.4.0
 
