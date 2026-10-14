@@ -14,7 +14,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
+#include <ctime>
 #include <filesystem>
+#include <limits>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -128,6 +131,47 @@ std::string testFlow(std::string const& id)
 
 const char kFallbackUi[] = R"HTML(<!doctype html><html><head><meta charset="utf-8"><title>mxl-fabrics-agent</title></head>
 <body><h1>mxl-fabrics-agent</h1><p>The admin UI was not embedded in this build. API is at <a href="/api/v1/info">/api/v1/info</a>.</p></body></html>)HTML";
+
+double taiNowSeconds()
+{
+    timespec ts{};
+    ::clock_gettime(CLOCK_TAI, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+}
+
+std::int64_t unixNowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// The mirror flow's data file: its inode and head index (none before the first grain).
+void readMirrorFile(std::string const& domainPath, std::string const& flowId, MirrorObservation& obs)
+{
+    auto const header = readFlowHeader((fs::path(domainPath) / (flowId + ".mxl-flow") / "data").string());
+    obs.inode = header.inode;
+    if (header.headIndex != 0 && header.headIndex != std::numeric_limits<std::uint64_t>::max())
+    {
+        obs.head = header.headIndex;
+    }
+}
+
+picojson::value unixSeconds(std::int64_t unixMs)
+{
+    return unixMs > 0 ? picojson::value(static_cast<double>(unixMs) / 1000.0) : picojson::value();
+}
+
+void putHealth(picojson::object& obj, MirrorHealth const& h, int staleMs)
+{
+    obj["state"] = picojson::value(h.state);
+    obj["reason"] = picojson::value(h.reason);
+    obj["last_grain_age_ms"] =
+        h.last_grain_age_ms ? picojson::value(std::round(*h.last_grain_age_ms * 1000.0) / 1000.0) : picojson::value();
+    obj["stale_since"] = unixSeconds(h.stale_since_unix_ms);
+    obj["stale_after_ms"] = picojson::value(static_cast<double>(staleMs));
+    obj["rebuilds"] = picojson::value(static_cast<double>(h.rebuilds));
+    obj["last_rebuild"] = unixSeconds(h.last_rebuild_unix_ms);
+    obj["last_rebuild_reason"] = h.last_rebuild_reason.empty() ? picojson::value() : picojson::value(h.last_rebuild_reason);
+}
 
 LocalIdentity identityFrom(Config const& cfg)
 {
@@ -423,6 +467,7 @@ void Controller::tick()
     std::vector<DomainRecord> mirrorViews;
     std::set<std::string> wantedDomains; // mirror domains with demand (a receiver, a held replication, eager mode)
     auto const free = freeMb(cfg.mxl_root);
+    std::vector<MirrorObservation> remoteObservations;
     for (auto const& remote : remotes)
     {
         auto const key = remote.domain->domain_id + "/" + remote.flow->flow_id;
@@ -487,6 +532,7 @@ void Controller::tick()
         }
         if (plan.remove && exists)
         {
+            mirrorHealth_.noteRemoved(key, !input.included ? "excluded" : !remote.flow->active ? "origin_gone" : "no_demand");
             engine_.releaseWriter(path, remote.flow->flow_id);
             std::error_code ec;
             fs::remove_all(fs::path(path) / (remote.flow->flow_id + ".mxl-flow"), ec);
@@ -555,6 +601,22 @@ void Controller::tick()
             pull.source_active = remote.flow->active;
             pulls.push_back(std::move(pull));
         }
+        // Health of the mirror flow: grains are due while a replication is wanted and the origin is live.
+        MirrorObservation obs;
+        obs.domain_id = remote.domain->domain_id;
+        obs.flow_id = remote.flow->flow_id;
+        obs.peer = remote.peer->host_id;
+        obs.rate_num = remote.flow->grain_rate_num;
+        obs.rate_den = remote.flow->grain_rate_den;
+        obs.origin_head = remote.flow->head_index;
+        obs.origin_live = remote.flow->live;
+        obs.expected = plan.replicate && remote.flow->live;
+        obs.idle_reason = !remote.flow->active ? "origin_inactive" : !plan.replicate ? "no_demand" : "origin_not_live";
+        if (auto const link = links.find(remote.peer->host_id); link != links.end() && !link->second.up)
+        {
+            obs.blocked = "link_down";
+        }
+        remoteObservations.push_back(std::move(obs));
     }
     for (auto it = originLost_.begin(); it != originLost_.end();)
     {
@@ -573,8 +635,10 @@ void Controller::tick()
     // once the peers are known: 30 s after start and, with NMOS, while the registry answers.
     bool const truthOk = now - started_ >= std::chrono::seconds(30) && (!cfg.nmos_enable || nmos.registry_up);
     auto domainViews = cleanupMirrors(cfg, inventory, peerSnap, truthOk, localIds, peerDomains, wantedDomains, mirrorViews);
+    observeMirrors(cfg, inventory, peerSnap, std::move(remoteObservations), seen);
     {
         std::lock_guard const lock{mu_};
+        mirrorHealthView_ = mirrorHealth_.entries();
         mirrorDomains_ = std::move(domainViews);
         demand_ = std::move(demand);
         mirrors_ = std::move(mirrorViews);
@@ -776,8 +840,142 @@ std::string Controller::removeMirrorDomain(std::string const& domainId, std::str
         log::warn("mirror_domain_remove_failed", {{"domain_id", domainId}, {"path", path}, {"error", ec.message()}});
         return "remove failed: " + ec.message();
     }
+    for (auto const& flowId : flows)
+    {
+        mirrorHealth_.noteRemoved(domainId + "/" + flowId, "mirror_domain_" + reason);
+    }
     log::info("mirror_domain_removed", {{"domain_id", domainId}, {"path", path}, {"reason", reason}, {"flows", removed}});
     return {};
+}
+
+void Controller::observeMirrors(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
+    std::vector<MirrorObservation> observations, std::set<std::string> const& seen)
+{
+    auto const now = std::chrono::steady_clock::now();
+    auto const tai = taiNowSeconds();
+    auto const unixMs = unixNowMs();
+    // Mirror flows on disk that no up peer offers: a source peer that is down keeps the expectation of
+    // grains while the demand stays (the mirror is stale); a source that is up no longer has the origin.
+    for (auto const& domain : inventory.domains)
+    {
+        if (domain.kind != "mirror" || fs::path(domain.path).filename().string() != "mirror-" + domain.domain_id)
+        {
+            continue;
+        }
+        bool sourceUp = false;
+        for (auto const& peer : peerSnap)
+        {
+            if (peer.host_id == domain.source_host_id)
+            {
+                sourceUp = peer.up;
+            }
+        }
+        for (auto const& flow : domain.flows)
+        {
+            auto const key = domain.domain_id + "/" + flow.flow_id;
+            if (seen.count(key) != 0)
+            {
+                continue;
+            }
+            MirrorObservation obs;
+            obs.domain_id = domain.domain_id;
+            obs.flow_id = flow.flow_id;
+            obs.peer = domain.source_host_id;
+            obs.rate_num = flow.grain_rate_num;
+            obs.rate_den = flow.grain_rate_den;
+            if (sourceUp)
+            {
+                obs.idle_reason = "origin_missing";
+            }
+            else
+            {
+                obs.blocked = "peer_down";
+                obs.idle_reason = "peer_down";
+                obs.expected = mirrorHealth_.expected(key) && lastDemand_.count(key) != 0;
+            }
+            observations.push_back(std::move(obs));
+        }
+    }
+    std::set<std::string> observed;
+    std::vector<MirrorEvent> events;
+    for (auto& obs : observations)
+    {
+        auto const key = obs.domain_id + "/" + obs.flow_id;
+        if (!observed.insert(key).second)
+        {
+            continue;
+        }
+        readMirrorFile(mirrorPath(cfg.mxl_root, obs.domain_id), obs.flow_id, obs);
+        if (obs.inode == 0 && mirrorHealth_.entries().count(key) == 0)
+        {
+            continue; // a peer flow without a mirror here
+        }
+        obs.tai_now = tai;
+        auto more = mirrorHealth_.update(obs, cfg.mirror_stale_ms, now, unixMs);
+        events.insert(events.end(), more.begin(), more.end());
+    }
+    // Mirrors seen before and neither offered nor on disk now: absent once, forgotten after a day.
+    std::vector<MirrorObservation> gone;
+    for (auto const& [key, health] : mirrorHealth_.entries())
+    {
+        if (observed.count(key) == 0 && health.state != "absent")
+        {
+            MirrorObservation obs;
+            obs.domain_id = health.domain_id;
+            obs.flow_id = health.flow_id;
+            gone.push_back(std::move(obs));
+        }
+    }
+    for (auto const& obs : gone)
+    {
+        auto more = mirrorHealth_.update(obs, cfg.mirror_stale_ms, now, unixMs);
+        events.insert(events.end(), more.begin(), more.end());
+    }
+    mirrorHealth_.prune(now, std::chrono::hours(24));
+    reportMirrorEvents(events, cfg.mirror_stale_ms);
+}
+
+void Controller::reportMirrorEvents(std::vector<MirrorEvent> const& events, int staleMs)
+{
+    for (auto const& event : events)
+    {
+        auto const& h = event.health;
+        std::vector<log::Field> fields{{"domain_id", h.domain_id}, {"flow_id", h.flow_id}, {"peer", h.peer}};
+        auto const age = h.last_grain_age_ms ? std::to_string(static_cast<std::int64_t>(std::llround(*h.last_grain_age_ms))) : std::string();
+        if (event.kind == "stale")
+        {
+            fields.push_back({"reason", h.reason});
+            fields.push_back({"last_grain_age_ms", age});
+            fields.push_back({"stale_after_ms", std::to_string(staleMs)});
+            log::warn("mirror_stale", fields);
+        }
+        else if (event.kind == "recovered")
+        {
+            fields.push_back({"state", h.state});
+            fields.push_back({"reason", h.reason});
+            fields.push_back({"stale_ms", std::to_string(static_cast<std::int64_t>(std::llround(event.stale_ms)))});
+            log::info("mirror_recovered", fields);
+        }
+        else
+        {
+            fields.push_back({"reason", h.last_rebuild_reason});
+            fields.push_back({"rebuilds", std::to_string(h.rebuilds)});
+            fields.push_back({"old_inode", std::to_string(event.old_inode)});
+            fields.push_back({"inode", std::to_string(h.inode)});
+            log::warn("mirror_rebuilt", fields);
+        }
+        picojson::object data;
+        data["event"] = picojson::value(event.kind);
+        data["domain_id"] = picojson::value(h.domain_id);
+        data["flow_id"] = picojson::value(h.flow_id);
+        data["peer"] = picojson::value(h.peer);
+        putHealth(data, h, staleMs);
+        if (event.kind == "recovered")
+        {
+            data["stale_ms"] = picojson::value(std::round(event.stale_ms));
+        }
+        publish("mirror", picojson::value(data).serialize());
+    }
 }
 
 void Controller::renderMetrics()
@@ -924,6 +1122,50 @@ void Controller::renderMetrics()
     }
     // One series per replication with its current state (1); a former state disappears.
     metrics_.setGauges("replication_state", states);
+    // Destination mirror flows: stale, state, age of the newest grain, rebuilds.
+    std::map<std::string, MirrorHealth> health;
+    {
+        std::lock_guard const lock{mu_};
+        health = mirrorHealthView_;
+    }
+    int staleCount = 0;
+    std::uint64_t rebuildsSum = 0;
+    std::vector<std::pair<std::map<std::string, std::string>, double>> staleSeries;
+    std::vector<std::pair<std::map<std::string, std::string>, double>> stateSeries;
+    std::vector<std::pair<std::map<std::string, std::string>, double>> ageSeries;
+    for (auto const& [key, h] : health)
+    {
+        std::map<std::string, std::string> const labels{{"domain_id", h.domain_id}, {"flow_id", h.flow_id}, {"peer", h.peer}};
+        rebuildsSum += h.rebuilds;
+        if (cfg.metrics_per_flow)
+        {
+            metrics_.setCounter("mirror_rebuilds_total", static_cast<double>(h.rebuilds), labels);
+        }
+        if (h.state == "absent")
+        {
+            continue;
+        }
+        staleCount += h.state == "stale" ? 1 : 0;
+        if (cfg.metrics_per_flow)
+        {
+            staleSeries.push_back({labels, h.state == "stale" ? 1.0 : 0.0});
+            auto withState = labels;
+            withState["state"] = h.state;
+            stateSeries.push_back({withState, 1.0});
+            if (h.last_grain_age_ms)
+            {
+                ageSeries.push_back({labels, *h.last_grain_age_ms / 1000.0});
+            }
+        }
+    }
+    if (!cfg.metrics_per_flow)
+    {
+        metrics_.setCounter("mirror_rebuilds_total", static_cast<double>(rebuildsSum));
+    }
+    metrics_.setGauges("mirror_stale", staleSeries);
+    metrics_.setGauges("mirror_state", stateSeries);
+    metrics_.setGauges("mirror_last_grain_age_seconds", ageSeries);
+    metrics_.setGauge("mirrors_stale", staleCount);
 }
 
 void Controller::stream(SseEmit const& emit)
@@ -1028,14 +1270,34 @@ HttpResponse Controller::handle(HttpRequest const& request)
     }
     if (request.method == "GET" && request.path == "/api/v1/inventory")
     {
-        return json(200, scanner_.snapshot().canonicalJson());
+        // Each local flow's head index now (not part of the revision): a destination tells a mirror that
+        // misses grains from an origin that writes none.
+        auto inventory = scanner_.snapshot();
+        for (auto& domain : inventory.domains)
+        {
+            if (domain.kind != "local")
+            {
+                continue;
+            }
+            for (auto& flow : domain.flows)
+            {
+                auto const header = readFlowHeader((fs::path(domain.path) / (flow.flow_id + ".mxl-flow") / "data").string());
+                if (header.headIndex != 0 && header.headIndex != std::numeric_limits<std::uint64_t>::max())
+                {
+                    flow.head_index = header.headIndex;
+                }
+            }
+        }
+        return json(200, inventory.canonicalJson());
     }
     if (request.method == "GET" && request.path == "/api/v1/mirrors")
     {
         std::vector<MirrorDomainView> views;
+        std::map<std::string, MirrorHealth> health;
         {
             std::lock_guard const lock{mu_};
             views = mirrorDomains_;
+            health = mirrorHealthView_;
         }
         // Readers now: every process other than the agent that maps a file of a mirror domain.
         std::map<FileKey, std::string> files;
@@ -1092,6 +1354,17 @@ HttpResponse Controller::handle(HttpRequest const& request)
                 f["format"] = picojson::value(flow.format);
                 f["active"] = picojson::value(flow.active);
                 f["state"] = picojson::value(state);
+                // Stale and rebuilt (for the platform's re-routing), as of the last reconcile pass.
+                picojson::object h;
+                if (auto const it = health.find(view.domain_id + "/" + flow.flow_id); it != health.end())
+                {
+                    putHealth(h, it->second, cfg.mirror_stale_ms);
+                }
+                else
+                {
+                    putHealth(h, MirrorHealth{}, cfg.mirror_stale_ms);
+                }
+                f["health"] = picojson::value(h);
                 flows.push_back(picojson::value(f));
             }
             obj["flows"] = picojson::value(flows);

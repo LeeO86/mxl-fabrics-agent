@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -45,19 +46,26 @@ bool flowActive(fs::path const& dataFile)
     return active;
 }
 
-struct DataHeader
+double taiNowSeconds()
 {
-    std::uint32_t grainCount = 0;
-    std::uint64_t headIndex = 0;
-};
+    timespec ts{};
+    ::clock_gettime(CLOCK_TAI, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+}
+} // namespace
 
-DataHeader readDataHeader(fs::path const& dataFile)
+FlowHeader readFlowHeader(std::string const& dataFile)
 {
-    DataHeader header;
+    FlowHeader header;
     int fd = ::open(dataFile.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
     {
         return header;
+    }
+    struct stat st{};
+    if (::fstat(fd, &st) == 0)
+    {
+        header.inode = static_cast<std::uint64_t>(st.st_ino);
     }
     // mxlFlowInfo is 2048 bytes. grainSize lives in each grain, not the flow header.
     // At stable offsets for version 1: ring depth is config.discrete.grainCount (8 byte prefix + 128 byte
@@ -79,14 +87,6 @@ DataHeader readDataHeader(fs::path const& dataFile)
     std::memcpy(&header.headIndex, buf + 8 + 192, 8);
     return header;
 }
-
-double taiNowSeconds()
-{
-    timespec ts{};
-    ::clock_gettime(CLOCK_TAI, &ts);
-    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
-}
-} // namespace
 
 Inventory scanOnce(std::string const& root, std::string const& hostId)
 {
@@ -157,7 +157,7 @@ Inventory scanOnce(std::string const& root, std::string const& hostId)
             }
             bool const active = flowActive(flowEntry.path() / "data");
             auto flow = flowFromDef(defJson, domain.options_json, active);
-            auto const header = readDataHeader(flowEntry.path() / "data");
+            auto const header = readFlowHeader((flowEntry.path() / "data").string());
             if (header.grainCount != 0)
             {
                 flow.ring_depth = header.grainCount;

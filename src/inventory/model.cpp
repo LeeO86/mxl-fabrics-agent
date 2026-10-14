@@ -82,6 +82,10 @@ std::string Inventory::canonicalJson() const
             f["media_type"] = picojson::value(flow.media_type);
             f["active"] = picojson::value(flow.active);
             f["live"] = picojson::value(flow.live);
+            if (flow.head_index)
+            {
+                f["head_index"] = picojson::value(static_cast<double>(*flow.head_index));
+            }
             picojson::object grain;
             grain["numerator"] = picojson::value(static_cast<double>(flow.grain_rate_num));
             grain["denominator"] = picojson::value(static_cast<double>(flow.grain_rate_den));

@@ -3,6 +3,7 @@
 #include "inventory/model.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -10,6 +11,17 @@
 
 namespace mfa
 {
+// The header of a flow's data file: ring depth, head index (runtime.headIndex, MXL_UNDEFINED_INDEX or 0
+// before the first grain) and the file's inode (0 when it does not exist).
+struct FlowHeader
+{
+    std::uint32_t grainCount = 0;
+    std::uint64_t headIndex = 0;
+    std::uint64_t inode = 0;
+};
+
+FlowHeader readFlowHeader(std::string const& dataFile);
+
 Inventory scanOnce(std::string const& root, std::string const& hostId);
 
 class DomainScanner

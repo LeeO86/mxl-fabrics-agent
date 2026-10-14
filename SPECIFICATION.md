@@ -354,6 +354,55 @@ mirror is not created, and status/metric/log report `insufficient_space`.
   existing `domain_def.json` whose id does not match the mirror is not
   overwritten.
 
+### 7.5 Mirror health (stale, rebuilt)
+
+The agent reports; it never re-routes. Choosing a source for a receiver stays with
+the controller (IS-05), so the agent only tells the platform when a mirror flow no
+longer carries the source.
+
+Per destination mirror flow, on every reconciliation tick:
+
+- **Grains are due** while a replication of the flow is wanted (a receiver, or a
+  held replication) and the origin is live in the source's inventory (a writer
+  holds it and its head is within 5 s of now). While the source peer or its
+  fabric link is down, grains stay due as long as the demand stays.
+- **Age of the newest grain** is the mirror's head index against the current TAI
+  index at the flow's rate (samples ÷ sample rate for continuous flows), read
+  from the mirror's data file. It includes the replication lag.
+- **`stale`**: grains are due, no new grain came for `MIRROR_STALE_MS` (default
+  1000; `0` never) and the origin has newer ones. The source's
+  `/api/v1/inventory` carries each local flow's `head_index` read when it
+  answers (not part of `revision`); without it (an older source) the origin's
+  `live` flag stands in. With the peer or its link down the origin is taken as
+  still written. Reasons: `no_new_grains`, `no_first_grain`, `peer_down`,
+  `link_down`. When grains first become due the full wait applies, so a mirror
+  that holds old grains is `pending`, not `stale`, at once.
+- Other states: `live` (a grain younger than the threshold), `pending` (due,
+  within the first wait), `idle` (nothing due: `no_demand`, `origin_inactive`,
+  `origin_not_live`, `origin_missing`, `peer_down`, or `origin_silent`: the
+  origin has no newer grain, e.g. a writer without input signal), `absent`
+  (the flow is not on disk).
+- **`rebuilt`**: the mirror's data file is a new one (another inode, or back
+  after it was gone). MXL readers keep the file they opened and see no new
+  grain on a flow that was created again, so every reader of the mirror needs a
+  fresh IS-05 activation. The reason is why the agent removed it
+  (`origin_gone`, `no_demand`, `excluded`, `mirror_domain_<idle|orphan|same_node|api>`)
+  or `replaced` when something else did. Counts and times live in memory: an
+  agent restart starts them again.
+
+Exposed in `GET /api/v1/mirrors` (`flows[].health`), the metrics of §12.3,
+the logs `mirror_stale`, `mirror_recovered`, `mirror_rebuilt` and the SSE event
+`mirror`.
+
+Platform contract: watch `mirror_stale` and `mirror_rebuilds_total` (or the SSE
+`mirror` event). A receiver on this host reading a mirror that is `stale` gets
+no new grains: the controller MAY switch it to another source after its own
+hold-off. When `mirror_rebuilds_total` rises, every receiver on this host that
+reads that flow SHOULD be activated again over IS-05 (same sender is fine) so the
+media function opens the new file. `idle` with `origin_silent` is a source
+without signal, not a mirror fault; `stale` with `peer_down` or `link_down`
+means the path to the source is gone.
+
 ---
 
 ## 8. Peers
@@ -417,13 +466,13 @@ posture as the siblings: protected networks only).
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/info` | `host_id`, version, MXL/libfabric versions, providers available |
-| GET | `/inventory` | local domains and flows (§5.3), monotonically increasing `revision` |
-| GET | `/events` | SSE stream: `inventory`, `replication`, `peer` events |
+| GET | `/inventory` | local domains and flows (§5.3), monotonically increasing `revision`; each flow's `head_index` when the request is answered (not part of `revision`) |
+| GET | `/events` | SSE stream: `inventory`, `replication`, `peer`, `mirror` (stale, recovered, rebuilt; §7.5) events |
 | POST | `/replications` | destination asks source to add a target: `{flow_id, domain_id, dest_host_id, target_info}` → `201 {replication_id}` |
 | DELETE | `/replications/{id}/targets/{dest_host_id}` | destination releases its target |
 | GET | `/replications` | active replications (both roles) |
 | GET | `/peers` | peers: control plane `up`, fabric `link_up`, `link_error`, `fabric_interface` |
-| GET | `/mirrors` | local mirror domains: origin, flows, demand, readers, age, cleanup state |
+| GET | `/mirrors` | local mirror domains: origin, flows (with `health`, §7.5), demand, readers, age, cleanup state |
 | DELETE | `/mirrors/{domain_id}` | remove a mirror domain; 409 while another process maps it |
 | GET | `/demand` | local demand entries and the receivers behind them |
 | GET | `/config` | effective configuration, where each key came from, `restart_required` |
@@ -574,6 +623,7 @@ include/exclude lists apply at runtime.
 | `MIRROR_GRACE_S` | 10 | keep mirror after origin disappears |
 | `MIRROR_IDLE_GRACE_S` | 300 | drop a mirror domain after this long without demand; `0` never |
 | `MIRROR_CLEANUP_DRY_RUN` | false | mirror cleanup only logs |
+| `MIRROR_STALE_MS` | 1000 | a mirror flow without a new grain this long while grains are due is `stale` (§7.5); `0` never |
 | `TMPFS_RESERVE_MB` | 512 | minimum free space on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | remove own mirrors on SIGTERM. Alias: `CLEANUP_MIRRORS_ON_EXIT` |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |
@@ -689,9 +739,15 @@ Tabs:
 | `nmos_poll_errors_total` | counter | — (not implemented yet) |
 | `tai_offset_seconds` | gauge | — |
 | `completion_queue_depth` | gauge | flow_id |
+| `mirror_stale` | gauge (0/1) | domain_id, flow_id, peer; 1 while the destination mirror flow is `stale` (§7.5) |
+| `mirror_state` | gauge (1) | domain_id, flow_id, peer, state (`live`, `pending`, `stale`, `idle`) |
+| `mirror_last_grain_age_seconds` | gauge | domain_id, flow_id, peer; age of the mirror's newest grain, absent before the first |
+| `mirror_rebuilds_total` | counter | domain_id, flow_id, peer; the mirror's data file was created again |
+| `mirrors_stale` | gauge | —; mirror flows that are `stale` |
 
 Label cardinality: `flow_id` labels are allowed (PoC scale); a config switch
-`METRICS_PER_FLOW=false` drops per-flow labels.
+`METRICS_PER_FLOW=false` drops per-flow labels (the `mirror_*` series then
+reduce to `mirrors_stale` and an unlabelled `mirror_rebuilds_total`).
 
 ### 12.4 Grafana dashboard
 
@@ -703,7 +759,10 @@ errors/restarts, setup time, tmpfs usage, TAI offset. Plus
 ### 12.5 Logging
 
 Structured JSON logs, one event per line, with `replication_id`, `flow_id`,
-`peer` fields where relevant.
+`peer` fields where relevant. Mirror health (§7.5): `mirror_stale` (warn;
+`domain_id`, `flow_id`, `peer`, `reason`, `last_grain_age_ms`, `stale_after_ms`),
+`mirror_recovered` (info; the new `state` and `reason`, `stale_ms`),
+`mirror_rebuilt` (warn; `reason`, `rebuilds`, `old_inode`, `inode`).
 
 ### 12.6 Exit codes (aligned with siblings)
 
