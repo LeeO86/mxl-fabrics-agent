@@ -149,7 +149,7 @@ onUnmounted(() => clearInterval(timer));
 
     <section v-else-if="tab === 'replications'">
       <table>
-        <thead><tr><th>Role</th><th>Peer</th><th>Provider</th><th>Flow</th><th>State</th><th>Grains</th><th>Lag</th><th>Errors</th><th>Last error</th></tr></thead>
+        <thead><tr><th>Role</th><th>Peer</th><th>Provider</th><th>Flow</th><th>State</th><th>Grains</th><th>Lag</th><th>Lag ms</th><th>Errors</th><th>Last error</th></tr></thead>
         <tbody>
           <tr v-for="row in replications" :key="row.replication_id + row.role + row.peer">
             <td>{{ row.role }}</td>
@@ -159,6 +159,7 @@ onUnmounted(() => clearInterval(timer));
             <td><span :class="pill(row.state)">{{ row.state }}</span></td>
             <td>{{ row.grains }}</td>
             <td>{{ row.lag_grains }}</td>
+            <td>{{ row.lag_ms?.toFixed(1) }}</td>
             <td>{{ row.errors }} / {{ row.restarts }}</td>
             <td class="muted">{{ row.last_error }}</td>
           </tr>

@@ -222,6 +222,17 @@ if ! rate=$("$WRITER" samples "$B/mirror-$AUDIO_DOMAIN" "$AUDIO_FLOW" 10 45000);
 fi
 say "audio flow: $rate"
 
+# lag_ms is the destination's lag in time at the flow's rate (lag_grains counts batches for audio).
+lag_ms=$(curl -sf --max-time 2 http://127.0.0.1:18096/api/v1/replications | python3 -c '
+import json, sys
+rows = [r for r in json.load(sys.stdin) if r.get("flow_id") == sys.argv[1] and r.get("role") == "destination"]
+print(rows[0]["lag_ms"] if rows and "lag_ms" in rows[0] else "missing")' "$AUDIO_FLOW")
+python3 -c 'import sys; v = float(sys.argv[1]); sys.exit(0 if 0 <= v < 200 else 1)' "$lag_ms" 2>/dev/null \
+  || fail "audio flow: lag_ms is $lag_ms, expected 0 to 200"
+curl -sf --max-time 2 http://127.0.0.1:18096/metrics | grep -q "^mxl_fabrics_agent_replication_lag_ms{flow_id=\"$AUDIO_FLOW\"" \
+  || fail "audio flow: no replication_lag_ms metric"
+say "audio flow: lag_ms $lag_ms"
+
 # A writer that restarts: MXL deletes the flow with its last writer, the next writer creates it again
 # (new inode). The source has to open the new flow; 1.2.3 stayed on the deleted one for good.
 RE_DOMAIN="abababab-abab-4bab-8bab-abababababab"

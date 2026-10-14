@@ -545,6 +545,12 @@ the set of hosts or the choice changes and exports `origin_conflicts`.
   head; for continuous flows the lag counts transfer batches. It is 0 while no
   writer holds the origin flow, while the origin head the source reports has
   not moved for 2 s (a holder without a signal), and before the first grain.
+  Because a batch of a continuous flow can be a single sample, the batch count
+  says little about time (47 batches of 1 sample at 48 kHz are about 1 ms).
+  The agent therefore also reports the lag in milliseconds: the same index
+  distance at the flow's rate, i.e. samples ÷ sample rate for continuous flows
+  and grains × grain period for discrete ones (`lag_ms`, rounded to whole
+  microseconds; 0 in the same cases as the grain count).
 
 ---
 
@@ -646,7 +652,7 @@ Tabs:
   domains and mirror flows with state (`idle`, `replicating`, `orphaned`,
   `insufficient_space`, `peer_down`, `conflict`).
 - **Replications**: per replication role, peer, provider, grains/s, Gbit/s,
-  lag (grains), errors, restarts, last error.
+  lag (grains and ms), errors, restarts, last error.
 - **Demand**: receivers on this host (node, label, active `mxl_domain_id` /
   `mxl_flow_id`), resolved source host, state (`local`, `replicating`,
   `unresolved`, `stale_reference`).
@@ -675,7 +681,8 @@ Tabs:
 | `replication_errors_total` | counter | flow_id, peer, role (no `kind`: errors are counted, not classified) |
 | `replication_restarts_total` | counter | flow_id, peer |
 | `replication_origin_gaps_total` | counter | flow_id, peer; source: origin indexes never written, passed over (since 1.3.1) |
-| `replication_lag_grains` | gauge | flow_id, peer |
+| `replication_lag_grains` | gauge | flow_id, peer; transfer batches for continuous flows |
+| `replication_lag_ms` | gauge | flow_id, peer; the lag in milliseconds at the flow's rate |
 | `grain_transfer_seconds` | histogram | provider; source grains, transfer to completion |
 | `setup_seconds` | histogram | phase (target_setup, handshake, first_grain) (not implemented yet) |
 | `nmos_registry_up` | gauge | — |

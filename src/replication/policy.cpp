@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cmath>
 
 namespace mfa
 {
@@ -60,5 +61,15 @@ std::string chooseOrigin(std::vector<OriginCandidate> const& candidates, std::st
         }
     }
     return best != nullptr ? best->host : std::string();
+}
+
+double indexesToMs(std::uint64_t indexes, std::int64_t numerator, std::int64_t denominator)
+{
+    if (numerator <= 0 || denominator <= 0)
+    {
+        return 0.0;
+    }
+    auto const ms = static_cast<double>(indexes) * 1000.0 * static_cast<double>(denominator) / static_cast<double>(numerator);
+    return std::round(ms * 1000.0) / 1000.0; // whole microseconds
 }
 } // namespace mfa

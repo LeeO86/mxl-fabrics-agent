@@ -900,6 +900,7 @@ void Controller::renderMetrics()
         {
             states.push_back({{{"flow_id", row.flow_id}, {"peer", row.peer}, {"role", row.role}, {"state", row.state}}, 1});
             metrics_.setGauge("replication_lag_grains", static_cast<double>(row.lag), {{"flow_id", row.flow_id}, {"peer", row.peer}});
+            metrics_.setGauge("replication_lag_ms", row.lag_ms, {{"flow_id", row.flow_id}, {"peer", row.peer}});
             metrics_.setGauge("completion_queue_depth", row.cq_depth, {{"flow_id", row.flow_id}});
             // The totals live in the replication rows (they start again with a new replication).
             std::map<std::string, std::string> const labels{{"flow_id", row.flow_id}, {"peer", row.peer}, {"role", row.role}};
@@ -1199,6 +1200,7 @@ HttpResponse Controller::handle(HttpRequest const& request)
             obj["restarts"] = picojson::value(static_cast<double>(row.restarts));
             obj["head_index"] = picojson::value(static_cast<double>(row.head));
             obj["lag_grains"] = picojson::value(static_cast<double>(row.lag));
+            obj["lag_ms"] = picojson::value(row.lag_ms);
             obj["origin_gaps"] = picojson::value(static_cast<double>(row.gaps));
             obj["last_error"] = picojson::value(row.last_error);
             obj["fallback"] = picojson::value(row.fallback);
