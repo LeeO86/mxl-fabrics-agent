@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `lag_ms` in `GET /api/v1/replications` and the gauge `replication_lag_ms{flow_id,peer}`: the destination's lag in milliseconds, from the same index distance as `lag_grains` at the flow's rate (samples ÷ sample rate for continuous flows, grains × grain period for discrete ones), rounded to whole microseconds. For audio `lag_grains` counts transfer batches and divides by the size of the last one, so a batch of one sample made 47 "grains" out of about 1 ms. `lag_grains` and `replication_lag_grains` are unchanged. The web UI shows both.
+
 ## 1.4.0
 
 - Mirror domain cleanup. Tests and moved functions left stale destination mirrors (`/Volumes/mxl/mirror-<domain id>`) on the platform's media nodes, and the agent kept them mapped. A mirror next to its live origin (the function moved to this node) froze a reader on the platform (vmix blackout: same flow ids, stale copy). Now each mirror domain on disk gets a state: `same_node` (origin on this node) and `orphan` (no up peer lists the origin) are removed at once, `idle` (no demand) after `MIRROR_IDLE_GRACE_S` (default 300 s), `active` stays; a mirror of a local origin is never created. The agent closes its own writers and targets, then removes the flows and the directory, and only when no other process maps one of its files (`/proc/<pid>/maps`, matched by device and inode) and it could check every process; otherwise it refuses and logs `mirror_domain_busy`. Orphans are decided 30 s after start and, with NMOS, while the registry answers. `MIRROR_CLEANUP_DRY_RUN=true` only logs.

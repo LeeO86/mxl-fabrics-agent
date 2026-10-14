@@ -1269,13 +1269,16 @@ private:
             row.errors = slot.errors;
             row.head = slot.head;
             // Origin writers commit at the current TAI index, so the distance from it is the lag
-            // (grainRate is the sample rate of a continuous flow).
+            // (grainRate is the sample rate of a continuous flow). `behind` counts batches for a
+            // continuous flow; `behind_ms` is the time the indexes cover at the flow's rate.
             if (auto const writer = writers_.find(slot.flowId); writer != writers_.end() && slot.grains > 0)
             {
-                auto const now = mxlGetCurrentIndex(&writer->second.info.common.grainRate);
+                auto const& rate = writer->second.info.common.grainRate;
+                auto const now = mxlGetCurrentIndex(&rate);
                 if (now != MXL_UNDEFINED_INDEX && now > slot.head)
                 {
                     row.behind = (now - slot.head) / std::max<std::size_t>(slot.lastBatch, 1);
+                    row.behind_ms = indexesToMs(now - slot.head, rate.numerator, rate.denominator);
                 }
             }
             row.last_error = slot.lastError;

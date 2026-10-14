@@ -44,6 +44,7 @@ struct ReplicaView
     std::uint64_t restarts = 0;
     std::uint64_t head = 0;
     std::int64_t lag = 0;
+    double lag_ms = 0; // destination: the lag in milliseconds at the flow's rate
     std::uint64_t gaps = 0; // source: origin indexes never written, passed over
     std::string last_error;
     bool fallback = false;

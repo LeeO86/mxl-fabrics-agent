@@ -179,3 +179,19 @@ TEST_CASE("a provider without an interface for a held address lists its interfac
     CHECK_FALSE(rescanDue(none.up, none.netdev, 1h)); // no address configured
     std::filesystem::remove_all(root);
 }
+
+TEST_CASE("indexesToMs: samples over the sample rate, grains times the grain period")
+{
+    // 2 ch 48 kHz audio: 47 batches of 1 sample were "47 grains" but are under 1 ms.
+    CHECK(indexesToMs(47, 48000, 1) == doctest::Approx(0.979).epsilon(1e-9));
+    CHECK(indexesToMs(48, 48000, 1) == doctest::Approx(1.0));
+    CHECK(indexesToMs(480, 48000, 1) == doctest::Approx(10.0));
+    // Video: grains times the grain period.
+    CHECK(indexesToMs(2, 50, 1) == doctest::Approx(40.0));
+    CHECK(indexesToMs(1, 60000, 1001) == doctest::Approx(16.683));
+    CHECK(indexesToMs(3, 30000, 1001) == doctest::Approx(100.1));
+    CHECK(indexesToMs(0, 50, 1) == 0.0);
+    // A rate that is not set gives no lag rather than a division by zero.
+    CHECK(indexesToMs(10, 0, 1) == 0.0);
+    CHECK(indexesToMs(10, 50, 0) == 0.0);
+}

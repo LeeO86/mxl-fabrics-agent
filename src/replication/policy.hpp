@@ -56,4 +56,9 @@ struct OriginCandidate
 // left its domain behind): a live origin before one with a writer before the rest. Among equals the
 // current choice stays, else the lowest host id.
 std::string chooseOrigin(std::vector<OriginCandidate> const& candidates, std::string const& current);
+
+// Milliseconds that `indexes` cover at a flow's index rate (`numerator`/`denominator` per second):
+// grains times the grain period for a discrete flow, samples over the sample rate for a continuous
+// one, rounded to whole microseconds. 0 for a rate that is not positive.
+double indexesToMs(std::uint64_t indexes, std::int64_t numerator, std::int64_t denominator);
 } // namespace mfa

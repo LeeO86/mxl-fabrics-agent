@@ -534,6 +534,7 @@ std::vector<ReplicaView> ReplicationEngine::status() const
             view.fallback = row.fallback;
             view.cq_depth = row.cq_depth;
             view.lag = static_cast<std::int64_t>(row.behind);
+            view.lag_ms = row.behind_ms;
             if (auto const down = linksDown.find(row.peer); row.role == "source" && down != linksDown.end())
             {
                 view.state = "link_down";
@@ -557,6 +558,7 @@ std::vector<ReplicaView> ReplicationEngine::status() const
                     (state.origin_head && std::chrono::steady_clock::now() - state.origin_moved_at > std::chrono::seconds(2)))
                 {
                     view.lag = 0;
+                    view.lag_ms = 0;
                 }
                 view.fallback = state.fallback || view.fallback;
                 if (!state.provider.empty())

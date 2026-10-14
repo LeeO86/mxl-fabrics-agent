@@ -29,7 +29,7 @@ Two agents on one host (the loopback demo) must use different `WEB_PORT`, `NMOS_
 2. If a flow is not present yet, the reader retries with backoff instead of failing permanently.
 3. Readers tolerate a flow that exists but has no new grains yet.
 4. Media functions do not build with `MXL_ENABLE_FABRICS_OFI`.
-5. Readers on a destination should sit at least one grain behind the mirror head (`mxl_fabrics_agent_replication_lag_grains`).
+5. Readers on a destination should sit at least one grain behind the mirror head (`mxl_fabrics_agent_replication_lag_ms`; `…_lag_grains` counts transfer batches for audio, which can be single samples).
 6. A writer may leave indexes unwritten (one that is late and jumps to the current grain). The source passes over them, and they are invalid on the mirror as on the origin. `mxl_fabrics_agent_replication_origin_gaps_total` counts them.
 
 mxl-decklink and mxl-st2110-gateway reject an IS-05 activation whose domain is not on disk yet. Use the default `MIRROR_MODE=eager` with them. `on-demand` is for readers that retry domain discovery.
@@ -196,7 +196,7 @@ All of these are on `WEB_PORT`.
 | GET | `/api/v1/mirrors` | Mirror domains: origin, flows, demand, readers, age, cleanup state |
 | DELETE | `/api/v1/mirrors/{domain_id}` | Remove a mirror domain; 409 while another process maps it |
 | GET | `/api/v1/demand` | Local IS-05 demand |
-| GET | `/api/v1/replications` | Active replications |
+| GET | `/api/v1/replications` | Active replications: state, `grains`, `head_index`, `lag_grains` (transfer batches for continuous flows), `lag_ms` (samples ÷ sample rate, or grains × grain period), `origin_gaps`, errors |
 | POST | `/api/v1/replications` | Peer asks this host to send a flow |
 | DELETE | `/api/v1/replications/{id}/targets/{dest}` | Peer releases a target |
 | GET | `/api/v1/peers` | Peer status: control plane `up`, fabric `link_up`, `link_error`, `fabric_interface` |
