@@ -139,7 +139,7 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | `MIRROR_GRACE_S` | 10 | Keep a mirror after the origin disappears |
 | `MIRROR_IDLE_GRACE_S` | 300 | Drop a mirror domain after this many seconds without demand (`0`: never) |
 | `MIRROR_CLEANUP_DRY_RUN` | false | Mirror cleanup only logs `mirror_domain_would_remove` |
-| `MIRROR_STALE_MS` | 1000 | A mirror flow without a new grain for this long while grains are due is `stale` (see Mirror health). `0`: never |
+| `MIRROR_STALE_MS` | 2000 | A mirror flow without a new grain for this long while grains are due is `stale` (see Mirror health). `0`: never |
 | `TMPFS_RESERVE_MB` | 512 | Free space left on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | On shutdown, remove mirror domains this agent owns. Alias: `CLEANUP_MIRRORS_ON_EXIT`. With false the mirror flows stay, and readers on the host keep reading them after a restart |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |

@@ -302,7 +302,7 @@ Config parseConfig(std::map<std::string, std::string> const& values)
     cfg.mirror_grace_s = parseInt("MIRROR_GRACE_S", valueOr(values, "MIRROR_GRACE_S", "10"), 0, 86400);
     cfg.mirror_idle_grace_s = parseInt("MIRROR_IDLE_GRACE_S", valueOr(values, "MIRROR_IDLE_GRACE_S", "300"), 0, 86400);
     cfg.mirror_cleanup_dry_run = parseBool("MIRROR_CLEANUP_DRY_RUN", valueOr(values, "MIRROR_CLEANUP_DRY_RUN", "false"));
-    cfg.mirror_stale_ms = parseInt("MIRROR_STALE_MS", valueOr(values, "MIRROR_STALE_MS", "1000"), 0, 600000);
+    cfg.mirror_stale_ms = parseInt("MIRROR_STALE_MS", valueOr(values, "MIRROR_STALE_MS", "2000"), 0, 600000);
     cfg.tmpfs_reserve_mb = parseInt("TMPFS_RESERVE_MB", valueOr(values, "TMPFS_RESERVE_MB", "512"), 0, 1024 * 1024);
     cfg.cleanup_mirrors_on_exit = parseBool("MXL_CLEANUP_ON_EXIT", valueOr(aligned, "MXL_CLEANUP_ON_EXIT", "false"));
     cfg.default_provider = valueOr(values, "DEFAULT_PROVIDER", "verbs");

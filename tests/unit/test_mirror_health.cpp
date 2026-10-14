@@ -217,7 +217,7 @@ TEST_CASE("mirror health: entries not seen for the keep time are forgotten")
 
 TEST_CASE("mirror health: MIRROR_STALE_MS")
 {
-    CHECK(parseConfig({}).mirror_stale_ms == 1000);
+    CHECK(parseConfig({}).mirror_stale_ms == 2000);
     CHECK(parseConfig({{"MIRROR_STALE_MS", "0"}}).mirror_stale_ms == 0);
     CHECK(parseConfig({{"MIRROR_STALE_MS", "250"}}).mirror_stale_ms == 250);
     CHECK_THROWS_AS(parseConfig({{"MIRROR_STALE_MS", "-1"}}), ConfigError);

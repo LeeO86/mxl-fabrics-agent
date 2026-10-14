@@ -370,7 +370,7 @@ Per destination mirror flow, on every reconciliation tick:
   index at the flow's rate (samples ÷ sample rate for continuous flows), read
   from the mirror's data file. It includes the replication lag.
 - **`stale`**: grains are due, no new grain came for `MIRROR_STALE_MS` (default
-  1000; `0` never) and the origin has newer ones. The source's
+  2000; `0` never) and the origin has newer ones. The source's
   `/api/v1/inventory` carries each local flow's `head_index` read when it
   answers (not part of `revision`); without it (an older source) the origin's
   `live` flag stands in. With the peer or its link down the origin is taken as
@@ -623,7 +623,7 @@ include/exclude lists apply at runtime.
 | `MIRROR_GRACE_S` | 10 | keep mirror after origin disappears |
 | `MIRROR_IDLE_GRACE_S` | 300 | drop a mirror domain after this long without demand; `0` never |
 | `MIRROR_CLEANUP_DRY_RUN` | false | mirror cleanup only logs |
-| `MIRROR_STALE_MS` | 1000 | a mirror flow without a new grain this long while grains are due is `stale` (§7.5); `0` never |
+| `MIRROR_STALE_MS` | 2000 | a mirror flow without a new grain this long while grains are due is `stale` (§7.5); `0` never |
 | `TMPFS_RESERVE_MB` | 512 | minimum free space on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | remove own mirrors on SIGTERM. Alias: `CLEANUP_MIRRORS_ON_EXIT` |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |

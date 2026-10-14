@@ -36,7 +36,7 @@ struct Config
     std::vector<std::string> mirror_exclude_flows;
     int mirror_grace_s = 10;
     int mirror_idle_grace_s = 300;       // drop a mirror domain after this long without demand (0 = never)
-    int mirror_stale_ms = 1000;          // a mirror without a new grain this long while grains are due is stale (0 = never)
+    int mirror_stale_ms = 2000;          // a mirror without a new grain this long while grains are due is stale (0 = never)
     bool mirror_cleanup_dry_run = false; // mirror cleanup only logs what it would remove
     int tmpfs_reserve_mb = 512;
     bool cleanup_mirrors_on_exit = false;
