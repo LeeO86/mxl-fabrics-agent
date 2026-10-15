@@ -122,4 +122,17 @@ MirrorDomainPlan planMirrorDomain(MirrorDomainInput const& in)
     plan.remove = true;
     return plan;
 }
+
+MirrorFlowPlan planMirrorFlow(MirrorFlowInput const& in)
+{
+    MirrorFlowPlan plan;
+    // A source peer that is down may still hold the origin: wait for it, as for a whole domain.
+    plan.missing = !in.offered && in.source_up;
+    if (plan.missing && in.peers_known && in.grace_expired)
+    {
+        plan.remove = true;
+        plan.reason = "origin_missing";
+    }
+    return plan;
+}
 } // namespace mfa

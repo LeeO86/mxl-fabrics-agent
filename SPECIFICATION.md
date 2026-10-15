@@ -344,6 +344,19 @@ mirror is not created, and status/metric/log report `insufficient_space`.
   maps one of its files (`/proc/<pid>/maps`, device and inode) or while the
   agent cannot check every process. Orphans are decided only 30 s after start
   and, with NMOS, while the registry answers. `MIRROR_CLEANUP_DRY_RUN` only logs.
+- Single mirror flows (1.6.0): in a mirror domain that stays, a flow whose
+  origin is missing (the domain's source peer is up and no up peer offers the
+  flow) is removed once it has been missing for `MIRROR_IDLE_GRACE_S` (`0`
+  never), not in the first 30 s after start and, with NMOS, only while the
+  registry answers. The clock restarts when the flow is offered again, its
+  source goes down, or the agent restarts. Removal releases the agent's writer
+  of the flow and removes `<flow id>.mxl-flow`; it MUST NOT happen while a
+  process other than the agent maps a file of that flow directory (the same
+  `/proc/<pid>/maps` check, per flow) or while the agent cannot check every
+  process, and the check runs again right before the files go. Same ownership
+  rules as whole domains. `MIRROR_CLEANUP_DRY_RUN` only logs
+  (`mirror_flow_would_remove`). The flow's health becomes `absent` with reason
+  `origin_missing`.
 - On clean shutdown (SIGTERM) the agent stops replications and, if
   `MXL_CLEANUP_ON_EXIT=true` (alias `CLEANUP_MIRRORS_ON_EXIT`, default false),
   removes only mirror directories it owns. With `false` it keeps the mirror
@@ -386,7 +399,7 @@ Per destination mirror flow, on every reconciliation tick:
   after it was gone). MXL readers keep the file they opened and see no new
   grain on a flow that was created again, so every reader of the mirror needs a
   fresh IS-05 activation. The reason is why the agent removed it
-  (`origin_gone`, `no_demand`, `excluded`, `mirror_domain_<idle|orphan|same_node|api>`)
+  (`origin_gone`, `origin_missing`, `no_demand`, `excluded`, `mirror_domain_<idle|orphan|same_node|api>`)
   or `replaced` when something else did. Counts and times live in memory: an
   agent restart starts them again.
 
@@ -621,7 +634,7 @@ include/exclude lists apply at runtime.
 | `MIRROR_INCLUDE_DOMAINS` / `MIRROR_INCLUDE_FLOWS` | empty | allow lists; empty does not filter |
 | `MIRROR_EXCLUDE_DOMAINS` / `MIRROR_EXCLUDE_FLOWS` | empty | deny lists |
 | `MIRROR_GRACE_S` | 10 | keep mirror after origin disappears |
-| `MIRROR_IDLE_GRACE_S` | 300 | drop a mirror domain after this long without demand; `0` never |
+| `MIRROR_IDLE_GRACE_S` | 300 | drop a mirror domain after this long without demand, and a mirror flow after its origin flow has been missing this long (§7.4); `0` never |
 | `MIRROR_CLEANUP_DRY_RUN` | false | mirror cleanup only logs |
 | `MIRROR_STALE_MS` | 2000 | a mirror flow without a new grain this long while grains are due is `stale` (§7.5); `0` never |
 | `TMPFS_RESERVE_MB` | 512 | minimum free space on the MXL filesystem |
@@ -744,6 +757,8 @@ Tabs:
 | `mirror_last_grain_age_seconds` | gauge | domain_id, flow_id, peer; age of the mirror's newest grain, absent before the first |
 | `mirror_rebuilds_total` | counter | domain_id, flow_id, peer; the mirror's data file was created again |
 | `mirrors_stale` | gauge | —; mirror flows that are `stale` |
+| `mirror_flows_removed_total` | counter | reason; single mirror flows removed: `origin_missing` (§7.4, since 1.6.0), `origin_gone`, `no_demand`, `excluded` |
+| `mirror_flows_refused_total` | counter | reason; a removal refused because another process maps the flow or the reader check is incomplete, counted once per change |
 
 Label cardinality: `flow_id` labels are allowed (PoC scale); a config switch
 `METRICS_PER_FLOW=false` drops per-flow labels (the `mirror_*` series then
@@ -762,7 +777,11 @@ Structured JSON logs, one event per line, with `replication_id`, `flow_id`,
 `peer` fields where relevant. Mirror health (§7.5): `mirror_stale` (warn;
 `domain_id`, `flow_id`, `peer`, `reason`, `last_grain_age_ms`, `stale_after_ms`),
 `mirror_recovered` (info; the new `state` and `reason`, `stale_ms`),
-`mirror_rebuilt` (warn; `reason`, `rebuilds`, `old_inode`, `inode`).
+`mirror_rebuilt` (warn; `reason`, `rebuilds`, `old_inode`, `inode`). Single-flow
+cleanup (§7.4): `mirror_flow_origin_missing` (info; `domain_id`, `flow_id`,
+`peer`, `grace_s`), `mirror_flow_removed` (info; `domain_id`, `flow_id`,
+`path`, `reason`, `missing_s`), `mirror_flow_kept_reader` (warn; `refused`),
+`mirror_flow_would_remove` (info; dry run), `mirror_flow_remove_failed` (warn).
 
 ### 12.6 Exit codes (aligned with siblings)
 
@@ -837,6 +856,10 @@ Single machine, `tcp` provider over loopback, two simulated hosts:
 - `tests/integration/shutdown.sh`: start, `/readyz` after registration, SIGTERM,
   exit 143, the registry records DELETE, and only this agent's mirror directory
   is removed.
+- `tests/integration/flow_cleanup.sh` (as root, for the reader check): three
+  flows in one mirror domain, two origins end → dry run logs and keeps both →
+  the unread one is removed → the one a reader maps stays until the reader
+  exits → the live flow and the domain stay.
 
 ### 15.3 NMOS checks
 

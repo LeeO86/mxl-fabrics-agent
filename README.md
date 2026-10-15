@@ -82,9 +82,10 @@ The checked-in integration test is the single-machine demo: two MXL roots, two a
 
 ```bash
 LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/tcp_mesh.sh
+sudo env LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/flow_cleanup.sh
 ```
 
-It checks that the eager mirror exists before the receiver is activated, that grain indices match, that disabling the receiver releases the target after `RELEASE_GRACE_MS`, that stopping the source is reported as peer down, that replication resumes, that a flow id the source no longer has is `stale_reference`, that a 1080p50 flow with a 200 ms ring arrives at 50 grains/s, that a 2-channel 48 kHz flow written in 1 ms batches arrives at 48,000 samples/s, that a flow its writer creates again (new inode) replicates again, that a destination that goes away costs the source a few log lines, not one per pass, and that a writer that leaves indexes unwritten replicates every written grain with the gaps counted.
+It checks that the eager mirror exists before the receiver is activated, that grain indices match, that disabling the receiver releases the target after `RELEASE_GRACE_MS`, that stopping the source is reported as peer down, that replication resumes, that a flow id the source no longer has is `stale_reference`, that a 1080p50 flow with a 200 ms ring arrives at 50 grains/s, that a 2-channel 48 kHz flow written in 1 ms batches arrives at 48,000 samples/s, that a flow its writer creates again (new inode) replicates again, that a destination that goes away costs the source a few log lines, not one per pass, and that a writer that leaves indexes unwritten replicates every written grain with the gaps counted. `flow_cleanup.sh` ends two of three origin flows in one domain and checks the dry run, the removal of the flow nobody reads, that a mapped flow stays until its reader exits, and that the live flow and the domain stay (root, or the reader check is incomplete and it checks only the refusal).
 
 `docker/docker-compose.demo.yaml` is the same shape in containers, plus Prometheus and Grafana. `docker/docker-compose.host.yaml` is one host of a real mesh: host networking, `/dev/infiniband`, `IPC_LOCK`, unlimited memlock, and the MXL root mounted read-write.
 
@@ -137,8 +138,8 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | `MIRROR_INCLUDE_DOMAINS` / `MIRROR_INCLUDE_FLOWS` | empty | Extra allow lists. Empty means no extra filter |
 | `MIRROR_EXCLUDE_DOMAINS` / `MIRROR_EXCLUDE_FLOWS` | empty | Deny lists |
 | `MIRROR_GRACE_S` | 10 | Keep a mirror after the origin disappears |
-| `MIRROR_IDLE_GRACE_S` | 300 | Drop a mirror domain after this many seconds without demand (`0`: never) |
-| `MIRROR_CLEANUP_DRY_RUN` | false | Mirror cleanup only logs `mirror_domain_would_remove` |
+| `MIRROR_IDLE_GRACE_S` | 300 | Drop a mirror domain after this many seconds without demand, and a mirror flow after its origin flow has been gone this long (`0`: never) |
+| `MIRROR_CLEANUP_DRY_RUN` | false | Mirror cleanup only logs `mirror_domain_would_remove` and `mirror_flow_would_remove` |
 | `MIRROR_STALE_MS` | 2000 | A mirror flow without a new grain for this long while grains are due is `stale` (see Mirror health). `0`: never |
 | `TMPFS_RESERVE_MB` | 512 | Free space left on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | On shutdown, remove mirror domains this agent owns. Alias: `CLEANUP_MIRRORS_ON_EXIT`. With false the mirror flows stay, and readers on the host keep reading them after a restart |
@@ -230,6 +231,19 @@ Safety:
 
 Logs: `mirror_domain_removed` (domain, path, reason, flows), `mirror_domain_busy` (refused, with the reader pids), `mirror_domain_would_remove` (dry run). Metrics: `mxl_fabrics_agent_mirror_domains{state}`, `mxl_fabrics_agent_mirror_domains_removed_total{reason}` and `mxl_fabrics_agent_mirror_domains_refused_total{reason}`; `reason` is `same_node`, `orphan`, `idle` or `api`.
 
+### Single mirror flows (1.6.0)
+
+A mirror domain stays while one of its flows is in use, but a flow whose origin flow is gone (the function deleted it, or a new flow id replaced it) used to stay with it for good: health `idle`, reason `origin_missing`, its last grain days old. The agent now removes such a flow (`<flow id>.mxl-flow` in the mirror domain) on its own:
+
+- Its origin is missing: the domain's source peer is up and no up peer offers the flow. A source peer that is down may still hold it, so its flows wait, as whole domains do.
+- It has been missing for `MIRROR_IDLE_GRACE_S` (the domain setting, default 300 s, `0` never). The clock starts again when the flow is offered again or its source goes down, and after an agent restart.
+- Nothing goes in the first 30 s after start or, with NMOS, while the registry does not answer.
+- The reader check is the one for whole domains, per flow: the files of that flow directory, matched by device and inode in `/proc/<pid>/maps` of every other process. A flow that another process maps stays (`mirror_flow_kept_reader` with the pids), the domain's other flows do not matter. It runs again after the agent released its own writer of the flow, right before the files go. When the agent cannot see every process, nothing is removed.
+- Same ownership rules: only flows in `mirror-<domain id>` directories with this agent's marker. Origin domains and other agents' mirrors are never touched.
+- `MIRROR_CLEANUP_DRY_RUN=true` logs `mirror_flow_would_remove` and removes nothing.
+
+The removed flow is `absent` in the mirror health with reason `origin_missing` and leaves `mirror_state`; should the origin come back, the new mirror counts as a rebuild with that reason. Logs: `mirror_flow_origin_missing` (once, when the grace time starts), `mirror_flow_removed` (`domain_id`, `flow_id`, `path`, `reason`, `missing_s`), `mirror_flow_kept_reader` (`refused`: the reader pids or why the check is incomplete; once per change), `mirror_flow_would_remove`. Metrics: `mxl_fabrics_agent_mirror_flows_removed_total{reason}` (`origin_missing`; also the per-flow removals of an offered flow: `origin_gone`, `no_demand`, `excluded`) and `mxl_fabrics_agent_mirror_flows_refused_total{reason}`.
+
 `GET /api/v1/mirrors` lists one entry per mirror domain: `domain_id`, `path`, `origin` (`host_id`, `peer_up`, `on_peer`, `local`), `state`, `on_disk`, `demand`, `idle_since` (Unix seconds, `null` with demand), `age_s` (since its `domain_def.json` was written), `readers` (`pid`, `comm`), `readers_known`, and `flows` (`flow_id`, `media_type`, `format`, `active`, the per-flow mirror `state`). `DELETE /api/v1/mirrors/{domain_id}` removes one with the same checks: 404 when this agent has no such mirror, 409 with `readers` or `error` while it is mapped or the readers are unknown, 200 with `removed: true` otherwise. A mirror that is still wanted (`eager`, demand) comes back on the next tick.
 
 This agent has no IS-05 senders or receivers. It does not accept connection patches. It only reads other nodes' active connections.
@@ -250,9 +264,9 @@ Each reconcile pass (about every 200 ms) gives every mirror flow one state:
 
 "Grains are due" means a replication of the flow is wanted (a receiver on this host, or a held replication) and the origin is live in the source's inventory. While the source peer or its fabric link is down they stay due as long as the receiver does. The age of the newest grain is the mirror's head index against the current TAI index at the flow's rate, so it includes the replication lag. A source's `/api/v1/inventory` now carries each flow's `head_index`; the destination uses it to tell a mirror that misses grains (`stale`) from an origin that writes none (`idle`, `origin_silent`: a writer without input signal). With an older source the origin's `live` flag stands in, so a source that stops writing can show `stale` for up to about 5 s plus `PEER_POLL_INTERVAL_MS`. Detection takes up to `MIRROR_STALE_MS` or one peer poll, whichever is longer.
 
-`reason`: `no_new_grains`, `no_first_grain`, `peer_down`, `link_down` (stale); `no_demand`, `origin_inactive`, `origin_not_live`, `origin_missing`, `origin_silent`, `peer_down` (idle); the removal reason (absent).
+`reason`: `no_new_grains`, `no_first_grain`, `peer_down`, `link_down` (stale); `no_demand`, `origin_inactive`, `origin_not_live`, `origin_missing`, `origin_silent`, `peer_down` (idle); the removal reason (absent), e.g. `origin_missing` after the single-flow cleanup.
 
-A mirror is **rebuilt** when its data file is a new one: another inode, or the file back after it was gone. MXL readers keep the file they opened, so a reader of the old one sees no new grain again (the MXL inode quirk). The rebuild reason is why the agent removed it: `origin_gone` (origin inactive longer than `MIRROR_GRACE_S`), `no_demand`, `excluded`, `mirror_domain_idle`, `mirror_domain_orphan`, `mirror_domain_same_node`, `mirror_domain_api`, or `replaced` when something else removed or replaced it. Counts and times are kept in memory for 24 h after a mirror was last seen; an agent restart starts them again. Link loss and an origin writer that re-creates its flow do not rebuild the mirror: the destination keeps its target and mirror flow, which then goes `stale` and back to `live`.
+A mirror is **rebuilt** when its data file is a new one: another inode, or the file back after it was gone. MXL readers keep the file they opened, so a reader of the old one sees no new grain again (the MXL inode quirk). The rebuild reason is why the agent removed it: `origin_gone` (origin inactive longer than `MIRROR_GRACE_S`), `origin_missing` (origin flow gone for `MIRROR_IDLE_GRACE_S`), `no_demand`, `excluded`, `mirror_domain_idle`, `mirror_domain_orphan`, `mirror_domain_same_node`, `mirror_domain_api`, or `replaced` when something else removed or replaced it. Counts and times are kept in memory for 24 h after a mirror was last seen; an agent restart starts them again. Link loss and an origin writer that re-creates its flow do not rebuild the mirror: the destination keeps its target and mirror flow, which then goes `stale` and back to `live`.
 
 `GET /api/v1/mirrors` has `health` on each flow: `state`, `reason`, `last_grain_age_ms` (`null` before the first grain), `stale_since` (Unix seconds or `null`), `stale_after_ms`, `rebuilds`, `last_rebuild` (Unix seconds or `null`), `last_rebuild_reason`.
 

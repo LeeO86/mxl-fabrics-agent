@@ -532,10 +532,12 @@ void Controller::tick()
         }
         if (plan.remove && exists)
         {
-            mirrorHealth_.noteRemoved(key, !input.included ? "excluded" : !remote.flow->active ? "origin_gone" : "no_demand");
+            auto const reason = !input.included ? "excluded" : !remote.flow->active ? "origin_gone" : "no_demand";
+            mirrorHealth_.noteRemoved(key, reason);
             engine_.releaseWriter(path, remote.flow->flow_id);
             std::error_code ec;
             fs::remove_all(fs::path(path) / (remote.flow->flow_id + ".mxl-flow"), ec);
+            metrics_.addCounter("mirror_flows_removed_total", 1, {{"reason", reason}});
             log::info("mirror_removed", {{"flow_id", remote.flow->flow_id}, {"domain_id", remote.domain->domain_id}});
         }
         if (plan.create)
@@ -635,6 +637,8 @@ void Controller::tick()
     // once the peers are known: 30 s after start and, with NMOS, while the registry answers.
     bool const truthOk = now - started_ >= std::chrono::seconds(30) && (!cfg.nmos_enable || nmos.registry_up);
     auto domainViews = cleanupMirrors(cfg, inventory, peerSnap, truthOk, localIds, peerDomains, wantedDomains, mirrorViews);
+    // Then single flows whose origin is gone in the domains that stay; the health below shows them absent.
+    cleanupMirrorFlows(cfg, inventory, peerSnap, truthOk, seen);
     observeMirrors(cfg, inventory, peerSnap, std::move(remoteObservations), seen);
     {
         std::lock_guard const lock{mu_};
@@ -846,6 +850,172 @@ std::string Controller::removeMirrorDomain(std::string const& domainId, std::str
     }
     log::info("mirror_domain_removed", {{"domain_id", domainId}, {"path", path}, {"reason", reason}, {"flows", removed}});
     return {};
+}
+
+void Controller::cleanupMirrorFlows(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
+    bool truthOk, std::set<std::string> const& seen)
+{
+    auto const now = std::chrono::steady_clock::now();
+    struct Candidate
+    {
+        std::string key;
+        std::string domain_id;
+        std::string flow_id;
+        std::string domain_path;
+        std::string flow_path;
+        std::string reason;
+        std::int64_t missing_s = 0;
+    };
+    std::vector<Candidate> candidates;
+    std::set<std::string> missing;
+    for (auto const& domain : inventory.domains)
+    {
+        // Only our own mirror directories, as for whole domains: never an origin or another agent's mirror.
+        if (domain.kind != "mirror" || fs::path(domain.path).filename().string() != "mirror-" + domain.domain_id)
+        {
+            continue;
+        }
+        bool sourceUp = false;
+        for (auto const& peer : peerSnap)
+        {
+            if (peer.host_id == domain.source_host_id)
+            {
+                sourceUp = peer.up;
+            }
+        }
+        for (auto const& flow : domain.flows)
+        {
+            auto const key = domain.domain_id + "/" + flow.flow_id;
+            MirrorFlowInput input;
+            input.offered = seen.count(key) != 0;
+            input.source_up = sourceUp;
+            input.peers_known = truthOk;
+            std::chrono::steady_clock::time_point since = now;
+            if (!input.offered && input.source_up)
+            {
+                since = flowMissingSince_.try_emplace(key, now).first->second;
+                input.grace_expired = cfg.mirror_idle_grace_s > 0 && now - since >= std::chrono::seconds(cfg.mirror_idle_grace_s);
+            }
+            auto const plan = planMirrorFlow(input);
+            if (!plan.missing)
+            {
+                continue;
+            }
+            missing.insert(key);
+            auto const flowPath = (fs::path(domain.path) / (flow.flow_id + ".mxl-flow")).string();
+            if (flowLogged_.count(key) == 0)
+            {
+                log::info("mirror_flow_origin_missing", {{"domain_id", domain.domain_id}, {"flow_id", flow.flow_id},
+                    {"peer", domain.source_host_id}, {"grace_s", std::to_string(cfg.mirror_idle_grace_s)}});
+                flowLogged_[key] = "missing";
+            }
+            // The scanner's snapshot may still list a flow that is gone meanwhile.
+            if (plan.remove && fs::is_directory(flowPath))
+            {
+                candidates.push_back(Candidate{key, domain.domain_id, flow.flow_id, domain.path, flowPath, plan.reason,
+                    std::chrono::duration_cast<std::chrono::seconds>(now - since).count()});
+            }
+        }
+    }
+    // A flow offered again (or whose source went down) starts a new grace time when its origin goes missing.
+    for (auto it = flowMissingSince_.begin(); it != flowMissingSince_.end();)
+    {
+        it = missing.count(it->first) == 0 ? flowMissingSince_.erase(it) : std::next(it);
+    }
+    for (auto it = flowLogged_.begin(); it != flowLogged_.end();)
+    {
+        it = missing.count(it->first) == 0 ? flowLogged_.erase(it) : std::next(it);
+    }
+    // Removal candidates: check the readers (at most every 2 s), then remove what no other process maps.
+    if (candidates.empty() || now < nextFlowReaderScan_)
+    {
+        return;
+    }
+    nextFlowReaderScan_ = now + std::chrono::seconds(2);
+    if (cfg.mirror_cleanup_dry_run)
+    {
+        for (auto const& c : candidates)
+        {
+            if (flowLogged_[c.key] != "dry_run")
+            {
+                log::info("mirror_flow_would_remove", {{"domain_id", c.domain_id}, {"flow_id", c.flow_id}, {"path", c.flow_path},
+                    {"reason", c.reason}, {"missing_s", std::to_string(c.missing_s)}});
+                flowLogged_[c.key] = "dry_run";
+            }
+        }
+        return;
+    }
+    // Per flow: the files of one flow directory, matched by device and inode in /proc/<pid>/maps of every
+    // other process (one pass for all candidates). A flow some process maps stays.
+    auto const scanFlows = [](std::vector<Candidate const*> const& flows) {
+        std::map<FileKey, std::string> files;
+        for (auto const* c : flows)
+        {
+            collectFiles(c->flow_path, c->flow_path, files);
+        }
+        return scanReaders(files, "/proc", static_cast<int>(::getpid()));
+    };
+    auto const keep = [&](Candidate const& c, std::string const& refused) {
+        if (flowLogged_[c.key] != "refused:" + refused)
+        {
+            log::warn("mirror_flow_kept_reader", {{"domain_id", c.domain_id}, {"flow_id", c.flow_id}, {"path", c.flow_path},
+                {"reason", c.reason}, {"refused", refused}});
+            metrics_.addCounter("mirror_flows_refused_total", 1, {{"reason", c.reason}});
+            flowLogged_[c.key] = "refused:" + refused;
+        }
+    };
+    std::vector<Candidate const*> all;
+    for (auto const& c : candidates)
+    {
+        all.push_back(&c);
+    }
+    std::vector<Candidate const*> free;
+    auto scan = scanFlows(all);
+    for (auto const* c : all)
+    {
+        std::vector<ReaderProcess> readers;
+        if (auto const refused = removalBlocker(scan, c->flow_path, &readers); !refused.empty())
+        {
+            keep(*c, refused);
+        }
+        else
+        {
+            free.push_back(c);
+        }
+    }
+    if (free.empty())
+    {
+        return;
+    }
+    // The agent's own writer first (a target went with the pull), then a last reader check right before the
+    // files go.
+    for (auto const* c : free)
+    {
+        engine_.releaseWriter(c->domain_path, c->flow_id);
+    }
+    scan = scanFlows(free);
+    for (auto const* c : free)
+    {
+        std::vector<ReaderProcess> readers;
+        if (auto const refused = removalBlocker(scan, c->flow_path, &readers); !refused.empty())
+        {
+            keep(*c, refused);
+            continue;
+        }
+        std::error_code ec;
+        fs::remove_all(c->flow_path, ec);
+        if (ec)
+        {
+            log::warn("mirror_flow_remove_failed", {{"domain_id", c->domain_id}, {"flow_id", c->flow_id}, {"path", c->flow_path},
+                {"error", ec.message()}});
+            continue;
+        }
+        mirrorHealth_.noteRemoved(c->key, c->reason);
+        metrics_.addCounter("mirror_flows_removed_total", 1, {{"reason", c->reason}});
+        log::info("mirror_flow_removed", {{"domain_id", c->domain_id}, {"flow_id", c->flow_id}, {"path", c->flow_path},
+            {"reason", c->reason}, {"missing_s", std::to_string(c->missing_s)}});
+        flowLogged_[c->key] = "removed"; // forgotten once the scanner no longer lists it
+    }
 }
 
 void Controller::observeMirrors(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,

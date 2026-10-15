@@ -122,6 +122,84 @@ TEST_CASE("mirror domain: a reader refuses the removal")
     CHECK(removalBlocker(scan, "/mxl/mirror-d2", &readers) == "reader check incomplete: pid namespace");
 }
 
+TEST_CASE("mirror flow: offered flows are left to the per-flow plan")
+{
+    MirrorFlowInput in;
+    in.offered = true;
+    in.source_up = true;
+    in.peers_known = true;
+    in.grace_expired = true;
+    auto const plan = planMirrorFlow(in);
+    CHECK_FALSE(plan.missing);
+    CHECK_FALSE(plan.remove);
+}
+
+TEST_CASE("mirror flow: a source peer that is down may still hold the origin")
+{
+    MirrorFlowInput in;
+    in.peers_known = true;
+    in.grace_expired = true;
+    auto const plan = planMirrorFlow(in);
+    CHECK_FALSE(plan.missing);
+    CHECK_FALSE(plan.remove);
+}
+
+TEST_CASE("mirror flow: origin missing is kept for the grace time, then removed")
+{
+    MirrorFlowInput in;
+    in.source_up = true;
+    in.peers_known = true;
+    auto plan = planMirrorFlow(in);
+    CHECK(plan.missing);
+    CHECK_FALSE(plan.remove);
+    in.grace_expired = true;
+    plan = planMirrorFlow(in);
+    CHECK(plan.missing);
+    CHECK(plan.remove);
+    CHECK(plan.reason == "origin_missing");
+}
+
+TEST_CASE("mirror flow: nothing goes before the peers are known")
+{
+    MirrorFlowInput in;
+    in.source_up = true;
+    in.grace_expired = true;
+    auto const plan = planMirrorFlow(in);
+    CHECK(plan.missing); // the grace time runs meanwhile
+    CHECK_FALSE(plan.remove);
+}
+
+TEST_CASE("reader scan per flow: a reader of one flow keeps only that flow")
+{
+    auto const root = tempDir("mfa-flow-readers");
+    auto const mirror = root / "mxl" / "mirror-d1";
+    auto const busy = mirror / "f1.mxl-flow";
+    auto const stale = mirror / "f2.mxl-flow";
+    write(busy / "data", "x");
+    write(busy / "grains" / "0", "g");
+    write(stale / "data", "y");
+    write(stale / "grains" / "0", "h");
+    write(mirror / "domain_def.json", "{}");
+    std::map<FileKey, std::string> files;
+    collectFiles(busy.string(), busy.string(), files);
+    collectFiles(stale.string(), stale.string(), files);
+    CHECK(files.size() == 4);
+
+    auto const proc = root / "proc";
+    write(proc / "self" / "status", "NSpid:\t100\n");
+    write(proc / "100" / "maps", mapsLine(stale / "data")); // the agent's own writer
+    write(proc / "300" / "maps", mapsLine(busy / "grains" / "0"));
+    write(proc / "300" / "comm", "player\n");
+    auto const scan = scanReaders(files, proc.string(), 100);
+    CHECK(scan.complete);
+    std::vector<ReaderProcess> readers;
+    CHECK(removalBlocker(scan, busy.string(), &readers) == "mapped by 300(player)");
+    readers.clear();
+    CHECK(removalBlocker(scan, stale.string(), &readers).empty());
+    CHECK(readers.empty());
+    fs::remove_all(root);
+}
+
 TEST_CASE("mirror cleanup settings")
 {
     auto cfg = parseConfig({});

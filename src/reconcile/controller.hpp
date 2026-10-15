@@ -66,6 +66,10 @@ private:
     // Returns "" when removed, else why not (with the readers).
     std::string removeMirrorDomain(std::string const& domainId, std::string const& path, std::string const& reason,
         std::vector<ReaderProcess>* readers);
+    // Mirror flows whose origin flow is gone, in mirror domains that stay (other flows still in use): removed
+    // after MIRROR_IDLE_GRACE_S when no other process maps one of their files.
+    void cleanupMirrorFlows(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
+        bool truthOk, std::set<std::string> const& seen);
 
     std::shared_ptr<ConfigStore> store_;
     std::string bootId_;
@@ -95,6 +99,9 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> mirrorIdleSince_; // per mirror domain without demand
     std::map<std::string, std::string> mirrorLogged_; // per mirror domain, the last logged cleanup decision
     std::vector<MirrorDomainView> mirrorDomains_;     // from the last tick (mu_)
+    std::map<std::string, std::chrono::steady_clock::time_point> flowMissingSince_; // per "domain/flow" without its origin
+    std::map<std::string, std::string> flowLogged_; // per "domain/flow", the last logged flow cleanup decision
+    std::chrono::steady_clock::time_point nextFlowReaderScan_{};
     std::map<std::string, FabricLink> links_;  // per peer, from the last tick (mu_)
     std::map<std::string, std::string> linkErrors_; // per peer, the last logged link error ("" = up)
     struct OriginConflict

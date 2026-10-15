@@ -21,6 +21,7 @@ cmake --build build
 ./build/unit-tests
 LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/tcp_mesh.sh
 LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/shutdown.sh
+sudo env LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp tests/integration/flow_cleanup.sh # reader check: root
 ```
 
 `MXL_ROOT` (alias of `MXL_DOMAIN_SCAN_PATH`) must exist or the process exits 78. For a loopback run, a directory on `/dev/shm` is enough. SIGTERM exits 143. A port that cannot be bound exits 75. Invalid configuration exits 78.
