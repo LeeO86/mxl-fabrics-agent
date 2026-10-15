@@ -889,6 +889,27 @@ private:
         log::info("origin_reopened", {{"replication_id", key}, {"flow_id", slot.flowId}});
     }
 
+    // The initiator twin of closeFailedTarget. In MXL 218ddaa an RC initiator endpoint whose activation throws
+    // (fi_ep_bind or fi_connect fails) keeps a moved-from Idle state, and the next MakeProgress calls
+    // fi_ep_bind on a null endpoint (SIGSEGV, docs/upstream-rctarget-accept-crash.md). The initiator is
+    // destroyed at once and its targets forgotten, as after a shut-down connection: the destination's next
+    // request adds its target again, and checkOrigin opens a new initiator for it.
+    void closeFailedInitiator(std::string const& key, InitiatorSlot& slot, std::string const& error)
+    {
+        log::warn("fabric_initiator_closed", {{"replication_id", key}, {"flow_id", slot.flowId}, {"provider", slot.provider}, {"error", error}});
+        closeInitiator(slot);
+        for (auto& [_, info] : slot.targets)
+        {
+            mxlFabricsFreeTargetInfo(info);
+        }
+        slot.targets.clear();
+        slot.targetTexts.clear();
+        updateEntryBytes(slot);
+        slot.errors += 1;
+        slot.lastError = error + " (initiator closed)";
+        slot.state = "error";
+    }
+
     void pumpInitiator(std::string const& key, InitiatorSlot& slot)
     {
         if (slot.targets.empty())
@@ -942,9 +963,7 @@ private:
         }
         if (progress != MXL_STATUS_OK)
         {
-            slot.errors += 1;
-            slot.lastError = "progress " + statusText(progress);
-            slot.state = "error";
+            closeFailedInitiator(key, slot, "progress " + statusText(progress));
             return;
         }
         slot.connected = true;

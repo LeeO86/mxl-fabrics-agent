@@ -186,9 +186,11 @@ TEST_CASE("mirror flow: not missing before every up peer's inventory is settled"
     CHECK_FALSE(plan.missing);
     CHECK_FALSE(plan.remove);
     CHECK(unofferedMirrorReason(true, false) == "inventory_pending");
+    CHECK(plan.pending);
     in.inventories_settled = true;
     plan = planMirrorFlow(in);
     CHECK(plan.missing);
+    CHECK_FALSE(plan.pending);
     CHECK(plan.remove);
     CHECK(unofferedMirrorReason(true, true) == "origin_missing");
     CHECK(unofferedMirrorReason(false, false) == "peer_down");
@@ -369,3 +371,86 @@ TEST_CASE("reader scan: finds other processes, skips the agent")
     CHECK_FALSE(scan.complete);
     fs::remove_all(root);
 }
+
+namespace
+{
+PeerSnapshot peerAt(std::string const& host, bool up, std::uint32_t polls, std::uint64_t revision = 3)
+{
+    PeerSnapshot peer;
+    peer.host_id = host;
+    peer.up = up;
+    peer.polls = polls;
+    peer.inventory.revision = revision;
+    return peer;
+}
+} // namespace
+
+TEST_CASE("settle tracker: per peer, pending only while it settles, a flapping peer counts as down after the limit")
+{
+    using namespace std::chrono_literals;
+    auto const t0 = std::chrono::steady_clock::time_point{} + 1h;
+    auto const limit = 60s;
+    InventorySettleTracker tracker;
+
+    // node-b settled, node-c just restarted (first poll of its new process).
+    tracker.update({peerAt("node-b", true, 5), peerAt("node-c", true, 1)}, t0, limit);
+    CHECK(tracker.view("node-b") == InventoryView::Settled);
+    CHECK(tracker.view("node-c") == InventoryView::Pending);
+    CHECK(tracker.view("node-x") == InventoryView::Down); // unknown
+    CHECK(tracker.anyPending());
+    // A domain from node-b that only node-b lists is decided; one that node-c lists too waits.
+    CHECK(tracker.settledFor("node-b", {"node-b"}));
+    CHECK(tracker.settledFor("node-b", {}));
+    CHECK_FALSE(tracker.settledFor("node-b", {"node-b", "node-c"}));
+    CHECK_FALSE(tracker.settledFor("node-c", {}));
+
+    // One poll later node-c is settled.
+    tracker.update({peerAt("node-b", true, 6), peerAt("node-c", true, 2)}, t0 + 2s, limit);
+    CHECK(tracker.view("node-c") == InventoryView::Settled);
+    CHECK_FALSE(tracker.anyPending());
+
+    // node-c flaps: down every other poll, or a new boot id every poll (polls stays 1). Passes while it is
+    // down do not reset the wait; after the limit it counts as down and holds nothing back.
+    auto t = t0 + 4s;
+    for (int i = 0; i < 40; ++i, t += 2s)
+    {
+        bool const up = i % 2 == 0;
+        tracker.update({peerAt("node-b", true, 7), peerAt("node-c", up, up ? 1 : 0)}, t, limit);
+        if (up)
+        {
+            CHECK(tracker.view("node-c") == (t - (t0 + 4s) < limit ? InventoryView::Pending : InventoryView::Down));
+        }
+        else
+        {
+            CHECK(tracker.view("node-c") == InventoryView::Down);
+        }
+    }
+    CHECK(tracker.view("node-c") != InventoryView::Pending);
+    CHECK(tracker.settledFor("node-b", {"node-b", "node-c"}));
+    CHECK_FALSE(tracker.anyPending());
+
+    // Once it settles, the wait starts from scratch the next time.
+    tracker.update({peerAt("node-b", true, 8), peerAt("node-c", true, 2)}, t, limit);
+    CHECK(tracker.view("node-c") == InventoryView::Settled);
+    tracker.update({peerAt("node-b", true, 9), peerAt("node-c", true, 1)}, t + 2s, limit);
+    CHECK(tracker.view("node-c") == InventoryView::Pending);
+
+    // An inventory before the first scan is never settled.
+    tracker.update({peerAt("node-d", true, 4, 0)}, t + 4s, limit);
+    CHECK(tracker.view("node-d") == InventoryView::Pending);
+}
+
+TEST_CASE("missing clock: pauses while pending, keeps its start, does not count the paused time")
+{
+    using namespace std::chrono_literals;
+    auto const t0 = std::chrono::steady_clock::time_point{} + 1h;
+    MissingClock clock{t0, std::nullopt};
+    CHECK(stepMissingClock(clock, false, t0 + 100s) == 100s);
+    // An unrelated peer or the source restarts: pending for 10 s. The clock stays at 100 s.
+    CHECK(stepMissingClock(clock, true, t0 + 101s) == 101s);
+    CHECK(stepMissingClock(clock, true, t0 + 111s) == 101s);
+    // Settled again: it goes on from where it stopped.
+    CHECK(stepMissingClock(clock, false, t0 + 111s) == 101s);
+    CHECK(stepMissingClock(clock, false, t0 + 310s) == 300s);
+}
+

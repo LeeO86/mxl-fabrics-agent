@@ -61,7 +61,7 @@ private:
         std::vector<std::pair<FlowRecord, std::string>> flows; // with the per-flow mirror state
     };
     std::vector<MirrorDomainView> cleanupMirrors(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
-        bool truthOk, bool inventoriesSettled, std::set<std::string> const& localIds, std::set<std::string> const& peerDomains,
+        bool truthOk, std::set<std::string> const& localIds, std::set<std::string> const& peerDomains,
         std::set<std::string> const& wanted, std::vector<DomainRecord> const& flowViews);
     // Closes the agent's writers of a mirror domain and removes it when no other process maps it.
     // Returns "" when removed, else why not (with the readers).
@@ -70,7 +70,7 @@ private:
     // Mirror flows whose origin flow is gone, in mirror domains that stay (other flows still in use): removed
     // after MIRROR_IDLE_GRACE_S when no other process maps one of their files.
     void cleanupMirrorFlows(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
-        bool truthOk, bool inventoriesSettled, std::set<std::string> const& seen);
+        bool truthOk, std::set<std::string> const& seen);
     // Tears one mirror flow down for a rebuild (under tickMu_): its targets and the sources' connections, the
     // agent's writer and its files. The next file of the flow is a rebuild for `reason`. Readers that still
     // hold the old file get MXL_ERR_FLOW_INVALID once no new grain comes, and open the new one.
@@ -105,7 +105,13 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> mirrorIdleSince_; // per mirror domain without demand
     std::map<std::string, std::string> mirrorLogged_; // per mirror domain, the last logged cleanup decision
     std::vector<MirrorDomainView> mirrorDomains_;     // from the last tick (mu_)
-    std::map<std::string, std::chrono::steady_clock::time_point> flowMissingSince_; // per "domain/flow" without its origin
+    std::map<std::string, MissingClock> flowMissingSince_; // per "domain/flow" without its origin
+    // Which peers' inventories may decide about flows and domains they do not list (1.7.1), and the up peers
+    // that list each domain, both from the current pass.
+    InventorySettleTracker settle_;
+    std::map<std::string, std::set<std::string>> domainHolders_;
+    // The source peer of a mirror domain counts as up for the clean-up and health decisions.
+    bool sourceCounts(std::string const& sourceHost) const;
     std::map<std::string, std::string> flowLogged_; // per "domain/flow", the last logged flow cleanup decision
     // Per "domain/flow", when the mirror was last rebuilt for a changed origin definition (at most one per 5 s;
     // entries older than that are dropped every pass).
@@ -123,7 +129,7 @@ private:
     // Stale and rebuilt destination mirror flows. The tracker is used under tickMu_, its copy for the API
     // and the metrics under mu_.
     void observeMirrors(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
-        std::vector<MirrorObservation> observations, std::set<std::string> const& seen, bool inventoriesSettled);
+        std::vector<MirrorObservation> observations, std::set<std::string> const& seen);
     void reportMirrorEvents(std::vector<MirrorEvent> const& events, int staleMs);
     MirrorHealthTracker mirrorHealth_;
     std::map<std::string, MirrorHealth> mirrorHealthView_;

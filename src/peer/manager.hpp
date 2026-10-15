@@ -3,8 +3,11 @@
 #include "config/config.hpp"
 #include "inventory/model.hpp"
 
+#include <chrono>
 #include <functional>
+#include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -38,6 +41,33 @@ std::uint32_t nextPollCount(PeerSnapshot const* previous, PeerSnapshot const& no
 // peer has been up for one full poll (read on two polls in a row of the same process). Until then a flow
 // that the inventory does not list is not missing (1.7.1).
 bool inventorySettled(PeerSnapshot const& peer);
+
+// What a peer's inventory may decide about flows and domains it does not list (origin_missing, orphans).
+enum class InventoryView
+{
+    Down,    // down, unknown, or up but not settled for longer than the limit (a flapping peer): as if down
+    Pending, // up, inventory not settled yet: wait, keep clocks paused
+    Settled, // up and settled: what it does not list, it does not hold
+};
+
+// Per peer, on every reconcile pass. A peer that is up but not settled is Pending until it has been
+// unsettled for `limit` (counted from the first such pass; passes while it is down do not reset it, only a
+// settled one does), then Down: a peer that fails every other poll or restarts on every poll does not hold
+// decisions back for good.
+class InventorySettleTracker
+{
+public:
+    void update(std::vector<PeerSnapshot> const& peers, std::chrono::steady_clock::time_point now, std::chrono::steady_clock::duration limit);
+    InventoryView view(std::string const& hostId) const;
+    bool anyPending() const;
+    // The inventories that decide about a mirror domain: its source peer is settled and no up peer that lists
+    // the domain (`holders`) is pending.
+    bool settledFor(std::string const& sourceHost, std::set<std::string> const& holders) const;
+
+private:
+    std::map<std::string, InventoryView> views_;
+    std::map<std::string, std::chrono::steady_clock::time_point> unsettledSince_;
+};
 
 class PeerManager
 {

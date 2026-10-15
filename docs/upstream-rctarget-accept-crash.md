@@ -52,8 +52,48 @@ throws something other than an interrupt, `_state` keeps a moved-from `Connected
 (`Endpoint.cpp:224-236`) then dereferences them. The `WaitForConnection` branch fails the same way when
 `_proto->start()` (line 142) throws.
 
-`RCInitiator.cpp` uses the same `_state = std::visit(..., std::move(_state))` pattern (lines 64-91, 105-134)
-and should be checked too.
+### Not covered by a status: an exception that maps to NOT_READY or INTERRUPTED
+
+`try_run` (`fabrics.cpp:71-95`) turns a `FabricException` into its status, and `-FI_EAGAIN` becomes
+`MXL_ERR_NOT_READY` and `-FI_EINTR` becomes `MXL_ERR_INTERRUPTED` (`Exception.cpp:45-46`). A caller cannot
+tell such a failure from "no data yet":
+
+- `WaitForConnection` (line 139-142): `state.ep` is moved into `connected` and then `_proto->start(connected.ep)`
+  posts a receive on `verbs` (`ProtocolIngressRMA.cpp:39-45`, `fi_recv`). If that throws `-FI_EINTR`, line 154
+  returns `WaitForConnection{.ep = std::move(state.ep)}`, an endpoint that was already moved: the state is
+  broken although nothing was rethrown. `-FI_EAGAIN` rethrows and leaves a moved-from state, but reports
+  NOT_READY.
+- `Connected` (line 173): `_proto->read` posts the next receive (`ProtocolIngressRMA.cpp:57`, `:147`).
+  `-FI_EAGAIN` there leaves a moved-from `Connected` and reports NOT_READY.
+
+The agent cannot catch these: a target that answers NOT_READY forever is also a target waiting for its
+connection. They need `fi_recv` to fail with EAGAIN or EINTR right after a connection, with a receive queue
+that holds at most one posted receive, so they are unlikely. The fix below covers them as well.
+
+## The same bug in the initiator
+
+`RCInitiator.cpp`, `RCInitiatorEndpoint::activate` (lines 103-135), uses the same
+`_state = std::visit(..., std::move(_state))` with an `Idle state` taken by value:
+
+1. Line 120 `state.ep.bind(eq)`, line 121 `bind(cq)` and line 126 `state.ep.connect(...)` (`fi_connect`)
+   can throw. For example, `tcp` refuses a connection at once (ECONNREFUSED from `connect`), or a socket
+   cannot be created.
+2. Nothing catches the exception in `activate`. It goes through `RCInitiator::activateIdleEndpoints` (line 386)
+   and `makeProgress` to `try_run`, and `mxlFabricsInitiatorMakeProgressNonBlocking` returns the status
+   ("Failed to make progress in the initiator: Failed to connect endpoint: Connection refused, code -111").
+3. `_state` keeps the moved-from `Idle`: its `Endpoint` has `_raw == nullptr`, and `idleSince` is unchanged,
+   so the 5 s idle wait has already passed.
+4. On the next `MakeProgress`, `activate` reaches line 120 again: `fi_ep_bind` on a null `fid_ep`, which is a
+   SIGSEGV.
+
+`consume(Event)` (lines 137-202) has the same exposure when `restart()` (line 269, `Endpoint::create`) throws.
+`shutdown()` (lines 62-92) has it when `state.ep.shutdown()` throws.
+
+Reproduced in the agent: `tests/integration/accept_fail.sh` preloads the fault library on the source with
+`MFA_FAULT_CONNECT_PORTS`, so its first `connect()` to the destination's ports fails with ECONNREFUSED. Agent
+1.7.0 dies with SIGSEGV on the next pass, right after the "Failed to make progress in the initiator" line.
+1.7.1 closes the initiator (`fabric_initiator_closed`) and opens a new one for the destination's next
+request.
 
 Destroying a target in that state is safe: the moved-from objects have `_raw == nullptr`, and their
 destructors do not call `fi_close`.
@@ -92,7 +132,8 @@ with SIGSEGV on the next pass. 1.7.1 closes the target and carries on.
 
 ## Suggested fix
 
-Keep `_state` valid when a branch throws:
+Keep `_state` valid when a branch throws, in `RCTarget::readNext` and in `RCInitiatorEndpoint`
+(`activate`, `consume`, `shutdown`):
 
 - take the state by reference and move out of it only on the path that returns a new state, or
 - catch everything in each branch, put the state back (`return WaitForConnectionRequest{std::move(state.pep)}`
@@ -124,6 +165,12 @@ like the capabilities.
 Either way, a failed accept of one stale request must not take the process down.
 
 ## What the agent does (1.7.1)
+
+`src/fabric/domain.cpp` `closeFailedInitiator`: when `MakeProgress` fails with any status other than OK,
+NOT_READY or INTERRUPTED, the agent destroys the initiator and forgets its targets (log
+`fabric_initiator_closed`). The destination's next request adds its target again, and a new initiator is opened
+for it.
+
 
 `src/fabric/domain.cpp` `closeFailedTarget`: the first read that fails (not `MXL_ERR_NOT_READY` or
 `MXL_ERR_INTERRUPTED`) is the last call into that target. The agent destroys it at once (log

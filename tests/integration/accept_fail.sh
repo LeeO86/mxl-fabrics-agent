@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A destination whose target fails to accept a connection, then both agents restarted together.
 #
-# 1. Accept failure (production, verbs: rdma_create_qp EINVAL ~1 s after a restart, then SIGSEGV). B runs
+# 1. Connect failure on the source (the same MXL bug in the RC initiator) and accept failure (production, verbs: rdma_create_qp EINVAL ~1 s after a restart, then SIGSEGV). B runs
 #    with tests/tools/accept_fault.cpp preloaded: the queues of the first connection its target accepts
 #    cannot be opened, so the target's read fails. With MXL 218ddaa the next read of that target crashes
 #    (docs/upstream-rctarget-accept-crash.md). B has to close the target, set up a new one and replicate.
@@ -90,9 +90,11 @@ common=(
   LOG_LEVEL=info
 )
 
-start_a() {
-  env "${common[@]}" TMPDIR="$BASE/tmp-a" HOST_ID=node-a MXL_ROOT="$A" WEB_PORT=$WEB_A NMOS_PORT=18272 FABRIC_PORT_BASE=23810 PEERS="$PEERS_A" \
-    "$BIN" >>"$BASE/a$1.log" 2>&1 &
+start_a() { # run, extra env...
+  local run=$1
+  shift
+  env "${common[@]}" "$@" TMPDIR="$BASE/tmp-a" HOST_ID=node-a MXL_ROOT="$A" WEB_PORT=$WEB_A NMOS_PORT=18272 FABRIC_PORT_BASE=23810 PEERS="$PEERS_A" \
+    "$BIN" >>"$BASE/a$run.log" 2>&1 &
   APID=$!
 }
 start_b() { # run, extra env...
@@ -140,12 +142,13 @@ mirror_moves() { # the mirror's head moves within 10 s
 PIDS+=($!)
 sleep 1
 
-# 1. The first connection B's target accepts fails.
-start_a 1
+# 1. A's first connect to B fails (its initiator throws in fi_connect), and the first connection B's
+#    target accepts fails.
+start_a 1 LD_PRELOAD="$FAULT" MFA_FAULT_CONNECT_PORTS=23910-23999
 start_b 1 LD_PRELOAD="$FAULT" MFA_FAULT_PORTS=23910-23999
 wait_http "http://127.0.0.1:$WEB_A/livez" 150 || fail "agent A did not start"
 wait_http "http://127.0.0.1:$WEB_B/livez" 150 || fail "agent B did not start"
-say "agents up, B with the accept fault"
+say "agents up, A with the connect fault, B with the accept fault"
 curl -sf --max-time 2 -X PUT http://127.0.0.1:18971/control \
   -d "{\"master_enable\":true,\"mxl_domain_id\":\"$DOMAIN_ID\",\"mxl_flow_id\":\"$FLOW_ID\"}" >/dev/null
 for ((i = 0; i < 75; i++)); do grep -q '"event":"accept_fault_injected"' "$BASE/b1.log" && break; sleep 0.2; done
@@ -158,7 +161,10 @@ for ((i = 0; i < 75; i++)); do grep -q '"event":"replication_restarted"' "$BASE/
 grep -q '"event":"replication_restarted"' "$BASE/b1.log" || { dump; fail "B did not set the target up again"; }
 mirror_moves || { dump; fail "no grains on B's mirror after the new target"; }
 kill -0 "$BPID" 2>/dev/null || { dump; fail "B died"; }
-say "failed accept: target closed, B alive, new target set up, the mirror gets grains"
+grep -q '"event":"connect_fault_injected"' "$BASE/a1.log" || { dump; fail "the connect fault was not injected on A"; }
+grep -q '"event":"fabric_initiator_closed"' "$BASE/a1.log" || { dump; fail "A did not close the failed initiator"; }
+kill -0 "$APID" 2>/dev/null || { dump; fail "A died after the failed connect"; }
+say "failed connect: initiator closed, A alive; failed accept: target closed, B alive; new ones set up, the mirror gets grains"
 
 # 2. Both agents stopped and started together; B keeps the mirror on disk (MXL_CLEANUP_ON_EXIT=false).
 kill -TERM "$APID" "$BPID"

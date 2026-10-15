@@ -98,6 +98,56 @@ bool inventorySettled(PeerSnapshot const& peer)
     return peer.up && peer.inventory.revision > 0 && peer.polls >= 2;
 }
 
+void InventorySettleTracker::update(std::vector<PeerSnapshot> const& peers, std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::duration limit)
+{
+    std::map<std::string, InventoryView> views;
+    std::map<std::string, std::chrono::steady_clock::time_point> since;
+    for (auto const& peer : peers)
+    {
+        if (inventorySettled(peer))
+        {
+            views[peer.host_id] = InventoryView::Settled;
+            continue;
+        }
+        auto const previous = unsettledSince_.find(peer.host_id);
+        if (!peer.up)
+        {
+            views[peer.host_id] = InventoryView::Down;
+            if (previous != unsettledSince_.end())
+            {
+                since[peer.host_id] = previous->second; // down in between does not reset the wait
+            }
+            continue;
+        }
+        auto const start = previous != unsettledSince_.end() ? previous->second : now;
+        since[peer.host_id] = start;
+        views[peer.host_id] = now - start < limit ? InventoryView::Pending : InventoryView::Down;
+    }
+    views_ = std::move(views);
+    unsettledSince_ = std::move(since);
+}
+
+InventoryView InventorySettleTracker::view(std::string const& hostId) const
+{
+    auto const it = views_.find(hostId);
+    return it != views_.end() ? it->second : InventoryView::Down;
+}
+
+bool InventorySettleTracker::anyPending() const
+{
+    return std::any_of(views_.begin(), views_.end(), [](auto const& item) { return item.second == InventoryView::Pending; });
+}
+
+bool InventorySettleTracker::settledFor(std::string const& sourceHost, std::set<std::string> const& holders) const
+{
+    if (view(sourceHost) != InventoryView::Settled)
+    {
+        return false;
+    }
+    return std::none_of(holders.begin(), holders.end(), [&](std::string const& host) { return view(host) == InventoryView::Pending; });
+}
+
 PeerManager::PeerManager(Config cfg, Wake wake)
     : cfg_(std::move(cfg))
     , wake_(std::move(wake))
