@@ -65,11 +65,13 @@ public:
     PostResult post(PostRequest const& request, std::string const& domainPath);
     bool eraseTarget(std::string const& replicationId, std::string const& destHostId);
     std::vector<ReplicaView> status() const;
-    std::shared_ptr<FabricDomain> domain(std::string const& path);
+    // The lane of one flow in a domain (opened when it does not exist yet). Each flow has its own fabric thread.
+    std::shared_ptr<FabricDomain> domain(std::string const& path, std::string const& flowId);
+    // Every lane of a domain.
     void releaseDomain(std::string const& path);
     void releaseAll(bool keepFlows = false);
-    // grain_transfer_seconds of source grains; set before the first domain is opened.
-    void setTransferObserver(TransferObserver observer);
+    // Metrics callbacks of every lane (transfer times, sample ages, stalls); set before the first lane is opened.
+    void setObservers(FabricObservers observers);
     bool ensureWriter(std::string const& path, std::string const& flowDef, std::string* error);
     void releaseWriter(std::string const& path, std::string const& flowId);
     // Before a mirror flow is rebuilt: drops its destination targets (and the sources' connections to them),
@@ -104,15 +106,20 @@ private:
 
     std::string endpointFor(std::string const& peer, std::string* provider, bool* fallback) const;
     FabricEndpoint endpoint(std::string const& peer) const;
+    // The lane if it exists (nothing is opened).
+    std::shared_ptr<FabricDomain> findLane(std::string const& path, std::string const& flowId) const;
+    // Drops the lane when nothing is left in it (no writer, target or initiator).
+    void dropIfIdle(std::string const& path, std::string const& flowId);
+    std::vector<std::shared_ptr<FabricDomain>> lanes() const;
 
     mutable std::mutex mu_;
     Config cfg_;
     HandshakeTable handshake_;
-    std::map<std::string, std::shared_ptr<FabricDomain>> domains_;
+    std::map<std::string, std::shared_ptr<FabricDomain>> domains_; // by laneKey(path, flow id)
     std::map<std::string, DestState> dest_;
     std::map<std::string, std::string> linksDown_;
     std::map<std::string, std::uint64_t> sourceRestarts_;
-    TransferObserver transferObserver_;
+    FabricObservers observers_;
     int nextPort_;
 };
 } // namespace mfa

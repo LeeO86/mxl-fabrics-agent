@@ -81,6 +81,8 @@ public:
     void updateConfig(Config const& cfg);
     void setDiscovered(std::vector<PeerSnapshot> const& discovered);
     std::vector<PeerSnapshot> snapshot() const;
+    // Seconds the last poll of all peers took (GET /info and /inventory of each), and the longest since the last call.
+    double takePollSeconds();
     void start();
     void stop();
 
@@ -91,6 +93,7 @@ private:
     Config cfg_;
     Wake wake_;
     mutable std::mutex mu_;
+    double pollMax_ = 0; // under mu_
     std::vector<PeerSnapshot> discovered_;
     std::vector<PeerSnapshot> live_;
     bool stop_ = false;

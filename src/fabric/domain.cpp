@@ -35,6 +35,14 @@ std::string statusText(mxlStatus status)
 
 // The fabric thread makes a pass (initiator progress, target drains) at least this often.
 constexpr auto kPassInterval = std::chrono::milliseconds(2);
+// The same for a lane of a continuous flow (audio): it sees a completed transfer and drains its target sooner.
+constexpr auto kContinuousPassInterval = std::chrono::milliseconds(1);
+// A continuous transfer starts this long after the source saw the last one complete (see pumpSamples).
+constexpr auto kSampleGate = std::chrono::milliseconds(2);
+// A lane with nothing to pump (only a writer, or nothing) waits this long between passes; a call wakes it.
+constexpr auto kIdleInterval = std::chrono::milliseconds(50);
+// A pass that comes this much later than the one before is a stall (logged, counted).
+constexpr auto kStallThreshold = std::chrono::milliseconds(20);
 
 struct PickedInterface
 {
@@ -210,6 +218,7 @@ struct TargetSlot
     std::uint64_t errors = 0;
     std::uint64_t head = 0;
     std::size_t lastBatch = 1; // samples in the last committed batch (a "grain" of a continuous flow)
+    std::chrono::steady_clock::time_point deliveredAt{}; // last pass that committed samples (continuous)
     std::string lastError;
     std::string state = "pending";
     bool closed = false; // the MXL target was released after a failed read (see closeFailedTarget)
@@ -246,6 +255,7 @@ struct InitiatorSlot
     bool connected = false;
     bool inFlight = false;
     std::chrono::steady_clock::time_point completedAt{}; // pass that saw the last sample transfer complete
+    std::chrono::steady_clock::time_point sampleSentAt{}; // when the sample transfer in flight was posted
     std::chrono::steady_clock::time_point progressAt{};  // last MakeProgress that returned OK
     // grain_transfer_seconds: from a grain's transfer to its completion.
     std::chrono::steady_clock::time_point transferStart{};
@@ -786,12 +796,62 @@ public:
         return runtime.headIndex;
     }
 
-    void setTransferObserver(TransferObserver observer)
+    void setObservers(FabricObservers observers)
     {
-        transferObserver_ = std::move(observer);
+        observers_ = std::move(observers);
+    }
+
+    // How long the lane's thread waits for the next pass: 1 ms for a continuous flow, 2 ms for a discrete one,
+    // longer with nothing to pump.
+    std::chrono::steady_clock::duration passInterval() const
+    {
+        if (!active())
+        {
+            return kIdleInterval;
+        }
+        for (auto const& [_, slot] : initiators_)
+        {
+            if (slot.continuous && !slot.targets.empty())
+            {
+                return kContinuousPassInterval;
+            }
+        }
+        for (auto const& [_, slot] : targets_)
+        {
+            if (auto const writer = writers_.find(slot.flowId); writer != writers_.end() && writer->second.continuous)
+            {
+                return kContinuousPassInterval;
+            }
+        }
+        return kPassInterval;
+    }
+
+    // Something to pump: a target or an initiator with targets.
+    bool active() const
+    {
+        if (!targets_.empty())
+        {
+            return true;
+        }
+        return std::any_of(initiators_.begin(), initiators_.end(), [](auto const& item) { return !item.second.targets.empty(); });
+    }
+
+    bool idle() const
+    {
+        return writers_.empty() && targets_.empty() && initiators_.empty();
     }
 
 private:
+    // Seconds from sample index `index` to `now` at the flow's rate (0 when it is not behind).
+    static double indexSeconds(std::uint64_t now, std::uint64_t index, mxlRational const& rate)
+    {
+        if (index == MXL_UNDEFINED_INDEX || now <= index)
+        {
+            return 0.0;
+        }
+        return indexesToMs(now - index, rate.numerator, rate.denominator) / 1000.0;
+    }
+
     static void updateEntryBytes(InitiatorSlot& slot)
     {
         slot.entryBytes = 0;
@@ -977,13 +1037,17 @@ private:
         if (std::exchange(slot.inFlight, false))
         {
             slot.completedAt = now;
+            if (observers_.sampleTransfer)
+            {
+                observers_.sampleTransfer(slot.provider, slot.flowId, std::chrono::duration<double>(now - slot.sampleSentAt).count());
+            }
         }
         slot.progressAt = now;
         if (slot.awaitingCompletion)
         {
-            if (transferObserver_)
+            if (observers_.transfer)
             {
-                transferObserver_(slot.provider, std::chrono::duration<double>(now - slot.transferStart).count());
+                observers_.transfer(slot.provider, std::chrono::duration<double>(now - slot.transferStart).count());
             }
             slot.awaitingCompletion = false;
         }
@@ -1088,7 +1152,7 @@ private:
         // waits a pass after the last one completed and carries every sample written since. 1.2.2
         // sent one sync batch (48 samples from the ST 2110 gateway) per pass: half of a 48 kHz flow
         // arrived, 8 % over verbs on the platform's E810.
-        if (std::chrono::steady_clock::now() - slot.completedAt < kPassInterval)
+        if (std::chrono::steady_clock::now() - slot.completedAt < kSampleGate)
         {
             return;
         }
@@ -1149,6 +1213,17 @@ private:
             slot.bytes += count * sampleBytes;
             slot.sampleHead += count;
             slot.inFlight = true;
+            slot.sampleSentAt = std::chrono::steady_clock::now();
+            if (observers_.sampleAge)
+            {
+                auto const& rate = slot.info.common.grainRate;
+                auto const now = mxlGetCurrentIndex(&rate);
+                if (now != MXL_UNDEFINED_INDEX)
+                {
+                    observers_.sampleAge("origin", slot.flowId, indexSeconds(now, runtime.headIndex, rate));
+                    observers_.sampleAge("sent", slot.flowId, indexSeconds(now, slot.sampleHead, rate));
+                }
+            }
         }
     }
 
@@ -1195,6 +1270,7 @@ private:
                 slot.pendingSamples.push_back(TargetSlot::PendingSamples{head, count});
             }
             int committed = 0;
+            auto const passStart = std::chrono::steady_clock::now();
             while (!slot.pendingSamples.empty() && committed < 8)
             {
                 auto const item = slot.pendingSamples.front();
@@ -1221,6 +1297,23 @@ private:
                 slot.head = item.head;
                 slot.lastBatch = item.count;
                 ++committed;
+                if (observers_.sampleAge)
+                {
+                    auto const& rate = writer->second.info.common.grainRate;
+                    auto const now = mxlGetCurrentIndex(&rate);
+                    if (now != MXL_UNDEFINED_INDEX)
+                    {
+                        observers_.sampleAge("delivered", slot.flowId, indexSeconds(now, item.head, rate));
+                    }
+                }
+            }
+            if (committed > 0)
+            {
+                if (observers_.deliveryGap && slot.deliveredAt != std::chrono::steady_clock::time_point{})
+                {
+                    observers_.deliveryGap(slot.flowId, std::chrono::duration<double>(passStart - slot.deliveredAt).count());
+                }
+                slot.deliveredAt = passStart;
             }
         }
         else
@@ -1356,11 +1449,12 @@ private:
     std::map<std::string, InitiatorSlot> initiators_;
     std::vector<FabricRow> rows_;
     bool keepFlows_ = false;
-    TransferObserver transferObserver_;
+    FabricObservers observers_;
 };
 
 struct Task
 {
+    char const* name = "";
     std::function<void(Session&)> fn;
     std::promise<void> done;
 };
@@ -1369,6 +1463,7 @@ struct Task
 struct FabricDomain::Impl
 {
     std::string path;
+    std::string flowId;
     int rt = 0;
     std::vector<int> cpus;
     Session session;
@@ -1380,8 +1475,12 @@ struct FabricDomain::Impl
     std::mutex rowsMu;
     std::vector<FabricRow> rows;
 
-    explicit Impl(std::string inPath, int inRt, std::vector<int> inCpus)
+    std::mutex observersMu;
+    FabricObservers observers; // the stall observer, read on the thread
+
+    explicit Impl(std::string inPath, std::string inFlowId, int inRt, std::vector<int> inCpus)
         : path(std::move(inPath))
+        , flowId(std::move(inFlowId))
         , rt(inRt)
         , cpus(std::move(inCpus))
         , session(path)
@@ -1390,20 +1489,27 @@ struct FabricDomain::Impl
     void loop()
     {
         applyThreadScheduling(rt, cpus);
+        auto lastPass = std::chrono::steady_clock::now();
+        auto lastLog = std::chrono::steady_clock::time_point{};
+        std::uint64_t unlogged = 0;
+        bool wasActive = false; // the last pass had something to pump (its waits were short)
         while (true)
         {
             std::vector<Task> batch;
             {
                 std::unique_lock lock(mu);
-                cv.wait_for(lock, kPassInterval, [&] { return stop || !queue.empty(); });
+                cv.wait_for(lock, session.passInterval(), [&] { return stop || !queue.empty(); });
                 if (stop && queue.empty())
                 {
                     break;
                 }
                 batch.swap(queue);
             }
+            char const* slowest = "pass";
+            std::chrono::steady_clock::duration slowestTook{};
             for (auto& task : batch)
             {
+                auto const start = std::chrono::steady_clock::now();
                 try
                 {
                     task.fn(session);
@@ -1413,22 +1519,64 @@ struct FabricDomain::Impl
                 {
                     task.done.set_exception(std::current_exception());
                 }
+                if (auto const took = std::chrono::steady_clock::now() - start; took > slowestTook)
+                {
+                    slowestTook = took;
+                    slowest = task.name;
+                }
             }
             if (!stop)
             {
+                bool const active = session.active();
                 session.pump();
                 auto snapshot = session.rows();
-                std::lock_guard const lock{rowsMu};
-                rows = std::move(snapshot);
+                {
+                    std::lock_guard const lock{rowsMu};
+                    rows = std::move(snapshot);
+                }
+                // A pass much later than the last one held up this lane's transfers: a slow call into the lane
+                // (named) or a thread that did not get the CPU ("pass"). Only while there is something to pump.
+                auto const now = std::chrono::steady_clock::now();
+                auto const gap = now - lastPass;
+                lastPass = now;
+                if (active && std::exchange(wasActive, active) && gap > kStallThreshold)
+                {
+                    noteStall(slowest, gap, slowestTook, now, lastLog, unlogged);
+                }
+                wasActive = active;
             }
         }
         session.shutdown();
     }
 
+    void noteStall(char const* task, std::chrono::steady_clock::duration gap, std::chrono::steady_clock::duration took,
+        std::chrono::steady_clock::time_point now, std::chrono::steady_clock::time_point& lastLog, std::uint64_t& unlogged)
+    {
+        auto const seconds = std::chrono::duration<double>(gap).count();
+        {
+            std::lock_guard const lock{observersMu};
+            if (observers.stall)
+            {
+                observers.stall(flowId, task, seconds);
+            }
+        }
+        // At most one line per second and lane; the counter has every one.
+        if (now - lastLog < std::chrono::seconds(1))
+        {
+            ++unlogged;
+            return;
+        }
+        lastLog = now;
+        auto const ms = [](auto d) { return std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(d).count() / 1000.0); };
+        log::warn("fabric_thread_stall", {{"path", path}, {"flow_id", flowId}, {"gap_ms", ms(gap)}, {"task", task}, {"task_ms", ms(took)},
+                                             {"unlogged", std::to_string(std::exchange(unlogged, 0))}});
+    }
+
     template <typename F>
-    void call(F&& fn)
+    void call(char const* name, F&& fn)
     {
         Task task;
+        task.name = name;
         task.fn = std::forward<F>(fn);
         auto future = task.done.get_future();
         {
@@ -1486,14 +1634,15 @@ ProviderProbe probeFabrics(std::string const& scratchDir)
     return probe;
 }
 
-FabricDomain::FabricDomain(std::string path, int rtPriority, std::vector<int> cpus)
+FabricDomain::FabricDomain(std::string path, std::string flowId, int rtPriority, std::vector<int> cpus)
     : path_(std::move(path))
-    , impl_(std::make_unique<Impl>(path_, rtPriority, std::move(cpus)))
+    , flowId_(std::move(flowId))
+    , impl_(std::make_unique<Impl>(path_, flowId_, rtPriority, std::move(cpus)))
 {
     impl_->thread = std::thread([this] { impl_->loop(); });
     std::string error;
     bool opened = false;
-    impl_->call([&](Session& session) { opened = session.open(&error); });
+    impl_->call("open", [&](Session& session) { opened = session.open(&error); });
     ok_ = opened;
     error_ = error;
     if (!ok_)
@@ -1522,80 +1671,91 @@ FabricDomain::~FabricDomain()
 bool FabricDomain::ensureWriter(std::string const& flowDefJson, std::string* error)
 {
     bool ok = false;
-    impl_->call([&](Session& session) { ok = session.ensureWriter(flowDefJson, error); });
+    impl_->call("ensure_writer", [&](Session& session) { ok = session.ensureWriter(flowDefJson, error); });
     return ok;
 }
 
 void FabricDomain::releaseWriter(std::string const& flowId)
 {
-    impl_->call([&](Session& session) { session.releaseWriter(flowId); });
+    impl_->call("release_writer", [&](Session& session) { session.releaseWriter(flowId); });
 }
 
 bool FabricDomain::commitPattern(std::string const& flowId, std::uint64_t* index, std::string* error)
 {
     bool ok = false;
-    impl_->call([&](Session& session) { ok = session.commitPattern(flowId, index, error); });
+    impl_->call("commit_pattern", [&](Session& session) { ok = session.commitPattern(flowId, index, error); });
     return ok;
 }
 
 std::uint64_t FabricDomain::headIndex(std::string const& flowId)
 {
     std::uint64_t head = 0;
-    impl_->call([&](Session& session) { head = session.headIndex(flowId); });
+    impl_->call("head_index", [&](Session& session) { head = session.headIndex(flowId); });
     return head;
 }
 
 TargetSetup FabricDomain::setupTarget(std::string const& key, std::string const& flowId, FabricEndpoint const& endpoint, int cqDepth)
 {
     TargetSetup result;
-    impl_->call([&](Session& session) { result = session.setupTarget(key, flowId, endpoint, cqDepth); });
+    impl_->call("setup_target", [&](Session& session) { result = session.setupTarget(key, flowId, endpoint, cqDepth); });
     return result;
 }
 
 void FabricDomain::destroyTarget(std::string const& key)
 {
-    impl_->call([&](Session& session) { session.destroyTarget(key); });
+    impl_->call("destroy_target", [&](Session& session) { session.destroyTarget(key); });
 }
 
 bool FabricDomain::ensureInitiator(std::string const& key, std::string const& flowId, FabricEndpoint const& endpoint, std::string* error)
 {
     bool ok = false;
-    impl_->call([&](Session& session) { ok = session.ensureInitiator(key, flowId, endpoint, error); });
+    impl_->call("ensure_initiator", [&](Session& session) { ok = session.ensureInitiator(key, flowId, endpoint, error); });
     return ok;
 }
 
 bool FabricDomain::addInitiatorTarget(std::string const& key, std::string const& destHost, std::string const& targetInfo, std::string* error)
 {
     bool ok = false;
-    impl_->call([&](Session& session) { ok = session.addInitiatorTarget(key, destHost, targetInfo, error); });
+    impl_->call("add_initiator_target", [&](Session& session) { ok = session.addInitiatorTarget(key, destHost, targetInfo, error); });
     return ok;
 }
 
 void FabricDomain::removeInitiatorTarget(std::string const& key, std::string const& destHost)
 {
-    impl_->call([&](Session& session) { session.removeInitiatorTarget(key, destHost); });
+    impl_->call("remove_initiator_target", [&](Session& session) { session.removeInitiatorTarget(key, destHost); });
 }
 
 void FabricDomain::destroyInitiator(std::string const& key)
 {
-    impl_->call([&](Session& session) { session.destroyInitiator(key); });
+    impl_->call("destroy_initiator", [&](Session& session) { session.destroyInitiator(key); });
 }
 
 std::optional<std::uint64_t> FabricDomain::originHead(std::string const& key)
 {
     std::optional<std::uint64_t> head;
-    impl_->call([&](Session& session) { head = session.originHead(key); });
+    impl_->call("origin_head", [&](Session& session) { head = session.originHead(key); });
     return head;
 }
 
-void FabricDomain::setTransferObserver(TransferObserver observer)
+void FabricDomain::setObservers(FabricObservers observers)
 {
-    impl_->call([&](Session& session) { session.setTransferObserver(std::move(observer)); });
+    {
+        std::lock_guard const lock{impl_->observersMu};
+        impl_->observers = observers;
+    }
+    impl_->call("set_observers", [&](Session& session) { session.setObservers(std::move(observers)); });
+}
+
+bool FabricDomain::idle()
+{
+    bool idle = false;
+    impl_->call("idle", [&](Session& session) { idle = session.idle(); });
+    return idle;
 }
 
 void FabricDomain::keepFlowsOnExit()
 {
-    impl_->call([](Session& session) { session.keepFlowsOnExit(); });
+    impl_->call("keep_flows", [](Session& session) { session.keepFlowsOnExit(); });
 }
 
 std::vector<FabricRow> FabricDomain::rows() const

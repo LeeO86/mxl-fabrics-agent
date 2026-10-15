@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <utility>
 
 namespace mfa
 {
@@ -250,6 +251,7 @@ void PeerManager::loop()
             cfg = cfg_;
             peers = mergeUnlocked();
         }
+        auto const pollStart = std::chrono::steady_clock::now();
         for (auto& peer : peers)
         {
             if (peer.host_id == cfg.host_id || peer.control_url.empty())
@@ -280,9 +282,12 @@ void PeerManager::loop()
             peer.inventory = parseInventoryJson(inventory.body);
             peer.revision = peer.inventory.revision;
         }
+        auto const pollSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - pollStart).count();
+        log::debug("peer_poll_timing", {{"peers", std::to_string(peers.size())}, {"ms", std::to_string(pollSeconds * 1000.0)}});
         bool changed = false;
         {
             std::lock_guard const lock{mu_};
+            pollMax_ = std::max(pollMax_, pollSeconds);
             if (peers.size() != live_.size())
             {
                 changed = true;
@@ -317,5 +322,10 @@ void PeerManager::loop()
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
+}
+double PeerManager::takePollSeconds()
+{
+    std::lock_guard const lock{mu_};
+    return std::exchange(pollMax_, 0.0);
 }
 } // namespace mfa

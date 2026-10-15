@@ -75,6 +75,11 @@ private:
     // agent's writer and its files. The next file of the flow is a rebuild for `reason`. Readers that still
     // hold the old file get MXL_ERR_FLOW_INVALID once no new grain comes, and open the new one.
     void teardownMirrorFlow(std::string const& path, std::string const& domainId, std::string const& flowId, std::string const& reason);
+    // scanReaders on /proc for every other process, timed (reconcile_work_seconds{work="reader_scan"}).
+    ReaderScan scanProcReaders(std::map<FileKey, std::string> const& files);
+    // Duration of one piece of periodic work: histogram, debug line, an info line when it takes over 0.5 s.
+    void noteWork(char const* work, std::chrono::steady_clock::duration took);
+    void noteWork(char const* work, double seconds);
     HttpResponse rebuildMirror(MirrorRebuildRequest const& request);
 
     std::shared_ptr<ConfigStore> store_;
@@ -90,6 +95,7 @@ private:
     bool stop_ = false;
     std::thread thread_;
     std::atomic<bool> ready_{false};
+    std::atomic<bool> metricsPerFlow_{true}; // METRICS_PER_FLOW, for the lanes' sample age observations
     std::atomic<bool> nmosReady_{false};
     std::atomic<bool> nmosRegistered_{false};
     std::atomic<int> fatal_{0};
@@ -118,6 +124,8 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> configRebuiltAt_;
     bool adminRebuild_ = false; // MIRROR_ADMIN_REBUILD at start
     std::chrono::steady_clock::time_point nextFlowReaderScan_{};
+    std::mutex workLogMu_;
+    std::chrono::steady_clock::time_point slowWorkLogged_{}; // under workLogMu_
     std::map<std::string, FabricLink> links_;  // per peer, from the last tick (mu_)
     std::map<std::string, std::string> linkErrors_; // per peer, the last logged link error ("" = up)
     struct OriginConflict

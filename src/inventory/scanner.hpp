@@ -33,6 +33,8 @@ public:
     ~DomainScanner();
 
     Inventory snapshot() const;
+    // The longest scan (seconds) since the last call.
+    double takeScanSeconds();
     bool running() const { return running_.load(); }
     void start();
     void stop();
@@ -49,6 +51,7 @@ private:
     std::string lastCanonical_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_{false};
+    std::atomic<double> scanMax_{0.0};
     std::thread thread_;
 };
 } // namespace mfa

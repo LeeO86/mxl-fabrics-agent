@@ -634,16 +634,23 @@ the set of hosts or the choice changes and exports `origin_conflicts`.
 
 ## 9. Replication engine
 
-- One Fabrics instance per provider in use. The Fabrics API is not assumed to
-  be thread-safe: all calls on one instance are serialised on one dedicated
-  thread per instance (the "fabric thread"), which runs progress for initiators
-  and drains target completions.
+- One lane per flow (since 1.7.2): the flow's own MXL instance, Fabrics
+  instance and dedicated thread (the "fabric thread"), which serialises every
+  call on them, runs progress for the flow's initiator and drains its target.
+  The Fabrics API is not assumed to be thread-safe. Until 1.7.1 one thread
+  served every flow of a domain, so a slow call for one flow (a target or
+  initiator set up again, its memory registered, a writer opened or released)
+  held up the transfers of all the others in that domain. A lane goes when
+  its flow has no writer, target or initiator left. The thread of a lane with
+  a continuous flow makes a pass every 1 ms, of a discrete one every 2 ms, of
+  an empty one every 50 ms; a call wakes it at once.
 - Initiator side: for each new grain index available in the origin reader
   (blocking wait with short timeout), transfer that grain to all targets.
   Continuous (audio) flows use MXL's sample transfer. One transfer carries
   every sample written since the last one, up to what the targets' bounce
-  buffer entry holds (its size is in the target info), and starts one fabric
-  thread pass (2 ms) after the last one completed: over `verbs` MXL's target
+  buffer entry holds (its size is in the target info; MXL sizes it from the
+  mirror's sync batch, 10 ms by default), and starts 2 ms after the source saw
+  the last one complete: over `verbs` MXL's target
   posts the receive for the next immediate only when its agent drains the last
   transfer. 1.2.2 sent one sync batch per pass (48 samples from the ST 2110
   gateway): half of a 48 kHz flow arrived, 8 % over `verbs` on the platform.
@@ -825,6 +832,14 @@ Tabs:
 | `replication_lag_grains` | gauge | flow_id, peer; transfer batches for continuous flows |
 | `replication_lag_ms` | gauge | flow_id, peer; the lag in milliseconds at the flow's rate |
 | `grain_transfer_seconds` | histogram | provider; source grains, transfer to completion |
+| `sample_transfer_seconds` | histogram | provider, flow_id; source, continuous flows: each transfer from its post to the pass that saw it complete (one is in flight at a time, so a long one holds back every later sample) (since 1.7.2) |
+| `sample_transfer_max_seconds` | gauge | provider, flow_id; the longest of those since the last scrape (since 1.7.2) |
+| `replication_sample_age_seconds` | histogram | stage, flow_id; continuous flows, how far behind the current TAI sample index: `origin` (the origin head when the source sends), `sent` (the newest sample of a transfer when it is posted), `delivered` (the newest sample of a batch when the destination commits it); 0 when at or ahead of the current index (since 1.7.2) |
+| `replication_sample_age_max_seconds` | gauge | stage, flow_id; the largest of those since the last scrape (since 1.7.2) |
+| `replication_delivery_gap_seconds` | histogram | flow_id; destination, continuous flows: time between two passes that committed samples (since 1.7.2) |
+| `replication_late_deliveries_total` | counter | flow_id; those gaps longer than 20 ms (since 1.7.2) |
+| `fabric_thread_stall_seconds` | histogram | task; a lane's thread made no pass for longer than 20 ms while it had something to pump, with the slowest call into the lane in between (`pass`: none, the thread got no CPU or a pass was slow) (since 1.7.2) |
+| `reconcile_work_seconds` | histogram | work (`plan`, `pulls`, `cleanup_domains`, `cleanup_flows`, `health`, `metrics`, `tick`, `reader_scan`, `peer_poll`, `inventory_scan`); durations of the periodic work (since 1.7.2) |
 | `setup_seconds` | histogram | phase (target_setup, handshake, first_grain) (not implemented yet) |
 | `nmos_registry_up` | gauge | — |
 | `nmos_poll_errors_total` | counter | — (not implemented yet) |

@@ -251,6 +251,18 @@ The removed flow is `absent` in the mirror health with reason `origin_missing` a
 
 This agent has no IS-05 senders or receivers. It does not accept connection patches. It only reads other nodes' active connections.
 
+## Audio timing
+
+How a continuous (audio) flow moves: the source's lane (its own thread, a pass every 1 ms) reads the origin's head and posts one transfer with every sample written since the last one, at most one bounce-buffer entry (the mirror's sync batch, 10 ms by default). One transfer is in flight at a time; the next one starts 2 ms after the source saw the last one complete (over `verbs` the target posts the receive for the next immediate only when it drains the last transfer). The destination's lane drains its target and commits each batch to the mirror. Nothing waits for a grain or a sample count: with the ST 2110 gateway's 1 ms commits a mirror gets a batch of about 3 ms every 3 ms (lab, `tcp`; 4 ms with 1.7.1). After a stall the source sends one entry per transfer until it has caught up, so a 10 ms entry and a 7 ms transfer period catch up only 3 ms per transfer.
+
+`lag_ms` (and `lag_grains`) is computed on each pass of the destination's lane from the mirror's head and the current TAI index, and `/api/v1/replications` and the gauge show the value at the moment they are read. It is 0 when the head is at or ahead of the current index (an origin that writes ahead) and while the origin is not written. A 1 s scrape therefore misses a stall of a few hundred milliseconds. For bursts use (since 1.7.2):
+
+- `replication_sample_age_seconds{stage}` and `replication_sample_age_max_seconds{stage}` (largest since the last scrape): how old the samples are when the source reads the origin (`origin`), posts them (`sent`) and the destination commits them (`delivered`). A reader with a 120 ms window misses samples whose `delivered` age is above 0.12.
+- `replication_delivery_gap_seconds` and `replication_late_deliveries_total` (gaps over 20 ms) at the destination.
+- `sample_transfer_seconds` and `sample_transfer_max_seconds` at the source: one transfer from its post to its completion. A long one with `fabric_thread_stall_seconds` flat is the transport (a retransmission or receiver-not-ready wait), compare `peer_rdma_retransmits_total`.
+- `fabric_thread_stall_seconds{task}` and the log `fabric_thread_stall` (`gap_ms`, `task`, `task_ms`, at most one line per second and lane): a lane's thread made no pass for over 20 ms while it had work, and the call that held it (`pass`: none, the thread got no CPU).
+- `reconcile_work_seconds{work}`: the periodic work (`plan`, `pulls`, `cleanup_domains`, `cleanup_flows`, `health`, `metrics`, `tick`, `reader_scan`, `peer_poll`, `inventory_scan`). `LOG_LEVEL=debug` logs each (`work_timing`, `peer_poll_timing`); one over 0.5 s logs `reconcile_work_slow` (info, at most every 10 s). None of this work runs on a lane's thread.
+
 ## Mirror health
 
 The agent says when a destination mirror flow no longer carries its source. It does not re-route: choosing a receiver's source is the controller's job over IS-05.
