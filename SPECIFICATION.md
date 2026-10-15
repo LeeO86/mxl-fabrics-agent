@@ -557,7 +557,8 @@ settled and no up peer that lists the domain is still pending. Until then its
 reason is `inventory_pending`, and a running grace clock pauses (it keeps its
 time). A mirror domain is not an orphan while any up peer is pending. A peer
 that stays up but unsettled for longer than 60 s (or three poll intervals,
-whichever is longer; passes while it is down do not reset this) counts as down
+whichever is longer; passes while it is down do not reset this unless it is
+down for longer than that) counts as down
 for these decisions.
 
 ### 8.4 Replication handshake (pull model, destination-driven)

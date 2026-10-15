@@ -435,8 +435,15 @@ TEST_CASE("settle tracker: per peer, pending only while it settles, a flapping p
     tracker.update({peerAt("node-b", true, 9), peerAt("node-c", true, 1)}, t + 2s, limit);
     CHECK(tracker.view("node-c") == InventoryView::Pending);
 
+    // Pending for one poll, then down for longer than the limit: it comes back with the full wait, not as down.
+    auto const back = t + 4s + limit + 10s;
+    tracker.update({peerAt("node-b", true, 9), peerAt("node-c", false, 0)}, t + 4s, limit);
+    tracker.update({peerAt("node-b", true, 9), peerAt("node-c", false, 0)}, back - 1s, limit);
+    tracker.update({peerAt("node-b", true, 9), peerAt("node-c", true, 1)}, back, limit);
+    CHECK(tracker.view("node-c") == InventoryView::Pending);
+
     // An inventory before the first scan is never settled.
-    tracker.update({peerAt("node-d", true, 4, 0)}, t + 4s, limit);
+    tracker.update({peerAt("node-d", true, 4, 0)}, back + 2s, limit);
     CHECK(tracker.view("node-d") == InventoryView::Pending);
 }
 

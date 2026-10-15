@@ -103,6 +103,7 @@ void InventorySettleTracker::update(std::vector<PeerSnapshot> const& peers, std:
 {
     std::map<std::string, InventoryView> views;
     std::map<std::string, std::chrono::steady_clock::time_point> since;
+    std::map<std::string, std::chrono::steady_clock::time_point> down;
     for (auto const& peer : peers)
     {
         if (inventorySettled(peer))
@@ -114,9 +115,13 @@ void InventorySettleTracker::update(std::vector<PeerSnapshot> const& peers, std:
         if (!peer.up)
         {
             views[peer.host_id] = InventoryView::Down;
-            if (previous != unsettledSince_.end())
+            auto const wasDown = downSince_.find(peer.host_id);
+            auto const downAt = wasDown != downSince_.end() ? wasDown->second : now;
+            down[peer.host_id] = downAt;
+            // Down in between does not reset the wait (a flapping peer); down for longer than the limit does.
+            if (previous != unsettledSince_.end() && now - downAt < limit)
             {
-                since[peer.host_id] = previous->second; // down in between does not reset the wait
+                since[peer.host_id] = previous->second;
             }
             continue;
         }
@@ -126,6 +131,7 @@ void InventorySettleTracker::update(std::vector<PeerSnapshot> const& peers, std:
     }
     views_ = std::move(views);
     unsettledSince_ = std::move(since);
+    downSince_ = std::move(down);
 }
 
 InventoryView InventorySettleTracker::view(std::string const& hostId) const

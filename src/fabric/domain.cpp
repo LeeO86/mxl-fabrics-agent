@@ -251,6 +251,7 @@ struct InitiatorSlot
     std::chrono::steady_clock::time_point transferStart{};
     bool awaitingCompletion = false;
     std::string lastError;
+    std::string closedLogged; // the last fabric_initiator_closed error logged, until a pass works again
     std::string state = "pending";
     std::map<std::string, mxlFabricsTargetInfo> targets;
     // The target info each target was added with, to recognise a repeated request.
@@ -896,7 +897,12 @@ private:
     // request adds its target again, and checkOrigin opens a new initiator for it.
     void closeFailedInitiator(std::string const& key, InitiatorSlot& slot, std::string const& error)
     {
-        log::warn("fabric_initiator_closed", {{"replication_id", key}, {"flow_id", slot.flowId}, {"provider", slot.provider}, {"error", error}});
+        // One line when the error starts or changes, not one per retry (a connect that fails every time).
+        if (slot.closedLogged != error)
+        {
+            log::warn("fabric_initiator_closed", {{"replication_id", key}, {"flow_id", slot.flowId}, {"provider", slot.provider}, {"error", error}});
+            slot.closedLogged = error;
+        }
         closeInitiator(slot);
         for (auto& [_, info] : slot.targets)
         {
@@ -1001,6 +1007,7 @@ private:
         {
             slot.state = "active";
             slot.lastError.clear();
+            slot.closedLogged.clear();
         }
     }
 

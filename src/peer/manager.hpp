@@ -52,8 +52,9 @@ enum class InventoryView
 
 // Per peer, on every reconcile pass. A peer that is up but not settled is Pending until it has been
 // unsettled for `limit` (counted from the first such pass; passes while it is down do not reset it, only a
-// settled one does), then Down: a peer that fails every other poll or restarts on every poll does not hold
-// decisions back for good.
+// settled one does, or being down for longer than `limit`), then Down: a peer that fails every other poll or
+// restarts on every poll does not hold decisions back for good, and one that was down for long gets the
+// full wait again when it comes back.
 class InventorySettleTracker
 {
 public:
@@ -67,6 +68,7 @@ public:
 private:
     std::map<std::string, InventoryView> views_;
     std::map<std::string, std::chrono::steady_clock::time_point> unsettledSince_;
+    std::map<std::string, std::chrono::steady_clock::time_point> downSince_;
 };
 
 class PeerManager
