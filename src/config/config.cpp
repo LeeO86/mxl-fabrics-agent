@@ -255,12 +255,17 @@ std::vector<std::string> configKeys()
 {
     return {"HOST_ID", "MXL_DOMAIN_SCAN_PATH", "MXL_ROOT", "STATE_DIR", "SCAN_INTERVAL_MS", "MIRROR_MODE",
         "MIRROR_INCLUDE_DOMAINS", "MIRROR_INCLUDE_FLOWS", "MIRROR_EXCLUDE_DOMAINS", "MIRROR_EXCLUDE_FLOWS", "MIRROR_GRACE_S",
-        "MIRROR_IDLE_GRACE_S", "MIRROR_CLEANUP_DRY_RUN", "MIRROR_STALE_MS", "MIRROR_ADMIN_REBUILD", "TMPFS_RESERVE_MB", "MXL_CLEANUP_ON_EXIT", "CLEANUP_MIRRORS_ON_EXIT", "DEFAULT_PROVIDER", "PROVIDER_FALLBACK",
+        "MIRROR_IDLE_GRACE_S", "MIRROR_CLEANUP_DRY_RUN", "MIRROR_STALE_MS", "TMPFS_RESERVE_MB", "MXL_CLEANUP_ON_EXIT", "CLEANUP_MIRRORS_ON_EXIT", "DEFAULT_PROVIDER", "PROVIDER_FALLBACK",
         "FABRIC_INTERFACE", "FABRIC_PORT_BASE", "FABRIC_PORT_COUNT", "PEERS", "PEER_POLL_INTERVAL_MS", "RELEASE_GRACE_MS",
         "NMOS_ENABLE", "NMOS_SEED", "NMOS_LABEL", "NMOS_TAGS", "NMOS_DNS_SD", "NMOS_HOST_ADDRESS", "NMOS_REGISTRY_ADDRESS",
         "NMOS_REGISTRY_PORT", "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT", "NMOS_POLL_INTERVAL_MS", "NMOS_PORT", "LOCAL_NODE_IDS",
         "LOCAL_NODE_HOSTNAMES", "LOCAL_NODE_CIDRS", "WEB_PORT", "WEB_ENABLE", "RT_PRIORITY", "CPU_AFFINITY", "LOG_LEVEL",
         "METRICS_PER_FLOW", "AGENT_CONFIG_FILE", "SHUTDOWN_TIMEOUT_S"};
+}
+
+bool isEnvironmentOnlyKey(std::string const& key)
+{
+    return key == "MIRROR_ADMIN_REBUILD";
 }
 
 bool isRuntimeKey(std::string const& key)
@@ -303,7 +308,6 @@ Config parseConfig(std::map<std::string, std::string> const& values)
     cfg.mirror_idle_grace_s = parseInt("MIRROR_IDLE_GRACE_S", valueOr(values, "MIRROR_IDLE_GRACE_S", "300"), 0, 86400);
     cfg.mirror_cleanup_dry_run = parseBool("MIRROR_CLEANUP_DRY_RUN", valueOr(values, "MIRROR_CLEANUP_DRY_RUN", "false"));
     cfg.mirror_stale_ms = parseInt("MIRROR_STALE_MS", valueOr(values, "MIRROR_STALE_MS", "2000"), 0, 600000);
-    cfg.mirror_admin_rebuild = parseBool("MIRROR_ADMIN_REBUILD", valueOr(values, "MIRROR_ADMIN_REBUILD", "false"));
     cfg.tmpfs_reserve_mb = parseInt("TMPFS_RESERVE_MB", valueOr(values, "TMPFS_RESERVE_MB", "512"), 0, 1024 * 1024);
     cfg.cleanup_mirrors_on_exit = parseBool("MXL_CLEANUP_ON_EXIT", valueOr(aligned, "MXL_CLEANUP_ON_EXIT", "false"));
     cfg.default_provider = valueOr(values, "DEFAULT_PROVIDER", "verbs");
@@ -429,6 +433,11 @@ Config loadLayered(std::map<std::string, std::string> const& fileValues, std::ma
     }
     auto file = fileValues;
     auto env = envValues;
+    // Environment-only keys (MIRROR_ADMIN_REBUILD): only the deployment sets them, never the file layer.
+    for (auto it = file.begin(); it != file.end();)
+    {
+        it = isEnvironmentOnlyKey(it->first) ? file.erase(it) : std::next(it);
+    }
     alignAlias(file, "MXL_DOMAIN_SCAN_PATH", "MXL_ROOT");
     alignAlias(file, "MXL_CLEANUP_ON_EXIT", "CLEANUP_MIRRORS_ON_EXIT");
     alignAlias(env, "MXL_DOMAIN_SCAN_PATH", "MXL_ROOT");
@@ -449,7 +458,9 @@ Config loadLayered(std::map<std::string, std::string> const& fileValues, std::ma
             (*origin)[key] = ValueOrigin::Env;
         }
     }
-    return parseConfig(merged);
+    auto cfg = parseConfig(merged);
+    cfg.mirror_admin_rebuild = parseBool("MIRROR_ADMIN_REBUILD", valueOr(env, "MIRROR_ADMIN_REBUILD", "false"));
+    return cfg;
 }
 
 std::map<std::string, std::string> configToMap(Config const& cfg)
@@ -469,7 +480,6 @@ std::map<std::string, std::string> configToMap(Config const& cfg)
     values["MIRROR_IDLE_GRACE_S"] = std::to_string(cfg.mirror_idle_grace_s);
     values["MIRROR_CLEANUP_DRY_RUN"] = cfg.mirror_cleanup_dry_run ? "true" : "false";
     values["MIRROR_STALE_MS"] = std::to_string(cfg.mirror_stale_ms);
-    values["MIRROR_ADMIN_REBUILD"] = cfg.mirror_admin_rebuild ? "true" : "false";
     values["TMPFS_RESERVE_MB"] = std::to_string(cfg.tmpfs_reserve_mb);
     values["MXL_CLEANUP_ON_EXIT"] = cfg.cleanup_mirrors_on_exit ? "true" : "false";
     values["CLEANUP_MIRRORS_ON_EXIT"] = cfg.cleanup_mirrors_on_exit ? "true" : "false";
@@ -564,6 +574,7 @@ std::map<std::string, std::string> environmentValues(char const* const* envp)
     std::set<std::string> known(keys.begin(), keys.end());
     known.insert("MIRROR_INCLUDE");
     known.insert("MIRROR_EXCLUDE");
+    known.insert("MIRROR_ADMIN_REBUILD"); // environment-only
     std::map<std::string, std::string> out;
     if (envp == nullptr)
     {

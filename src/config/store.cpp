@@ -97,6 +97,10 @@ Config ConfigStore::updateFile(std::map<std::string, std::string> const& patch, 
     std::lock_guard const lock{mu_};
     for (auto const& [key, value] : patch)
     {
+        if (isEnvironmentOnlyKey(key))
+        {
+            throw ConfigError(key + " can only be set in the environment");
+        }
         auto const it = origin_.find(key);
         if (it != origin_.end() && it->second == ValueOrigin::Env)
         {
@@ -109,7 +113,9 @@ Config ConfigStore::updateFile(std::map<std::string, std::string> const& patch, 
         }
     }
     auto const keptFile = cfg_.config_file;
+    auto const keptAdminRebuild = cfg_.mirror_admin_rebuild; // environment-only, from the start
     cfg_ = loadLayered(file_, env_, &origin_);
+    cfg_.mirror_admin_rebuild = keptAdminRebuild;
     if (cfg_.config_file.empty())
     {
         cfg_.config_file = keptFile;
@@ -147,7 +153,9 @@ void ConfigStore::importDocument(std::map<std::string, std::string> const& doc)
     }
     file_ = std::move(next);
     auto const keptFile = cfg_.config_file;
+    auto const keptAdminRebuild = cfg_.mirror_admin_rebuild; // environment-only, from the start
     cfg_ = loadLayered(file_, env_, &origin_);
+    cfg_.mirror_admin_rebuild = keptAdminRebuild;
     if (cfg_.config_file.empty())
     {
         cfg_.config_file = keptFile;
@@ -161,6 +169,10 @@ void ConfigStore::replaceFile(std::map<std::string, std::string> const& fileLaye
     file_ = fileLayer;
     for (auto const& [key, _] : file_)
     {
+        if (isEnvironmentOnlyKey(key))
+        {
+            throw ConfigError(key + " can only be set in the environment");
+        }
         if (origin_.count(key) && origin_[key] == ValueOrigin::Env)
         {
             throw ConfigError(key + " is set by the environment and is read-only");
@@ -171,7 +183,9 @@ void ConfigStore::replaceFile(std::map<std::string, std::string> const& fileLaye
         }
     }
     auto const keptFile = cfg_.config_file;
+    auto const keptAdminRebuild = cfg_.mirror_admin_rebuild; // environment-only, from the start
     cfg_ = loadLayered(file_, env_, &origin_);
+    cfg_.mirror_admin_rebuild = keptAdminRebuild;
     if (cfg_.config_file.empty())
     {
         cfg_.config_file = keptFile;

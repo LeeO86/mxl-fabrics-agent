@@ -107,7 +107,8 @@ private:
     std::vector<MirrorDomainView> mirrorDomains_;     // from the last tick (mu_)
     std::map<std::string, std::chrono::steady_clock::time_point> flowMissingSince_; // per "domain/flow" without its origin
     std::map<std::string, std::string> flowLogged_; // per "domain/flow", the last logged flow cleanup decision
-    // Per "domain/flow", when the mirror was last rebuilt for a changed origin definition (at most one per 5 s).
+    // Per "domain/flow", when the mirror was last rebuilt for a changed origin definition (at most one per 5 s;
+    // entries older than that are dropped every pass).
     std::map<std::string, std::chrono::steady_clock::time_point> configRebuiltAt_;
     bool adminRebuild_ = false; // MIRROR_ADMIN_REBUILD at start
     std::chrono::steady_clock::time_point nextFlowReaderScan_{};

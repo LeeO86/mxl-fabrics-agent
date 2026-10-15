@@ -327,7 +327,7 @@ mirror is not created, and status/metric/log report `insufficient_space`.
   deleted file closes its reader and initiator, and the next check opens the new
   flow for the same targets. The destination keeps its target and mirror when
   the new flow has the same definition (grains go on in the same mirror file).
-- Origin created again with another definition under the same flow id (1.6.0):
+- Origin created again with another definition under the same flow id (1.7.0):
   when the origin's `flow_def.json` in the source's inventory differs from the
   mirror's own in more than its descriptive fields (`label`, `description`,
   `tags`, `parents`, `version`, `source_id`, `device_id`), the mirror's layout
@@ -442,8 +442,10 @@ releases the writer, removes the flow's files and creates the flow again from
 its own `flow_def.json`; the next reconciliation pass sets up a new target and
 replication resumes. Readers that map the old file get `MXL_ERR_FLOW_INVALID`
 once no new grain comes and must open the flow again. Off unless
-`MIRROR_ADMIN_REBUILD=true`, read at start (a `PUT /api/v1/config` does not
-open it on a running agent): `403` when off, `400` for ids that are not UUIDs,
+`MIRROR_ADMIN_REBUILD=true` in the environment, read at start. It is
+environment-only, so only the deployment opens the hook: it is not a key of the
+file layer, `GET /api/v1/config`, the export or the import, a config file that
+holds it is ignored, and `PUT /api/v1/config` with it answers `400`. Answers: `403` when off, `400` for ids that are not UUIDs,
 `404` when this agent has no such mirror flow, `500` when the flow could not be
 created again (the next pass retries while the mirror is wanted), `200` with
 `old_inode`, `inode` and the `readers` (`pid`, `comm`) that mapped the old file.
@@ -686,7 +688,7 @@ include/exclude lists apply at runtime.
 | `MIRROR_IDLE_GRACE_S` | 300 | drop a mirror domain after this long without demand, and a mirror flow after its origin flow has been missing this long (§7.4); `0` never |
 | `MIRROR_CLEANUP_DRY_RUN` | false | mirror cleanup only logs |
 | `MIRROR_STALE_MS` | 2000 | a mirror flow without a new grain this long while grains are due is `stale` (§7.5); `0` never |
-| `MIRROR_ADMIN_REBUILD` | false | allow the rebuild test hook (§7.5); read at start |
+| `MIRROR_ADMIN_REBUILD` | false | allow the rebuild test hook (§7.5); environment only (not in the config file, export, import or `PUT /config`), read at start |
 | `TMPFS_RESERVE_MB` | 512 | minimum free space on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | remove own mirrors on SIGTERM. Alias: `CLEANUP_MIRRORS_ON_EXIT` |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |

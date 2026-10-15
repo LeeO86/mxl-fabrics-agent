@@ -200,7 +200,7 @@ Controller::Controller(std::shared_ptr<ConfigStore> store)
 {
     tai_ = taiOffsetSeconds();
     rootTmpfs_ = pathIsTmpfs(store_->get().mxl_root);
-    // Read once: a PUT /api/v1/config cannot open the rebuild hook of a running agent.
+    // Environment only, read once: neither the config file nor PUT /api/v1/config can open the rebuild hook.
     adminRebuild_ = store_->get().mirror_admin_rebuild;
     // Source grains, from the transfer to its completion.
     engine_.setTransferObserver([this](std::string const& provider, double seconds) {
@@ -639,6 +639,11 @@ void Controller::tick()
             obs.blocked = "link_down";
         }
         remoteObservations.push_back(std::move(obs));
+    }
+    // The throttle of rebuilds for a changed origin definition only needs the last 5 s.
+    for (auto it = configRebuiltAt_.begin(); it != configRebuiltAt_.end();)
+    {
+        it = now - it->second >= std::chrono::seconds(5) ? configRebuiltAt_.erase(it) : std::next(it);
     }
     for (auto it = originLost_.begin(); it != originLost_.end();)
     {

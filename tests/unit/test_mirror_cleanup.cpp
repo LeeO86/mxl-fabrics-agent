@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include "config/config.hpp"
+#include "config/store.hpp"
 #include "mirror/lifecycle.hpp"
 #include "mirror/readers.hpp"
 
@@ -8,6 +9,7 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -211,14 +213,37 @@ TEST_CASE("mirror cleanup settings")
     CHECK_THROWS_AS(parseConfig({{"MIRROR_IDLE_GRACE_S", "-1"}}), ConfigError);
 }
 
-TEST_CASE("mirror rebuild hook setting")
+TEST_CASE("mirror rebuild hook setting: environment only")
 {
-    CHECK_FALSE(parseConfig({}).mirror_admin_rebuild);
-    CHECK(parseConfig({{"MIRROR_ADMIN_REBUILD", "true"}}).mirror_admin_rebuild);
-    CHECK_THROWS_AS(parseConfig({{"MIRROR_ADMIN_REBUILD", "maybe"}}), ConfigError);
-    // Not a runtime key: a PUT /api/v1/config needs a restart (the agent reads it at start).
-    CHECK_FALSE(isRuntimeKey("MIRROR_ADMIN_REBUILD"));
-    CHECK(configToMap(parseConfig({{"MIRROR_ADMIN_REBUILD", "true"}})).at("MIRROR_ADMIN_REBUILD") == "true");
+    // Only the deployment opens the hook: the environment sets it, the file layer cannot.
+    CHECK_FALSE(loadLayered({}, {}).mirror_admin_rebuild);
+    CHECK(loadLayered({}, {{"MIRROR_ADMIN_REBUILD", "true"}}).mirror_admin_rebuild);
+    CHECK_FALSE(loadLayered({{"MIRROR_ADMIN_REBUILD", "true"}}, {}).mirror_admin_rebuild);
+    CHECK_THROWS_AS(loadLayered({}, {{"MIRROR_ADMIN_REBUILD", "maybe"}}), ConfigError);
+    CHECK_FALSE(parseConfig({{"MIRROR_ADMIN_REBUILD", "true"}}).mirror_admin_rebuild);
+    CHECK(isEnvironmentOnlyKey("MIRROR_ADMIN_REBUILD"));
+    auto const keys = configKeys();
+    CHECK(std::find(keys.begin(), keys.end(), "MIRROR_ADMIN_REBUILD") == keys.end());
+    CHECK(configToMap(loadLayered({}, {{"MIRROR_ADMIN_REBUILD", "true"}})).count("MIRROR_ADMIN_REBUILD") == 0);
+    char const* envp[] = {"MIRROR_ADMIN_REBUILD=true", "UNRELATED=1", nullptr};
+    CHECK(environmentValues(envp).at("MIRROR_ADMIN_REBUILD") == "true");
+
+    // PUT /api/v1/config and POST /api/v1/config/import cannot set it; the start value stays.
+    std::map<std::string, ValueOrigin> origin;
+    auto cfg = loadLayered({}, {{"MIRROR_ADMIN_REBUILD", "true"}}, &origin);
+    cfg.config_file.clear();
+    ConfigStore store(cfg, origin, {});
+    CHECK_THROWS_AS(store.updateFile({{"MIRROR_ADMIN_REBUILD", "false"}}), ConfigError);
+    store.importDocument({{"MIRROR_ADMIN_REBUILD", "false"}, {"MIRROR_STALE_MS", "1500"}});
+    CHECK(store.get().mirror_admin_rebuild);
+    CHECK(store.get().mirror_stale_ms == 1500);
+    CHECK(store.exportJson().find("MIRROR_ADMIN_REBUILD") == std::string::npos);
+    store.updateFile({{"MIRROR_STALE_MS", "1000"}});
+    CHECK(store.get().mirror_admin_rebuild);
+
+    ConfigStore off(loadLayered({}, {}, &origin), origin, {});
+    off.importDocument({{"MIRROR_ADMIN_REBUILD", "true"}});
+    CHECK_FALSE(off.get().mirror_admin_rebuild);
 }
 
 TEST_CASE("maps line: device and inode")

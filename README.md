@@ -141,7 +141,7 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | `MIRROR_IDLE_GRACE_S` | 300 | Drop a mirror domain after this many seconds without demand, and a mirror flow after its origin flow has been gone this long (`0`: never) |
 | `MIRROR_CLEANUP_DRY_RUN` | false | Mirror cleanup only logs `mirror_domain_would_remove` and `mirror_flow_would_remove` |
 | `MIRROR_STALE_MS` | 2000 | A mirror flow without a new grain for this long while grains are due is `stale` (see Mirror health). `0`: never |
-| `MIRROR_ADMIN_REBUILD` | false | Allow `POST /api/v1/mirrors/{domain_id}/{flow_id}/rebuild`, the test hook that rebuilds one mirror flow (see Mirror health). Read at start: setting it with `PUT /api/v1/config` needs a restart |
+| `MIRROR_ADMIN_REBUILD` | false | Allow `POST /api/v1/mirrors/{domain_id}/{flow_id}/rebuild`, the test hook that rebuilds one mirror flow (see Mirror health). Environment only, read at start: the config file, `PUT /api/v1/config` and the import cannot set it, and the export does not show it |
 | `TMPFS_RESERVE_MB` | 512 | Free space left on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | On shutdown, remove mirror domains this agent owns. Alias: `CLEANUP_MIRRORS_ON_EXIT`. With false the mirror flows stay, and readers on the host keep reading them after a restart |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |
@@ -306,7 +306,7 @@ Given the timing the outcome is deterministic, but a restart that deletes the wh
 
 `POST /api/v1/mirrors/{domain_id}/{flow_id}/rebuild` makes one mirror flow on this host look like an origin that came back with a new definition, to test a media function's re-open path without restarting a producer. It drops the flow's target and the source's connection to it, releases the agent's writer, removes the flow's files and creates the flow again from its own `flow_def.json`, under the same ids. The next reconcile pass (about 200 ms) sets up a new target and replication resumes into the new file. Readers that hold the old file get `MXL_ERR_FLOW_INVALID` once no new grain comes, and have to open the flow again (IS-05 receivers: activate them again, as for any rebuild).
 
-- Off by default. Start the agent with `MIRROR_ADMIN_REBUILD=true` to allow it; the setting is read at start, so `PUT /api/v1/config` cannot open the hook on a running agent. Like the rest of `/api/v1` the hook has no authentication (protected networks only).
+- Off by default. Start the agent with `MIRROR_ADMIN_REBUILD=true` in its environment to allow it. Only the deployment can open the hook: the setting is environment-only and read at start, a config file that holds it is ignored, `PUT /api/v1/config` with it answers `400`, the import skips it and the export does not show it. Like the rest of `/api/v1` the hook has no authentication (protected networks only).
 - Answers: `403` while it is off, `400` for ids that are not UUIDs, `404` when this agent has no such mirror flow, `200` with `old_inode`, `inode` and the `readers` (`pid`, `comm`) that mapped the old file, `500` when the flow could not be created again (the next pass retries while the mirror is wanted).
 - Logs `mirror_rebuild_requested` at once and `mirror_rebuilt` with reason `api` on the next pass; `mirror_rebuilds_total` rises and the SSE event `mirror` goes out like for any rebuild. `MIRROR_CLEANUP_DRY_RUN` does not apply.
 

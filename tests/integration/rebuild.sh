@@ -144,7 +144,11 @@ code=$(post $WEB_B "not-a-uuid" "$FLOW_ID")
 [[ "$code" == 400 ]] || fail "hook with a bad id: http $code, expected 400"
 code=$(post $WEB_B "$DOMAIN_ID" "99999999-9999-4999-8999-999999999999")
 [[ "$code" == 404 ]] || fail "hook for an unknown flow: http $code, expected 404"
-say "hook guarded: 403 off, 400 bad id, 404 unknown flow"
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 -X PUT "http://127.0.0.1:$WEB_A/api/v1/config" -d '{"MIRROR_ADMIN_REBUILD":true}')
+[[ "$code" == 400 ]] || fail "PUT /api/v1/config with MIRROR_ADMIN_REBUILD: http $code, expected 400 (environment only)"
+code=$(post $WEB_A "$DOMAIN_ID" "$FLOW_ID")
+[[ "$code" == 403 ]] || fail "hook on A after the PUT: http $code, expected 403"
+say "hook guarded: 403 off, 400 bad id, 404 unknown flow, setting environment-only (PUT 400)"
 
 before=$(inode)
 code=$(post $WEB_B "$DOMAIN_ID" "$FLOW_ID")
