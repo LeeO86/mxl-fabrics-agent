@@ -1,5 +1,10 @@
 #include "mirror/lifecycle.hpp"
 
+#include "util/jsonutil.hpp"
+#include "util/uuid.hpp"
+
+#include <optional>
+
 namespace mfa
 {
 bool flowIncluded(FlowFilter const& filter)
@@ -121,6 +126,72 @@ MirrorDomainPlan planMirrorDomain(MirrorDomainInput const& in)
     }
     plan.remove = true;
     return plan;
+}
+
+namespace
+{
+// A flow definition without its descriptive fields, serialized with sorted keys; none when it is not a JSON object.
+std::optional<std::string> layoutOf(std::string const& def)
+{
+    if (def.empty())
+    {
+        return std::nullopt;
+    }
+    std::string error;
+    auto root = json::parse(def, &error);
+    if (!error.empty() || !root.is<picojson::object>())
+    {
+        return std::nullopt;
+    }
+    auto& obj = root.get<picojson::object>();
+    for (char const* key : {"label", "description", "tags", "parents", "version", "source_id", "device_id"})
+    {
+        obj.erase(key);
+    }
+    return root.serialize();
+}
+} // namespace
+
+bool flowDefinitionChanged(std::string const& mirrorDef, std::string const& originDef)
+{
+    auto const mirror = layoutOf(mirrorDef);
+    auto const origin = layoutOf(originDef);
+    return mirror && origin && *mirror != *origin;
+}
+
+MirrorRebuildRequest parseMirrorRebuildPath(std::string const& path)
+{
+    static std::string const prefix = "/api/v1/mirrors/";
+    static std::string const suffix = "/rebuild";
+    MirrorRebuildRequest request;
+    if (path.size() <= prefix.size() + suffix.size() || path.compare(0, prefix.size(), prefix) != 0 ||
+        path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0)
+    {
+        return request;
+    }
+    auto const ids = path.substr(prefix.size(), path.size() - prefix.size() - suffix.size());
+    auto const slash = ids.find('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 == ids.size() || ids.find('/', slash + 1) != std::string::npos)
+    {
+        return request;
+    }
+    request.matched = true;
+    request.domain_id = ids.substr(0, slash);
+    request.flow_id = ids.substr(slash + 1);
+    return request;
+}
+
+int mirrorRebuildRefusal(bool enabled, MirrorRebuildRequest const& request, bool found)
+{
+    if (!enabled)
+    {
+        return 403;
+    }
+    if (!parseUuid(request.domain_id) || !parseUuid(request.flow_id))
+    {
+        return 400;
+    }
+    return found ? 0 : 404;
 }
 
 MirrorFlowPlan planMirrorFlow(MirrorFlowInput const& in)

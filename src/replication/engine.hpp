@@ -72,6 +72,9 @@ public:
     void setTransferObserver(TransferObserver observer);
     bool ensureWriter(std::string const& path, std::string const& flowDef, std::string* error);
     void releaseWriter(std::string const& path, std::string const& flowId);
+    // Before a mirror flow is rebuilt: drops its destination targets (and the sources' connections to them),
+    // so the next setPulls sets up new ones on the new writer, then releases the agent's writer.
+    void resetMirrorFlow(std::string const& path, std::string const& domainId, std::string const& flowId);
 
 private:
     struct DestState

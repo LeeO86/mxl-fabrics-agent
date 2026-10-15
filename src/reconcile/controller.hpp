@@ -4,6 +4,7 @@
 #include "demand/derive.hpp"
 #include "inventory/scanner.hpp"
 #include "mirror/health.hpp"
+#include "mirror/lifecycle.hpp"
 #include "mirror/readers.hpp"
 #include "nmos/node.hpp"
 #include "nmos/observer.hpp"
@@ -70,6 +71,11 @@ private:
     // after MIRROR_IDLE_GRACE_S when no other process maps one of their files.
     void cleanupMirrorFlows(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
         bool truthOk, std::set<std::string> const& seen);
+    // Tears one mirror flow down for a rebuild (under tickMu_): its targets and the sources' connections, the
+    // agent's writer and its files. The next file of the flow is a rebuild for `reason`. Readers that still
+    // hold the old file get MXL_ERR_FLOW_INVALID once no new grain comes, and open the new one.
+    void teardownMirrorFlow(std::string const& path, std::string const& domainId, std::string const& flowId, std::string const& reason);
+    HttpResponse rebuildMirror(MirrorRebuildRequest const& request);
 
     std::shared_ptr<ConfigStore> store_;
     std::string bootId_;
@@ -101,6 +107,10 @@ private:
     std::vector<MirrorDomainView> mirrorDomains_;     // from the last tick (mu_)
     std::map<std::string, std::chrono::steady_clock::time_point> flowMissingSince_; // per "domain/flow" without its origin
     std::map<std::string, std::string> flowLogged_; // per "domain/flow", the last logged flow cleanup decision
+    // Per "domain/flow", when the mirror was last rebuilt for a changed origin definition (at most one per 5 s;
+    // entries older than that are dropped every pass).
+    std::map<std::string, std::chrono::steady_clock::time_point> configRebuiltAt_;
+    bool adminRebuild_ = false; // MIRROR_ADMIN_REBUILD at start
     std::chrono::steady_clock::time_point nextFlowReaderScan_{};
     std::map<std::string, FabricLink> links_;  // per peer, from the last tick (mu_)
     std::map<std::string, std::string> linkErrors_; // per peer, the last logged link error ("" = up)

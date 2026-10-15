@@ -38,6 +38,7 @@ struct Config
     int mirror_idle_grace_s = 300;       // drop a mirror domain after this long without demand (0 = never)
     int mirror_stale_ms = 2000;          // a mirror without a new grain this long while grains are due is stale (0 = never)
     bool mirror_cleanup_dry_run = false; // mirror cleanup only logs what it would remove
+    bool mirror_admin_rebuild = false;   // POST /api/v1/mirrors/{domain}/{flow}/rebuild is allowed (environment only, read at start)
     int tmpfs_reserve_mb = 512;
     bool cleanup_mirrors_on_exit = false;
     std::string default_provider = "verbs";
@@ -102,6 +103,9 @@ Config loadLayered(std::map<std::string, std::string> const& fileValues, std::ma
     std::map<std::string, ValueOrigin>* origin = nullptr);
 
 bool isRuntimeKey(std::string const& key);
+// Keys read from the environment only (MIRROR_ADMIN_REBUILD): not in configKeys(), the file layer, the export,
+// PUT /api/v1/config or the import.
+bool isEnvironmentOnlyKey(std::string const& key);
 std::vector<std::string> configKeys();
 std::string configToJson(Config const& cfg);
 std::string configToEnv(Config const& cfg);

@@ -158,6 +158,38 @@ void ReplicationEngine::releaseWriter(std::string const& path, std::string const
     dom->releaseWriter(flowId);
 }
 
+void ReplicationEngine::resetMirrorFlow(std::string const& path, std::string const& domainId, std::string const& flowId)
+{
+    auto const suffix = "/" + domainId + "/" + flowId;
+    std::vector<std::pair<std::string, DestState>> reset;
+    {
+        std::lock_guard const lock{mu_};
+        for (auto& [key, state] : dest_)
+        {
+            if (key.size() <= suffix.size() || key.compare(key.size() - suffix.size(), suffix.size(), suffix) != 0)
+            {
+                continue;
+            }
+            reset.emplace_back(key, state);
+            auto const restarts = state.restarts + 1;
+            state = DestState{};
+            state.restarts = restarts;
+        }
+    }
+    for (auto const& [key, state] : reset)
+    {
+        if (!state.control_url.empty() && !state.replication_id.empty())
+        {
+            httpRequest("DELETE", state.control_url + "/replications/" + state.replication_id + "/targets/" + cfg_.host_id);
+        }
+        if (auto dom = domain(state.mirror_path.empty() ? path : state.mirror_path))
+        {
+            dom->destroyTarget(key);
+        }
+    }
+    releaseWriter(path, flowId);
+}
+
 void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
 {
     std::map<std::string, PullRequest> wanted;

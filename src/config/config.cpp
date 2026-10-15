@@ -263,6 +263,11 @@ std::vector<std::string> configKeys()
         "METRICS_PER_FLOW", "AGENT_CONFIG_FILE", "SHUTDOWN_TIMEOUT_S"};
 }
 
+bool isEnvironmentOnlyKey(std::string const& key)
+{
+    return key == "MIRROR_ADMIN_REBUILD";
+}
+
 bool isRuntimeKey(std::string const& key)
 {
     static std::set<std::string> const keys = {"PEERS", "MIRROR_MODE", "MIRROR_INCLUDE_DOMAINS", "MIRROR_INCLUDE_FLOWS",
@@ -428,6 +433,11 @@ Config loadLayered(std::map<std::string, std::string> const& fileValues, std::ma
     }
     auto file = fileValues;
     auto env = envValues;
+    // Environment-only keys (MIRROR_ADMIN_REBUILD): only the deployment sets them, never the file layer.
+    for (auto it = file.begin(); it != file.end();)
+    {
+        it = isEnvironmentOnlyKey(it->first) ? file.erase(it) : std::next(it);
+    }
     alignAlias(file, "MXL_DOMAIN_SCAN_PATH", "MXL_ROOT");
     alignAlias(file, "MXL_CLEANUP_ON_EXIT", "CLEANUP_MIRRORS_ON_EXIT");
     alignAlias(env, "MXL_DOMAIN_SCAN_PATH", "MXL_ROOT");
@@ -448,7 +458,9 @@ Config loadLayered(std::map<std::string, std::string> const& fileValues, std::ma
             (*origin)[key] = ValueOrigin::Env;
         }
     }
-    return parseConfig(merged);
+    auto cfg = parseConfig(merged);
+    cfg.mirror_admin_rebuild = parseBool("MIRROR_ADMIN_REBUILD", valueOr(env, "MIRROR_ADMIN_REBUILD", "false"));
+    return cfg;
 }
 
 std::map<std::string, std::string> configToMap(Config const& cfg)
@@ -562,6 +574,7 @@ std::map<std::string, std::string> environmentValues(char const* const* envp)
     std::set<std::string> known(keys.begin(), keys.end());
     known.insert("MIRROR_INCLUDE");
     known.insert("MIRROR_EXCLUDE");
+    known.insert("MIRROR_ADMIN_REBUILD"); // environment-only
     std::map<std::string, std::string> out;
     if (envp == nullptr)
     {

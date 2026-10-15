@@ -194,6 +194,28 @@ TEST_CASE("mirror health: a new data file is a rebuild")
     CHECK(tracker.entries().at("d/f").rebuilds == 2);
 }
 
+TEST_CASE("mirror health: a rebuild through the API or for a changed origin carries its reason")
+{
+    MirrorHealthTracker tracker;
+    auto const t0 = std::chrono::steady_clock::now();
+    CHECK(tracker.update(live(20, 7), 1000, t0, 0).empty());
+    // The hook tears the flow down and creates it again in one pass: the tracker never sees it absent.
+    tracker.noteRemoved("d/f", "api");
+    auto events = tracker.update(live(20, 8), 1000, t0 + 1s, 1000);
+    REQUIRE(kinds(events) == std::vector<std::string>{"rebuilt"});
+    CHECK(events[0].old_inode == 7);
+    CHECK(tracker.entries().at("d/f").last_rebuild_reason == "api");
+    tracker.noteRemoved("d/f", "origin_config_changed");
+    events = tracker.update(live(20, 9), 1000, t0 + 2s, 2000);
+    REQUIRE(kinds(events) == std::vector<std::string>{"rebuilt"});
+    CHECK(tracker.entries().at("d/f").rebuilds == 2);
+    CHECK(tracker.entries().at("d/f").last_rebuild_reason == "origin_config_changed");
+    // The same file afterwards: no rebuild, and a later new file without a removal is "replaced".
+    CHECK(tracker.update(live(20, 9), 1000, t0 + 3s, 3000).empty());
+    events = tracker.update(live(20, 10), 1000, t0 + 4s, 4000);
+    CHECK(tracker.entries().at("d/f").last_rebuild_reason == "replaced");
+}
+
 TEST_CASE("mirror health: a stale mirror that is rebuilt reports both")
 {
     MirrorHealthTracker tracker;
