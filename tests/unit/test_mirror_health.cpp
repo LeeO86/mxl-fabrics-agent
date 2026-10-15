@@ -260,3 +260,25 @@ TEST_CASE("flow header: inode of the data file, 0 when missing")
     CHECK(header.headIndex == 0); // too short for a version 1 header
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("mirror health: a flow removed because its origin is missing is absent")
+{
+    MirrorHealthTracker tracker;
+    auto obs = live(40);
+    obs.expected = false;
+    obs.origin_live = false;
+    obs.origin_head.reset();
+    obs.idle_reason = "origin_missing";
+    tracker.update(obs, 2000, t0, 1000);
+    CHECK(tracker.entries().at("d/f").state == "idle");
+    CHECK(tracker.entries().at("d/f").reason == "origin_missing");
+    tracker.noteRemoved("d/f", "origin_missing");
+    obs.inode = 0;
+    obs.head.reset();
+    auto const events = tracker.update(obs, 2000, t0 + 1s, 2000);
+    CHECK(events.empty());
+    auto const& h = tracker.entries().at("d/f");
+    CHECK(h.state == "absent");
+    CHECK(h.reason == "origin_missing");
+    CHECK_FALSE(h.last_grain_age_ms.has_value());
+}

@@ -60,4 +60,23 @@ struct MirrorDomainPlan
 };
 
 MirrorDomainPlan planMirrorDomain(MirrorDomainInput const& in);
+
+// One destination mirror flow on disk, in a mirror domain of this agent, that no up peer offers: its origin
+// flow is gone while the rest of the domain may still be in use.
+struct MirrorFlowInput
+{
+    bool offered = false;        // an up peer lists the flow: the per-flow plan (planMirror) applies
+    bool source_up = false;      // the domain's source peer is known and up, so its inventory is the truth
+    bool peers_known = false;    // 30 s after start and, with NMOS, while the registry answers
+    bool grace_expired = false;  // the origin has been missing for MIRROR_IDLE_GRACE_S (0 = never)
+};
+
+struct MirrorFlowPlan
+{
+    bool missing = false; // the origin is missing: the grace clock runs (it stops and resets otherwise)
+    bool remove = false;  // drop the flow now, unless a reader maps it (removalBlocker)
+    std::string reason;   // why it goes: origin_missing
+};
+
+MirrorFlowPlan planMirrorFlow(MirrorFlowInput const& in);
 } // namespace mfa

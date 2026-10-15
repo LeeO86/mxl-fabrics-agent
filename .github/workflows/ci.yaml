@@ -78,3 +78,5 @@ jobs:
           export FI_PROVIDER=tcp
           tests/integration/tcp_mesh.sh
           tests/integration/shutdown.sh
+          # The mirror reader check reads /proc/<pid>/maps of every process: root on the runner.
+          sudo env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" FI_PROVIDER=tcp REQUIRE_READER_CHECK=1 tests/integration/flow_cleanup.sh
