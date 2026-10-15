@@ -68,6 +68,7 @@ struct MirrorFlowInput
     bool offered = false;        // an up peer lists the flow: the per-flow plan (planMirror) applies
     bool source_up = false;      // the domain's source peer is known and up, so its inventory is the truth
     bool peers_known = false;    // 30 s after start and, with NMOS, while the registry answers
+    bool inventories_settled = false; // every up peer's inventory is settled (inventorySettled, 1.7.1)
     bool grace_expired = false;  // the origin has been missing for MIRROR_IDLE_GRACE_S (0 = never)
 };
 
@@ -79,6 +80,11 @@ struct MirrorFlowPlan
 };
 
 MirrorFlowPlan planMirrorFlow(MirrorFlowInput const& in);
+
+// Health reason of a mirror flow that no up peer offers: peer_down while its source peer is down,
+// inventory_pending while an up peer's inventory is not settled yet (an agent that has just started, or
+// whose peer has), else origin_missing.
+std::string unofferedMirrorReason(bool sourceUp, bool inventoriesSettled);
 
 // The origin flow was created again with another definition under the same flow id: the mirror's
 // flow_def.json (the definition it was created with) and the origin's differ in more than the descriptive

@@ -48,6 +48,7 @@ struct FabricRow
     std::string last_error;
     int cq_depth = 0;
     bool fallback = false;
+    bool closed = false; // destination: the target was released after a failed read and waits to be set up again
 };
 
 struct ProviderProbe

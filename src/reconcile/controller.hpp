@@ -61,7 +61,7 @@ private:
         std::vector<std::pair<FlowRecord, std::string>> flows; // with the per-flow mirror state
     };
     std::vector<MirrorDomainView> cleanupMirrors(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
-        bool truthOk, std::set<std::string> const& localIds, std::set<std::string> const& peerDomains,
+        bool truthOk, bool inventoriesSettled, std::set<std::string> const& localIds, std::set<std::string> const& peerDomains,
         std::set<std::string> const& wanted, std::vector<DomainRecord> const& flowViews);
     // Closes the agent's writers of a mirror domain and removes it when no other process maps it.
     // Returns "" when removed, else why not (with the readers).
@@ -70,7 +70,7 @@ private:
     // Mirror flows whose origin flow is gone, in mirror domains that stay (other flows still in use): removed
     // after MIRROR_IDLE_GRACE_S when no other process maps one of their files.
     void cleanupMirrorFlows(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
-        bool truthOk, std::set<std::string> const& seen);
+        bool truthOk, bool inventoriesSettled, std::set<std::string> const& seen);
     // Tears one mirror flow down for a rebuild (under tickMu_): its targets and the sources' connections, the
     // agent's writer and its files. The next file of the flow is a rebuild for `reason`. Readers that still
     // hold the old file get MXL_ERR_FLOW_INVALID once no new grain comes, and open the new one.
@@ -123,7 +123,7 @@ private:
     // Stale and rebuilt destination mirror flows. The tracker is used under tickMu_, its copy for the API
     // and the metrics under mu_.
     void observeMirrors(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
-        std::vector<MirrorObservation> observations, std::set<std::string> const& seen);
+        std::vector<MirrorObservation> observations, std::set<std::string> const& seen, bool inventoriesSettled);
     void reportMirrorEvents(std::vector<MirrorEvent> const& events, int staleMs);
     MirrorHealthTracker mirrorHealth_;
     std::map<std::string, MirrorHealth> mirrorHealthView_;

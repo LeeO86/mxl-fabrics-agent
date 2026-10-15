@@ -212,6 +212,7 @@ struct TargetSlot
     std::size_t lastBatch = 1; // samples in the last committed batch (a "grain" of a continuous flow)
     std::string lastError;
     std::string state = "pending";
+    bool closed = false; // the MXL target was released after a failed read (see closeFailedTarget)
     std::vector<std::uint64_t> pendingGrains;
     struct PendingSamples
     {
@@ -1125,6 +1126,21 @@ private:
         }
     }
 
+    // A target read that fails is the last call into that target. In MXL 218ddaa an RC target whose
+    // accept path throws (rdma_create_qp EINVAL on verbs, a queue that cannot be opened) keeps a moved-from
+    // state, and its next read dereferences a null event queue (SIGSEGV, docs/upstream-rctarget-accept-crash.md).
+    // Destroying it is safe in every state. The replication engine sets up a new target on another port
+    // and hands the source the new target info (ReplicationEngine::reconcile, shouldRebuild).
+    void closeFailedTarget(TargetSlot& slot, std::string const& error)
+    {
+        slot.errors += 1;
+        slot.lastError = error + " (target closed)";
+        slot.state = "error";
+        slot.closed = true;
+        log::warn("fabric_target_closed", {{"flow_id", slot.flowId}, {"provider", slot.provider}, {"error", error}});
+        destroyTargetSlot(slot);
+    }
+
     void pumpTarget(std::string const&, TargetSlot& slot)
     {
         auto const writer = writers_.find(slot.flowId);
@@ -1147,9 +1163,7 @@ private:
                 }
                 if (status != MXL_STATUS_OK)
                 {
-                    slot.errors += 1;
-                    slot.lastError = "read samples " + statusText(status);
-                    slot.state = "error";
+                    closeFailedTarget(slot, "read samples " + statusText(status));
                     return;
                 }
                 slot.pendingSamples.push_back(TargetSlot::PendingSamples{head, count});
@@ -1195,9 +1209,7 @@ private:
                 }
                 if (status != MXL_STATUS_OK)
                 {
-                    slot.errors += 1;
-                    slot.lastError = "read grain " + statusText(status);
-                    slot.state = "error";
+                    closeFailedTarget(slot, "read grain " + statusText(status));
                     return;
                 }
                 slot.pendingGrains.push_back(index);
@@ -1284,6 +1296,7 @@ private:
             row.last_error = slot.lastError;
             row.cq_depth = slot.cqDepth;
             row.fallback = slot.fallback;
+            row.closed = slot.closed;
             rows_.push_back(std::move(row));
         }
         for (auto const& [key, slot] : initiators_)

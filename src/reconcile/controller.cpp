@@ -234,9 +234,13 @@ void Controller::start()
                 nmosRegistered_ = registered;
                 cv_.notify_all();
             });
+    }
+    // The scanner first: the HTTP server already answers, and /api/v1/inventory waits for the first scan.
+    scanner_.start();
+    if (node_)
+    {
         node_->start();
     }
-    scanner_.start();
     peers_.start();
     observer_.start();
     stop_ = false;
@@ -661,10 +665,15 @@ void Controller::tick()
     // Whole mirror domains, after setPulls has dropped the targets they no longer need. Orphans only
     // once the peers are known: 30 s after start and, with NMOS, while the registry answers.
     bool const truthOk = now - started_ >= std::chrono::seconds(30) && (!cfg.nmos_enable || nmos.registry_up);
-    auto domainViews = cleanupMirrors(cfg, inventory, peerSnap, truthOk, localIds, peerDomains, wantedDomains, mirrorViews);
+    // What an up peer does not list counts only once every up peer's inventory is settled: read on two polls
+    // in a row of the same process and from a finished scan. A peer that has just started (or this agent)
+    // may hold an inventory without the flows yet (1.7.1).
+    bool const inventoriesSettled =
+        std::all_of(peerSnap.begin(), peerSnap.end(), [](PeerSnapshot const& peer) { return !peer.up || inventorySettled(peer); });
+    auto domainViews = cleanupMirrors(cfg, inventory, peerSnap, truthOk, inventoriesSettled, localIds, peerDomains, wantedDomains, mirrorViews);
     // Then single flows whose origin is gone in the domains that stay; the health below shows them absent.
-    cleanupMirrorFlows(cfg, inventory, peerSnap, truthOk, seen);
-    observeMirrors(cfg, inventory, peerSnap, std::move(remoteObservations), seen);
+    cleanupMirrorFlows(cfg, inventory, peerSnap, truthOk, inventoriesSettled, seen);
+    observeMirrors(cfg, inventory, peerSnap, std::move(remoteObservations), seen, inventoriesSettled);
     {
         std::lock_guard const lock{mu_};
         mirrorHealthView_ = mirrorHealth_.entries();
@@ -678,7 +687,7 @@ void Controller::tick()
 }
 
 std::vector<Controller::MirrorDomainView> Controller::cleanupMirrors(Config const& cfg, Inventory const& inventory,
-    std::vector<PeerSnapshot> const& peerSnap, bool truthOk, std::set<std::string> const& localIds,
+    std::vector<PeerSnapshot> const& peerSnap, bool truthOk, bool inventoriesSettled, std::set<std::string> const& localIds,
     std::set<std::string> const& peerDomains, std::set<std::string> const& wanted, std::vector<DomainRecord> const& flowViews)
 {
     auto const now = std::chrono::steady_clock::now();
@@ -761,7 +770,7 @@ std::vector<Controller::MirrorDomainView> Controller::cleanupMirrors(Config cons
         }
         MirrorDomainInput input;
         input.origin_local = view.origin_local;
-        input.origin_on_peer = view.origin_on_peer || !truthOk; // not an orphan until the peers are known
+        input.origin_on_peer = view.origin_on_peer || !truthOk || !inventoriesSettled; // not an orphan until the peers are known
         input.source_peer_down = sourceKnownDown;
         input.demand = view.demand;
         input.idle_expired = !view.demand && cfg.mirror_idle_grace_s > 0 &&
@@ -960,7 +969,7 @@ std::string Controller::removeMirrorDomain(std::string const& domainId, std::str
 }
 
 void Controller::cleanupMirrorFlows(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
-    bool truthOk, std::set<std::string> const& seen)
+    bool truthOk, bool inventoriesSettled, std::set<std::string> const& seen)
 {
     auto const now = std::chrono::steady_clock::now();
     struct Candidate
@@ -997,8 +1006,9 @@ void Controller::cleanupMirrorFlows(Config const& cfg, Inventory const& inventor
             input.offered = seen.count(key) != 0;
             input.source_up = sourceUp;
             input.peers_known = truthOk;
+            input.inventories_settled = inventoriesSettled;
             std::chrono::steady_clock::time_point since = now;
-            if (!input.offered && input.source_up)
+            if (!input.offered && input.source_up && input.inventories_settled)
             {
                 since = flowMissingSince_.try_emplace(key, now).first->second;
                 input.grace_expired = cfg.mirror_idle_grace_s > 0 && now - since >= std::chrono::seconds(cfg.mirror_idle_grace_s);
@@ -1126,7 +1136,7 @@ void Controller::cleanupMirrorFlows(Config const& cfg, Inventory const& inventor
 }
 
 void Controller::observeMirrors(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
-    std::vector<MirrorObservation> observations, std::set<std::string> const& seen)
+    std::vector<MirrorObservation> observations, std::set<std::string> const& seen, bool inventoriesSettled)
 {
     auto const now = std::chrono::steady_clock::now();
     auto const tai = taiNowSeconds();
@@ -1160,14 +1170,10 @@ void Controller::observeMirrors(Config const& cfg, Inventory const& inventory, s
             obs.peer = domain.source_host_id;
             obs.rate_num = flow.grain_rate_num;
             obs.rate_den = flow.grain_rate_den;
-            if (sourceUp)
-            {
-                obs.idle_reason = "origin_missing";
-            }
-            else
+            obs.idle_reason = unofferedMirrorReason(sourceUp, inventoriesSettled);
+            if (!sourceUp)
             {
                 obs.blocked = "peer_down";
-                obs.idle_reason = "peer_down";
                 obs.expected = mirrorHealth_.expected(key) && lastDemand_.count(key) != 0;
             }
             observations.push_back(std::move(obs));
@@ -1550,6 +1556,11 @@ HttpResponse Controller::handle(HttpRequest const& request)
         // Each local flow's head index now (not part of the revision): a destination tells a mirror that
         // misses grains from an origin that writes none.
         auto inventory = scanner_.snapshot();
+        // Before the first scan the inventory is empty, not the truth: a peer would miss every flow (1.7.1).
+        if (inventory.revision == 0)
+        {
+            return json(503, R"({"error":"inventory not scanned yet"})");
+        }
         for (auto& domain : inventory.domains)
         {
             if (domain.kind != "local")

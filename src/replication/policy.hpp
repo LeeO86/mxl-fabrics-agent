@@ -18,11 +18,13 @@ struct StallInput
     bool destError = false;                           // the destination's target reports errors
     bool sourceError = false;                         // the source answered "error" (its transfers do not complete)
     bool originMoved = false;                         // the origin was written more than 1 s after the last grain
+    bool destClosed = false;                          // the destination released its target after a failed read
 };
 
 // True when the destination should set its target up again: something says grains are due (an
 // error on either side, or an origin that moves on) and none came for 5 s, or 1 s when the source
-// reports the error. The wait doubles with each rebuild in a row, three times at most.
+// reports the error or the destination closed its target (nothing listens any more). The wait doubles
+// with each rebuild in a row, three times at most.
 bool shouldRebuild(StallInput const& in);
 
 // True when `index`, the grain a source wants to send next, is one its origin never wrote while a later

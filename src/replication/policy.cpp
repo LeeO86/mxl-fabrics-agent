@@ -14,11 +14,11 @@ std::chrono::milliseconds nextBackoff(std::chrono::milliseconds current)
 
 bool shouldRebuild(StallInput const& in)
 {
-    if (!in.destError && !in.sourceError && !in.originMoved)
+    if (!in.destError && !in.sourceError && !in.originMoved && !in.destClosed)
     {
         return false;
     }
-    auto const base = in.sourceError ? std::chrono::seconds(1) : std::chrono::seconds(5);
+    auto const base = in.sourceError || in.destClosed ? std::chrono::seconds(1) : std::chrono::seconds(5);
     return in.sinceGrain > base * (1LL << std::min<std::uint64_t>(in.stalls, 3));
 }
 

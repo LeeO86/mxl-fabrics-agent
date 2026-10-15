@@ -197,13 +197,23 @@ int mirrorRebuildRefusal(bool enabled, MirrorRebuildRequest const& request, bool
 MirrorFlowPlan planMirrorFlow(MirrorFlowInput const& in)
 {
     MirrorFlowPlan plan;
-    // A source peer that is down may still hold the origin: wait for it, as for a whole domain.
-    plan.missing = !in.offered && in.source_up;
+    // A source peer that is down may still hold the origin: wait for it, as for a whole domain. An
+    // inventory that is not settled may not list the flow yet: no clock, no log until it is.
+    plan.missing = !in.offered && in.source_up && in.inventories_settled;
     if (plan.missing && in.peers_known && in.grace_expired)
     {
         plan.remove = true;
         plan.reason = "origin_missing";
     }
     return plan;
+}
+
+std::string unofferedMirrorReason(bool sourceUp, bool inventoriesSettled)
+{
+    if (!sourceUp)
+    {
+        return "peer_down";
+    }
+    return inventoriesSettled ? "origin_missing" : "inventory_pending";
 }
 } // namespace mfa

@@ -4,6 +4,7 @@
 #include "config/store.hpp"
 #include "mirror/lifecycle.hpp"
 #include "mirror/readers.hpp"
+#include "peer/manager.hpp"
 
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -151,6 +152,7 @@ TEST_CASE("mirror flow: origin missing is kept for the grace time, then removed"
     MirrorFlowInput in;
     in.source_up = true;
     in.peers_known = true;
+    in.inventories_settled = true;
     auto plan = planMirrorFlow(in);
     CHECK(plan.missing);
     CHECK_FALSE(plan.remove);
@@ -165,10 +167,81 @@ TEST_CASE("mirror flow: nothing goes before the peers are known")
 {
     MirrorFlowInput in;
     in.source_up = true;
+    in.inventories_settled = true;
     in.grace_expired = true;
     auto const plan = planMirrorFlow(in);
     CHECK(plan.missing); // the grace time runs meanwhile
     CHECK_FALSE(plan.remove);
+}
+
+TEST_CASE("mirror flow: not missing before every up peer's inventory is settled")
+{
+    // 1.7.1: all agents restarted together; 3 s after start the source's first inventory did not list a live
+    // flow yet. No clock, no mirror_flow_origin_missing, no origin_missing health until it is settled.
+    MirrorFlowInput in;
+    in.source_up = true;
+    in.peers_known = true;
+    in.grace_expired = true;
+    auto plan = planMirrorFlow(in);
+    CHECK_FALSE(plan.missing);
+    CHECK_FALSE(plan.remove);
+    CHECK(unofferedMirrorReason(true, false) == "inventory_pending");
+    in.inventories_settled = true;
+    plan = planMirrorFlow(in);
+    CHECK(plan.missing);
+    CHECK(plan.remove);
+    CHECK(unofferedMirrorReason(true, true) == "origin_missing");
+    CHECK(unofferedMirrorReason(false, false) == "peer_down");
+    CHECK(unofferedMirrorReason(false, true) == "peer_down");
+}
+
+TEST_CASE("peer inventory: settled after one full poll of the same process with a scanned inventory")
+{
+    PeerSnapshot peer;
+    peer.host_id = "node-b";
+    peer.boot_id = "boot-1";
+    peer.inventory.revision = 3;
+    peer.up = false;
+    CHECK(nextPollCount(nullptr, peer) == 0);
+    peer.up = true;
+    peer.polls = nextPollCount(nullptr, peer); // the first poll after this agent started
+    CHECK(peer.polls == 1);
+    CHECK_FALSE(inventorySettled(peer));
+    auto const first = peer;
+    peer.polls = nextPollCount(&first, peer); // one full poll later
+    CHECK(peer.polls == 2);
+    CHECK(inventorySettled(peer));
+    auto const second = peer;
+    peer.polls = nextPollCount(&second, peer);
+    CHECK(peer.polls == 3);
+    CHECK(inventorySettled(peer));
+
+    // The peer restarted (another boot id): its first inventory may not list its flows yet.
+    auto const before = peer;
+    peer.boot_id = "boot-2";
+    peer.polls = nextPollCount(&before, peer);
+    CHECK(peer.polls == 1);
+    CHECK_FALSE(inventorySettled(peer));
+
+    // Down in between: counting starts again.
+    auto down = peer;
+    down.up = false;
+    down.polls = nextPollCount(&peer, down);
+    CHECK(down.polls == 0);
+    CHECK_FALSE(inventorySettled(down));
+    auto back = down;
+    back.up = true;
+    back.polls = nextPollCount(&down, back);
+    CHECK(back.polls == 1);
+
+    // An agent before its first scan answers revision 0 and no domain (before 1.7.1; 503 since).
+    PeerSnapshot fresh;
+    fresh.up = true;
+    fresh.polls = 5;
+    fresh.inventory.revision = 0;
+    CHECK_FALSE(inventorySettled(fresh));
+    fresh.inventory.revision = 1;
+    CHECK(inventorySettled(fresh));
 }
 
 TEST_CASE("reader scan per flow: a reader of one flow keeps only that flow")

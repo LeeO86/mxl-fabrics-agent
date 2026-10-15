@@ -59,6 +59,28 @@ TEST_CASE("a destination rebuilds only when grains are due and none came")
     CHECK(shouldRebuild(dest));
 }
 
+TEST_CASE("a destination that closed its target after a failed read sets it up again after 1 s")
+{
+    // The target is gone (a failed accept, 1.7.1): nothing listens, so there is no reason to wait 5 s.
+    StallInput closed;
+    closed.destError = true;
+    closed.destClosed = true;
+    closed.sinceGrain = 500ms;
+    CHECK_FALSE(shouldRebuild(closed));
+    closed.sinceGrain = 1500ms;
+    CHECK(shouldRebuild(closed));
+    // A target that fails again right after each rebuild backs off: 2 s, 4 s, 8 s at most.
+    closed.stalls = 1;
+    CHECK_FALSE(shouldRebuild(closed));
+    closed.sinceGrain = 2500ms;
+    CHECK(shouldRebuild(closed));
+    closed.stalls = 7;
+    closed.sinceGrain = 7900ms;
+    CHECK_FALSE(shouldRebuild(closed));
+    closed.sinceGrain = 8100ms;
+    CHECK(shouldRebuild(closed));
+}
+
 TEST_CASE("a re-created or deleted origin flow is seen by its inode")
 {
     auto const dir = std::filesystem::temp_directory_path() / "mfa-origin-test";

@@ -4,6 +4,7 @@
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 namespace mfa
@@ -77,6 +78,24 @@ Inventory parseInventoryJson(std::string const& body)
         inventory.domains.push_back(std::move(domain));
     }
     return inventory;
+}
+
+std::uint32_t nextPollCount(PeerSnapshot const* previous, PeerSnapshot const& now)
+{
+    if (!now.up)
+    {
+        return 0;
+    }
+    if (previous == nullptr || !previous->up || previous->boot_id != now.boot_id)
+    {
+        return 1;
+    }
+    return previous->polls + 1;
+}
+
+bool inventorySettled(PeerSnapshot const& peer)
+{
+    return peer.up && peer.inventory.revision > 0 && peer.polls >= 2;
 }
 
 PeerManager::PeerManager(Config cfg, Wake wake)
@@ -211,6 +230,16 @@ void PeerManager::loop()
             if (peers.size() != live_.size())
             {
                 changed = true;
+            }
+            for (auto& peer : peers)
+            {
+                auto const previous = std::find_if(live_.begin(), live_.end(), [&](auto const& p) { return p.host_id == peer.host_id; });
+                peer.polls = nextPollCount(previous != live_.end() ? &*previous : nullptr, peer);
+                // The poll that settles the inventory: the controller may now judge flows the peer does not list.
+                if (peer.polls == 2)
+                {
+                    changed = true;
+                }
             }
             live_ = std::move(peers);
         }
