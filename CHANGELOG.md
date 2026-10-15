@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (1.6.0)
+## 1.6.0
 
 - Single mirror flows whose origin flow is gone are removed. On host-01 13 mirror flows sat in mirror domains still in use, their origin flows gone for days; 1.5.0 reported them `idle` (`origin_missing`) and the 1.4.0 cleanup only drops whole domains. Now a mirror flow whose origin is missing (the domain's source peer is up and no up peer offers the flow) is removed after `MIRROR_IDLE_GRACE_S` (the domain setting, default 300 s, `0` never), not in the first 30 s after start and, with NMOS, only while the registry answers. The reader check is the domain one per flow: a flow that another process maps (`/proc/<pid>/maps`, device and inode of the files in its directory) stays and is logged (`mirror_flow_kept_reader`), and nothing goes while the agent cannot see every process; the check runs again after the agent released its writer, right before the files go. Same ownership rules as for domains. `MIRROR_CLEANUP_DRY_RUN=true` logs `mirror_flow_would_remove` and removes nothing. The flow's health becomes `absent` with reason `origin_missing`.
 - Logs `mirror_flow_origin_missing`, `mirror_flow_removed`, `mirror_flow_kept_reader`, `mirror_flow_would_remove`, `mirror_flow_remove_failed`. Metrics `mirror_flows_removed_total{reason}` (`origin_missing`, and the existing per-flow removals `origin_gone`, `no_demand`, `excluded`, which were only logged as `mirror_removed`) and `mirror_flows_refused_total{reason}`.
