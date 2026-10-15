@@ -4,6 +4,7 @@
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 namespace mfa
@@ -77,6 +78,80 @@ Inventory parseInventoryJson(std::string const& body)
         inventory.domains.push_back(std::move(domain));
     }
     return inventory;
+}
+
+std::uint32_t nextPollCount(PeerSnapshot const* previous, PeerSnapshot const& now)
+{
+    if (!now.up)
+    {
+        return 0;
+    }
+    if (previous == nullptr || !previous->up || previous->boot_id != now.boot_id)
+    {
+        return 1;
+    }
+    return previous->polls + 1;
+}
+
+bool inventorySettled(PeerSnapshot const& peer)
+{
+    return peer.up && peer.inventory.revision > 0 && peer.polls >= 2;
+}
+
+void InventorySettleTracker::update(std::vector<PeerSnapshot> const& peers, std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::duration limit)
+{
+    std::map<std::string, InventoryView> views;
+    std::map<std::string, std::chrono::steady_clock::time_point> since;
+    std::map<std::string, std::chrono::steady_clock::time_point> down;
+    for (auto const& peer : peers)
+    {
+        if (inventorySettled(peer))
+        {
+            views[peer.host_id] = InventoryView::Settled;
+            continue;
+        }
+        auto const previous = unsettledSince_.find(peer.host_id);
+        if (!peer.up)
+        {
+            views[peer.host_id] = InventoryView::Down;
+            auto const wasDown = downSince_.find(peer.host_id);
+            auto const downAt = wasDown != downSince_.end() ? wasDown->second : now;
+            down[peer.host_id] = downAt;
+            // Down in between does not reset the wait (a flapping peer); down for longer than the limit does.
+            if (previous != unsettledSince_.end() && now - downAt < limit)
+            {
+                since[peer.host_id] = previous->second;
+            }
+            continue;
+        }
+        auto const start = previous != unsettledSince_.end() ? previous->second : now;
+        since[peer.host_id] = start;
+        views[peer.host_id] = now - start < limit ? InventoryView::Pending : InventoryView::Down;
+    }
+    views_ = std::move(views);
+    unsettledSince_ = std::move(since);
+    downSince_ = std::move(down);
+}
+
+InventoryView InventorySettleTracker::view(std::string const& hostId) const
+{
+    auto const it = views_.find(hostId);
+    return it != views_.end() ? it->second : InventoryView::Down;
+}
+
+bool InventorySettleTracker::anyPending() const
+{
+    return std::any_of(views_.begin(), views_.end(), [](auto const& item) { return item.second == InventoryView::Pending; });
+}
+
+bool InventorySettleTracker::settledFor(std::string const& sourceHost, std::set<std::string> const& holders) const
+{
+    if (view(sourceHost) != InventoryView::Settled)
+    {
+        return false;
+    }
+    return std::none_of(holders.begin(), holders.end(), [&](std::string const& host) { return view(host) == InventoryView::Pending; });
 }
 
 PeerManager::PeerManager(Config cfg, Wake wake)
@@ -211,6 +286,16 @@ void PeerManager::loop()
             if (peers.size() != live_.size())
             {
                 changed = true;
+            }
+            for (auto& peer : peers)
+            {
+                auto const previous = std::find_if(live_.begin(), live_.end(), [&](auto const& p) { return p.host_id == peer.host_id; });
+                peer.polls = nextPollCount(previous != live_.end() ? &*previous : nullptr, peer);
+                // The poll that settles the inventory: the controller may now judge flows the peer does not list.
+                if (peer.polls == 2)
+                {
+                    changed = true;
+                }
             }
             live_ = std::move(peers);
         }

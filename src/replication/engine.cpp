@@ -316,6 +316,7 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
                 stall.stalls = state.stalls;
                 stall.destError = row.state == "error";
                 stall.sourceError = state.source_error;
+                stall.destClosed = row.closed;
                 // "Moved on": more than 1 s after the last grain, so the head read in the same pass as
                 // that grain does not count.
                 stall.originMoved = state.origin_head ? state.origin_moved_at > state.progress_at + std::chrono::seconds(1) : pull.source_active;

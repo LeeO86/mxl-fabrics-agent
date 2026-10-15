@@ -234,9 +234,13 @@ void Controller::start()
                 nmosRegistered_ = registered;
                 cv_.notify_all();
             });
+    }
+    // The scanner first: the HTTP server already answers, and /api/v1/inventory waits for the first scan.
+    scanner_.start();
+    if (node_)
+    {
         node_->start();
     }
-    scanner_.start();
     peers_.start();
     observer_.start();
     stop_ = false;
@@ -352,6 +356,7 @@ void Controller::tick()
         FlowRecord const* flow;
     };
     std::vector<Remote> remotes;
+    domainHolders_.clear();
     for (auto const& peer : peerSnap)
     {
         if (!peer.up)
@@ -361,6 +366,7 @@ void Controller::tick()
         for (auto const& domain : peer.inventory.domains)
         {
             peerDomains.insert(domain.domain_id);
+            domainHolders_[domain.domain_id].insert(peer.host_id);
             for (auto const& flow : domain.flows)
             {
                 remotes.push_back(Remote{&peer, &domain, &flow});
@@ -661,6 +667,11 @@ void Controller::tick()
     // Whole mirror domains, after setPulls has dropped the targets they no longer need. Orphans only
     // once the peers are known: 30 s after start and, with NMOS, while the registry answers.
     bool const truthOk = now - started_ >= std::chrono::seconds(30) && (!cfg.nmos_enable || nmos.registry_up);
+    // What a peer does not list counts only once its inventory is settled: read on two polls in a row of the
+    // same process and from a finished scan. A peer that has just started (or this agent) may hold an
+    // inventory without the flows yet (1.7.1). A peer unsettled for longer than the limit counts as down.
+    settle_.update(peerSnap, now, std::max<std::chrono::steady_clock::duration>(std::chrono::seconds(60),
+                                     std::chrono::milliseconds(3LL * cfg.peer_poll_interval_ms)));
     auto domainViews = cleanupMirrors(cfg, inventory, peerSnap, truthOk, localIds, peerDomains, wantedDomains, mirrorViews);
     // Then single flows whose origin is gone in the domains that stay; the health below shows them absent.
     cleanupMirrorFlows(cfg, inventory, peerSnap, truthOk, seen);
@@ -744,7 +755,7 @@ std::vector<Controller::MirrorDomainView> Controller::cleanupMirrors(Config cons
             if (peer.host_id == view.source_host_id)
             {
                 view.source_up = peer.up;
-                sourceKnownDown = !peer.up;
+                sourceKnownDown = !sourceCounts(peer.host_id); // down, or unsettled beyond the limit
             }
         }
         view.demand = wanted.count(id) != 0;
@@ -761,7 +772,9 @@ std::vector<Controller::MirrorDomainView> Controller::cleanupMirrors(Config cons
         }
         MirrorDomainInput input;
         input.origin_local = view.origin_local;
-        input.origin_on_peer = view.origin_on_peer || !truthOk; // not an orphan until the peers are known
+        // Not an orphan until the peers are known. An orphan goes at once (no grace time), so any up peer whose
+        // inventory is still pending holds it back, at most for the settle limit.
+        input.origin_on_peer = view.origin_on_peer || !truthOk || settle_.anyPending();
         input.source_peer_down = sourceKnownDown;
         input.demand = view.demand;
         input.idle_expired = !view.demand && cfg.mirror_idle_grace_s > 0 &&
@@ -959,6 +972,11 @@ std::string Controller::removeMirrorDomain(std::string const& domainId, std::str
     return {};
 }
 
+bool Controller::sourceCounts(std::string const& sourceHost) const
+{
+    return settle_.view(sourceHost) != InventoryView::Down;
+}
+
 void Controller::cleanupMirrorFlows(Config const& cfg, Inventory const& inventory, std::vector<PeerSnapshot> const& peerSnap,
     bool truthOk, std::set<std::string> const& seen)
 {
@@ -982,14 +1000,10 @@ void Controller::cleanupMirrorFlows(Config const& cfg, Inventory const& inventor
         {
             continue;
         }
-        bool sourceUp = false;
-        for (auto const& peer : peerSnap)
-        {
-            if (peer.host_id == domain.source_host_id)
-            {
-                sourceUp = peer.up;
-            }
-        }
+        bool const sourceUp = sourceCounts(domain.source_host_id);
+        static std::set<std::string> const none;
+        auto const holders = domainHolders_.find(domain.domain_id);
+        bool const settled = settle_.settledFor(domain.source_host_id, holders != domainHolders_.end() ? holders->second : none);
         for (auto const& flow : domain.flows)
         {
             auto const key = domain.domain_id + "/" + flow.flow_id;
@@ -997,13 +1011,28 @@ void Controller::cleanupMirrorFlows(Config const& cfg, Inventory const& inventor
             input.offered = seen.count(key) != 0;
             input.source_up = sourceUp;
             input.peers_known = truthOk;
-            std::chrono::steady_clock::time_point since = now;
+            input.inventories_settled = settled;
+            std::chrono::steady_clock::duration missingFor{};
             if (!input.offered && input.source_up)
             {
-                since = flowMissingSince_.try_emplace(key, now).first->second;
-                input.grace_expired = cfg.mirror_idle_grace_s > 0 && now - since >= std::chrono::seconds(cfg.mirror_idle_grace_s);
+                // Pending: an existing clock pauses (and stays), none starts.
+                auto clock = flowMissingSince_.find(key);
+                if (clock == flowMissingSince_.end() && settled)
+                {
+                    clock = flowMissingSince_.emplace(key, MissingClock{now, std::nullopt}).first;
+                }
+                if (clock != flowMissingSince_.end())
+                {
+                    missingFor = stepMissingClock(clock->second, !settled, now);
+                }
+                input.grace_expired = settled && cfg.mirror_idle_grace_s > 0 && missingFor >= std::chrono::seconds(cfg.mirror_idle_grace_s);
             }
             auto const plan = planMirrorFlow(input);
+            if (plan.pending)
+            {
+                missing.insert(key); // keeps its clock and its log state
+                continue;
+            }
             if (!plan.missing)
             {
                 continue;
@@ -1020,7 +1049,7 @@ void Controller::cleanupMirrorFlows(Config const& cfg, Inventory const& inventor
             if (plan.remove && fs::is_directory(flowPath))
             {
                 candidates.push_back(Candidate{key, domain.domain_id, flow.flow_id, domain.path, flowPath, plan.reason,
-                    std::chrono::duration_cast<std::chrono::seconds>(now - since).count()});
+                    std::chrono::duration_cast<std::chrono::seconds>(missingFor).count()});
             }
         }
     }
@@ -1139,14 +1168,10 @@ void Controller::observeMirrors(Config const& cfg, Inventory const& inventory, s
         {
             continue;
         }
-        bool sourceUp = false;
-        for (auto const& peer : peerSnap)
-        {
-            if (peer.host_id == domain.source_host_id)
-            {
-                sourceUp = peer.up;
-            }
-        }
+        bool const sourceUp = sourceCounts(domain.source_host_id);
+        static std::set<std::string> const none;
+        auto const holders = domainHolders_.find(domain.domain_id);
+        bool const settled = settle_.settledFor(domain.source_host_id, holders != domainHolders_.end() ? holders->second : none);
         for (auto const& flow : domain.flows)
         {
             auto const key = domain.domain_id + "/" + flow.flow_id;
@@ -1160,14 +1185,10 @@ void Controller::observeMirrors(Config const& cfg, Inventory const& inventory, s
             obs.peer = domain.source_host_id;
             obs.rate_num = flow.grain_rate_num;
             obs.rate_den = flow.grain_rate_den;
-            if (sourceUp)
-            {
-                obs.idle_reason = "origin_missing";
-            }
-            else
+            obs.idle_reason = unofferedMirrorReason(sourceUp, settled);
+            if (!sourceUp)
             {
                 obs.blocked = "peer_down";
-                obs.idle_reason = "peer_down";
                 obs.expected = mirrorHealth_.expected(key) && lastDemand_.count(key) != 0;
             }
             observations.push_back(std::move(obs));
@@ -1550,6 +1571,11 @@ HttpResponse Controller::handle(HttpRequest const& request)
         // Each local flow's head index now (not part of the revision): a destination tells a mirror that
         // misses grains from an origin that writes none.
         auto inventory = scanner_.snapshot();
+        // Before the first scan the inventory is empty, not the truth: a peer would miss every flow (1.7.1).
+        if (inventory.revision == 0)
+        {
+            return json(503, R"({"error":"inventory not scanned yet"})");
+        }
         for (auto& domain : inventory.domains)
         {
             if (domain.kind != "local")

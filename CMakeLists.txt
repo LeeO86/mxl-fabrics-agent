@@ -104,6 +104,10 @@ add_executable(mxl-pattern-writer tests/tools/pattern_writer.cpp)
 target_link_libraries(mxl-pattern-writer PRIVATE mxl::mxl)
 target_compile_features(mxl-pattern-writer PRIVATE cxx_std_20)
 
+# LD_PRELOAD fault injection for tests/integration/accept_fail.sh (not installed).
+add_library(mfa-accept-fault SHARED tests/tools/accept_fault.cpp)
+target_link_libraries(mfa-accept-fault PRIVATE ${CMAKE_DL_LIBS})
+
 install(TARGETS mxl-fabrics-agent mxl-pattern-writer RUNTIME DESTINATION bin)
 else()
     message(STATUS "mxl not found; building unit tests only")

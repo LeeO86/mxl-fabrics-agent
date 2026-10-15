@@ -212,6 +212,7 @@ struct TargetSlot
     std::size_t lastBatch = 1; // samples in the last committed batch (a "grain" of a continuous flow)
     std::string lastError;
     std::string state = "pending";
+    bool closed = false; // the MXL target was released after a failed read (see closeFailedTarget)
     std::vector<std::uint64_t> pendingGrains;
     struct PendingSamples
     {
@@ -250,6 +251,7 @@ struct InitiatorSlot
     std::chrono::steady_clock::time_point transferStart{};
     bool awaitingCompletion = false;
     std::string lastError;
+    std::string closedLogged; // the last fabric_initiator_closed error logged, until a pass works again
     std::string state = "pending";
     std::map<std::string, mxlFabricsTargetInfo> targets;
     // The target info each target was added with, to recognise a repeated request.
@@ -888,6 +890,32 @@ private:
         log::info("origin_reopened", {{"replication_id", key}, {"flow_id", slot.flowId}});
     }
 
+    // The initiator twin of closeFailedTarget. In MXL 218ddaa an RC initiator endpoint whose activation throws
+    // (fi_ep_bind or fi_connect fails) keeps a moved-from Idle state, and the next MakeProgress calls
+    // fi_ep_bind on a null endpoint (SIGSEGV, docs/upstream-rctarget-accept-crash.md). The initiator is
+    // destroyed at once and its targets forgotten, as after a shut-down connection: the destination's next
+    // request adds its target again, and checkOrigin opens a new initiator for it.
+    void closeFailedInitiator(std::string const& key, InitiatorSlot& slot, std::string const& error)
+    {
+        // One line when the error starts or changes, not one per retry (a connect that fails every time).
+        if (slot.closedLogged != error)
+        {
+            log::warn("fabric_initiator_closed", {{"replication_id", key}, {"flow_id", slot.flowId}, {"provider", slot.provider}, {"error", error}});
+            slot.closedLogged = error;
+        }
+        closeInitiator(slot);
+        for (auto& [_, info] : slot.targets)
+        {
+            mxlFabricsFreeTargetInfo(info);
+        }
+        slot.targets.clear();
+        slot.targetTexts.clear();
+        updateEntryBytes(slot);
+        slot.errors += 1;
+        slot.lastError = error + " (initiator closed)";
+        slot.state = "error";
+    }
+
     void pumpInitiator(std::string const& key, InitiatorSlot& slot)
     {
         if (slot.targets.empty())
@@ -941,9 +969,7 @@ private:
         }
         if (progress != MXL_STATUS_OK)
         {
-            slot.errors += 1;
-            slot.lastError = "progress " + statusText(progress);
-            slot.state = "error";
+            closeFailedInitiator(key, slot, "progress " + statusText(progress));
             return;
         }
         slot.connected = true;
@@ -981,6 +1007,7 @@ private:
         {
             slot.state = "active";
             slot.lastError.clear();
+            slot.closedLogged.clear();
         }
     }
 
@@ -1125,6 +1152,21 @@ private:
         }
     }
 
+    // A target read that fails is the last call into that target. In MXL 218ddaa an RC target whose
+    // accept path throws (rdma_create_qp EINVAL on verbs, a queue that cannot be opened) keeps a moved-from
+    // state, and its next read dereferences a null event queue (SIGSEGV, docs/upstream-rctarget-accept-crash.md).
+    // Destroying it is safe in every state. The replication engine sets up a new target on another port
+    // and hands the source the new target info (ReplicationEngine::reconcile, shouldRebuild).
+    void closeFailedTarget(TargetSlot& slot, std::string const& error)
+    {
+        slot.errors += 1;
+        slot.lastError = error + " (target closed)";
+        slot.state = "error";
+        slot.closed = true;
+        log::warn("fabric_target_closed", {{"flow_id", slot.flowId}, {"provider", slot.provider}, {"error", error}});
+        destroyTargetSlot(slot);
+    }
+
     void pumpTarget(std::string const&, TargetSlot& slot)
     {
         auto const writer = writers_.find(slot.flowId);
@@ -1147,9 +1189,7 @@ private:
                 }
                 if (status != MXL_STATUS_OK)
                 {
-                    slot.errors += 1;
-                    slot.lastError = "read samples " + statusText(status);
-                    slot.state = "error";
+                    closeFailedTarget(slot, "read samples " + statusText(status));
                     return;
                 }
                 slot.pendingSamples.push_back(TargetSlot::PendingSamples{head, count});
@@ -1195,9 +1235,7 @@ private:
                 }
                 if (status != MXL_STATUS_OK)
                 {
-                    slot.errors += 1;
-                    slot.lastError = "read grain " + statusText(status);
-                    slot.state = "error";
+                    closeFailedTarget(slot, "read grain " + statusText(status));
                     return;
                 }
                 slot.pendingGrains.push_back(index);
@@ -1284,6 +1322,7 @@ private:
             row.last_error = slot.lastError;
             row.cq_depth = slot.cqDepth;
             row.fallback = slot.fallback;
+            row.closed = slot.closed;
             rows_.push_back(std::move(row));
         }
         for (auto const& [key, slot] : initiators_)

@@ -105,7 +105,13 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> mirrorIdleSince_; // per mirror domain without demand
     std::map<std::string, std::string> mirrorLogged_; // per mirror domain, the last logged cleanup decision
     std::vector<MirrorDomainView> mirrorDomains_;     // from the last tick (mu_)
-    std::map<std::string, std::chrono::steady_clock::time_point> flowMissingSince_; // per "domain/flow" without its origin
+    std::map<std::string, MissingClock> flowMissingSince_; // per "domain/flow" without its origin
+    // Which peers' inventories may decide about flows and domains they do not list (1.7.1), and the up peers
+    // that list each domain, both from the current pass.
+    InventorySettleTracker settle_;
+    std::map<std::string, std::set<std::string>> domainHolders_;
+    // The source peer of a mirror domain counts as up for the clean-up and health decisions.
+    bool sourceCounts(std::string const& sourceHost) const;
     std::map<std::string, std::string> flowLogged_; // per "domain/flow", the last logged flow cleanup decision
     // Per "domain/flow", when the mirror was last rebuilt for a changed origin definition (at most one per 5 s;
     // entries older than that are dropped every pass).

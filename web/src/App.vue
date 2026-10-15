@@ -11,6 +11,7 @@ const demand = ref({ receivers: [] });
 const peers = ref([]);
 const configDoc = ref({ config: {}, origin: {}, restart_required: false });
 const message = ref("");
+const scanning = ref(false); // /api/v1/inventory answers 503 until the agent's first scan
 let timer = 0;
 
 async function get(path) {
@@ -20,12 +21,25 @@ async function get(path) {
   return type.includes("json") ? response.json() : response.text();
 }
 
+// The inventory before the agent's first scan: 503, shown as "scanning" (the last one stays), retried on
+// the next refresh.
+async function getInventory() {
+  const response = await fetch("/api/v1/inventory");
+  if (response.status === 503) {
+    scanning.value = true;
+    return null;
+  }
+  if (!response.ok) throw new Error("/api/v1/inventory " + response.status);
+  scanning.value = false;
+  return response.json();
+}
+
 async function refresh() {
   try {
     const [i, s, inv, mir, rep, dem, pee, cfg] = await Promise.all([
       get("/api/v1/info"),
       get("/statusz"),
-      get("/api/v1/inventory"),
+      getInventory(),
       get("/api/v1/mirrors"),
       get("/api/v1/replications"),
       get("/api/v1/demand"),
@@ -34,7 +48,7 @@ async function refresh() {
     ]);
     info.value = i;
     status.value = s;
-    inventory.value = inv;
+    if (inv) inventory.value = inv;
     mirrors.value = mir;
     replications.value = rep;
     demand.value = dem;
@@ -112,7 +126,7 @@ onUnmounted(() => clearInterval(timer));
       <div class="card"><div class="k">TAI offset</div><div class="v">{{ info.tai_offset_seconds }}s</div></div>
       <div class="card"><div class="k">Registry</div><div class="v">{{ status.nmos ? "up" : "down" }}</div></div>
       <div class="card"><div class="k">Peers up</div><div class="v">{{ peers.filter(p => p.up && p.link_up !== false).length }} / {{ peers.length }}</div></div>
-      <div class="card"><div class="k">Local domains</div><div class="v">{{ (inventory.domains || []).length }}</div></div>
+      <div class="card"><div class="k">Local domains</div><div class="v">{{ scanning ? "scanning" : (inventory.domains || []).length }}</div></div>
       <div class="card"><div class="k">Replications</div><div class="v">{{ replications.length }}</div></div>
     </section>
 

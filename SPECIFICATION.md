@@ -403,7 +403,8 @@ Per destination mirror flow, on every reconciliation tick:
   that holds old grains is `pending`, not `stale`, at once.
 - Other states: `live` (a grain younger than the threshold), `pending` (due,
   within the first wait), `idle` (nothing due: `no_demand`, `origin_inactive`,
-  `origin_not_live`, `origin_missing`, `peer_down`, or `origin_silent`: the
+  `origin_not_live`, `origin_missing`, `inventory_pending` (no peer lists the
+  flow yet, but an up peer's inventory is not settled, §8.3), `peer_down`, or `origin_silent`: the
   origin has no newer grain, e.g. a writer without input signal), `absent`
   (the flow is not on disk).
 - **`rebuilt`**: the mirror's data file is a new one (another inode, or back
@@ -547,6 +548,18 @@ posture as the siblings: protected networks only).
 
 Inventory exchange: each agent polls peers' `/inventory` every
 `PEER_POLL_INTERVAL_MS` (default 2000) and additionally reacts to `/events`.
+`/inventory` answers 503 until the agent's first scan (since 1.7.1; before, an
+empty inventory with `revision` 0). A peer's inventory is *settled* once the
+peer has been up for one full poll (read on two polls in a row with the same
+boot id) and its `revision` is above 0. A mirror flow that no peer lists is
+judged (`origin_missing`, §7.4, §7.5) only when its domain's source peer is
+settled and no up peer that lists the domain is still pending. Until then its
+reason is `inventory_pending`, and a running grace clock pauses (it keeps its
+time). A mirror domain is not an orphan while any up peer is pending. A peer
+that stays up but unsettled for longer than 60 s (or three poll intervals,
+whichever is longer; passes while it is down do not reset this unless it is
+down for longer than that) counts as down
+for these decisions.
 
 ### 8.4 Replication handshake (pull model, destination-driven)
 
@@ -597,6 +610,19 @@ transfer: libfabric's `verbs` provider shuts an endpoint down on a completion
 error), the source forgets it (`errors` + 1, `last_error`) and adds it again on
 the destination's next request; the destination's target listens again after a
 shutdown.
+
+A destination target whose read fails (since 1.7.1: an accept that fails, such
+as `rdma_create_qp` EINVAL on `verbs` or a queue that cannot be opened) is
+released at once and never read again (log `fabric_target_closed`; the link is
+`error` with `last_error` `… (target closed)`). In MXL 218ddaa such a target
+crashes the process on its next read
+(`docs/upstream-rctarget-accept-crash.md`). The destination sets up a new target
+on the next port after 1 s without a grain (1, 2, 4, 8 s in a row) and repeats
+the handshake.
+A source initiator whose `MakeProgress` fails (other than not ready or
+interrupted; the same MXL bug when `fi_connect` throws) is released at once and
+its targets forgotten; the destination's next request adds its target to a new
+initiator.
 
 When a flow (domain id and flow id) is offered by more than one peer (a function
 moved to another host and left its domain behind), the destination replicates
@@ -837,6 +863,11 @@ cleanup (§7.4): `mirror_flow_origin_missing` (info; `domain_id`, `flow_id`,
 Rebuilds (§7.4, §7.5): `mirror_origin_changed` (warn; `domain_id`, `flow_id`,
 `peer`), `mirror_rebuild_requested` (warn; `domain_id`, `flow_id`, `old_inode`,
 `inode`, `readers`, `error`).
+`fabric_target_closed` (warn; `flow_id`, `provider`, `error`): a destination
+target released after a failed read (§8.4, since 1.7.1).
+`fabric_initiator_closed` (warn; `replication_id`, `flow_id`, `provider`,
+`error`): a source initiator released after a failed `MakeProgress` (§8.4,
+since 1.7.1).
 
 ### 12.6 Exit codes (aligned with siblings)
 
@@ -923,6 +954,12 @@ Single machine, `tcp` provider over loopback, two simulated hosts:
   exits and comes back at 25 instead of 50 grains/s under the same flow id →
   the mirror is rebuilt (`origin_config_changed`) with the new rate and the
   reader reads again.
+- `tests/integration/accept_fail.sh`: the source's first connect is refused
+  and the destination's first accepted connection fails (`libmfa-accept-fault.so`
+  preloaded) → `fabric_initiator_closed` and `fabric_target_closed`, both agents
+  stay up, new ones are set up and the mirror gets grains → both agents stopped and started together with
+  the mirror on disk → no `origin_missing` for the live flow, in the log or the
+  mirror health, and the mirror gets grains again.
 
 ### 15.3 NMOS checks
 

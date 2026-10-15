@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+#include <optional>
 #include <string>
 
 namespace mfa
@@ -68,17 +70,37 @@ struct MirrorFlowInput
     bool offered = false;        // an up peer lists the flow: the per-flow plan (planMirror) applies
     bool source_up = false;      // the domain's source peer is known and up, so its inventory is the truth
     bool peers_known = false;    // 30 s after start and, with NMOS, while the registry answers
+    bool inventories_settled = false; // the source's inventory is settled and no up peer listing the domain is pending (1.7.1)
     bool grace_expired = false;  // the origin has been missing for MIRROR_IDLE_GRACE_S (0 = never)
 };
 
 struct MirrorFlowPlan
 {
     bool missing = false; // the origin is missing: the grace clock runs (it stops and resets otherwise)
+    bool pending = false; // not offered, but an inventory that decides is not settled: the clock pauses
     bool remove = false;  // drop the flow now, unless a reader maps it (removalBlocker)
     std::string reason;   // why it goes: origin_missing
 };
 
 MirrorFlowPlan planMirrorFlow(MirrorFlowInput const& in);
+
+// The grace clock of a mirror flow whose origin is missing. It runs while the origin is missing, pauses while
+// the inventories that decide are not settled (1.7.1: a peer restart no longer starts it again), and
+// ends when the flow is offered again or its source goes down.
+struct MissingClock
+{
+    std::chrono::steady_clock::time_point since{};
+    std::optional<std::chrono::steady_clock::time_point> pausedAt;
+};
+
+// One pass of a running clock: `pending` pauses it, else it runs (resumed after a pause, the paused time
+// not counted). Returns how long the origin has been missing.
+std::chrono::steady_clock::duration stepMissingClock(MissingClock& clock, bool pending, std::chrono::steady_clock::time_point now);
+
+// Health reason of a mirror flow that no up peer offers: peer_down while its source peer is down,
+// inventory_pending while an up peer's inventory is not settled yet (an agent that has just started, or
+// whose peer has), else origin_missing.
+std::string unofferedMirrorReason(bool sourceUp, bool inventoriesSettled);
 
 // The origin flow was created again with another definition under the same flow id: the mirror's
 // flow_def.json (the definition it was created with) and the origin's differ in more than the descriptive

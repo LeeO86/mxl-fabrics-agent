@@ -197,13 +197,42 @@ int mirrorRebuildRefusal(bool enabled, MirrorRebuildRequest const& request, bool
 MirrorFlowPlan planMirrorFlow(MirrorFlowInput const& in)
 {
     MirrorFlowPlan plan;
-    // A source peer that is down may still hold the origin: wait for it, as for a whole domain.
-    plan.missing = !in.offered && in.source_up;
+    // A source peer that is down may still hold the origin: wait for it, as for a whole domain. An
+    // inventory that is not settled may not list the flow yet: no clock, no log until it is.
+    plan.missing = !in.offered && in.source_up && in.inventories_settled;
+    plan.pending = !in.offered && in.source_up && !in.inventories_settled;
     if (plan.missing && in.peers_known && in.grace_expired)
     {
         plan.remove = true;
         plan.reason = "origin_missing";
     }
     return plan;
+}
+
+std::chrono::steady_clock::duration stepMissingClock(MissingClock& clock, bool pending, std::chrono::steady_clock::time_point now)
+{
+    if (pending)
+    {
+        if (!clock.pausedAt)
+        {
+            clock.pausedAt = now;
+        }
+        return *clock.pausedAt - clock.since;
+    }
+    if (clock.pausedAt)
+    {
+        clock.since += now - *clock.pausedAt;
+        clock.pausedAt.reset();
+    }
+    return now - clock.since;
+}
+
+std::string unofferedMirrorReason(bool sourceUp, bool inventoriesSettled)
+{
+    if (!sourceUp)
+    {
+        return "peer_down";
+    }
+    return inventoriesSettled ? "origin_missing" : "inventory_pending";
 }
 } // namespace mfa
