@@ -211,6 +211,16 @@ TEST_CASE("mirror cleanup settings")
     CHECK_THROWS_AS(parseConfig({{"MIRROR_IDLE_GRACE_S", "-1"}}), ConfigError);
 }
 
+TEST_CASE("mirror rebuild hook setting")
+{
+    CHECK_FALSE(parseConfig({}).mirror_admin_rebuild);
+    CHECK(parseConfig({{"MIRROR_ADMIN_REBUILD", "true"}}).mirror_admin_rebuild);
+    CHECK_THROWS_AS(parseConfig({{"MIRROR_ADMIN_REBUILD", "maybe"}}), ConfigError);
+    // Not a runtime key: a PUT /api/v1/config needs a restart (the agent reads it at start).
+    CHECK_FALSE(isRuntimeKey("MIRROR_ADMIN_REBUILD"));
+    CHECK(configToMap(parseConfig({{"MIRROR_ADMIN_REBUILD", "true"}})).at("MIRROR_ADMIN_REBUILD") == "true");
+}
+
 TEST_CASE("maps line: device and inode")
 {
     auto const key = parseMapsLine("7f1c2a000000-7f1c2a400000 rw-s 00000000 00:2a 123456    /Volumes/mxl/mirror-x/f.mxl-flow/data");

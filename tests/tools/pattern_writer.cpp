@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -69,6 +70,14 @@ int readFlow(std::string const& domain, std::string const& flowId, int seconds)
     return 1;
 }
 
+// Grain rate of the video pattern: 50, or PATTERN_VIDEO_RATE (a writer that comes back with another
+// flow definition under the same flow id).
+std::string videoRate()
+{
+    char const* rate = std::getenv("PATTERN_VIDEO_RATE");
+    return rate != nullptr && std::atoi(rate) > 0 ? std::to_string(std::atoi(rate)) : std::string("50");
+}
+
 // A 1080p50 v210 flow in its own domain with the given history, written in real
 // time for `seconds`; each grain carries its index in the first 8 bytes. With `recreateAfter`
 // (seconds, > 0) the writer is released and created again then, as by a function that restarts:
@@ -85,7 +94,7 @@ int writeVideo(std::string const& domain, std::string const& domainId, std::stri
     std::string const def = std::string("{\"id\":\"") + flowId +
                             "\",\"format\":\"urn:x-nmos:format:video\",\"label\":\"pattern video\",\"description\":\"integration writer\","
                             "\"tags\":{\"urn:x-nmos:tag:grouphint/v1.0\":[\"pattern:Video\"]},\"parents\":[],\"media_type\":\"video/v210\","
-                            "\"grain_rate\":{\"numerator\":50,\"denominator\":1},\"frame_width\":1920,\"frame_height\":1080,"
+                            "\"grain_rate\":{\"numerator\":" + videoRate() + ",\"denominator\":1},\"frame_width\":1920,\"frame_height\":1080,"
                             "\"interlace_mode\":\"progressive\",\"colorspace\":\"BT709\",\"components\":["
                             "{\"name\":\"Y\",\"width\":1920,\"height\":1080,\"bit_depth\":10},"
                             "{\"name\":\"Cb\",\"width\":960,\"height\":1080,\"bit_depth\":10},"
@@ -406,8 +415,96 @@ int sampleRateFlow(std::string const& domain, std::string const& flowId, int sec
     return rate >= minRate ? 0 : 2;
 }
 
+// Reads a (mirrored) discrete flow for `seconds` like a media function that re-opens it on
+// MXL_ERR_FLOW_INVALID (the flow was created again, a new inode). Prints one line per re-open and a
+// summary: grains read, re-opens, grains read since the last re-open. Exit 0 when grains came after
+// the last re-open (or there was none and grains came).
+int followFlow(std::string const& domain, std::string const& flowId, int seconds)
+{
+    auto* instance = mxlCreateInstance(domain.c_str(), "");
+    if (instance == nullptr)
+    {
+        return 1;
+    }
+    auto const start = std::chrono::steady_clock::now();
+    auto const end = start + std::chrono::seconds(seconds);
+    auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); };
+    mxlFlowReader reader = nullptr;
+    long long grains = 0;
+    long long since = 0;
+    int reopens = 0;
+    std::uint64_t index = 0;
+    while (std::chrono::steady_clock::now() < end)
+    {
+        if (reader == nullptr)
+        {
+            if (mxlCreateFlowReader(instance, flowId.c_str(), nullptr, &reader) != MXL_STATUS_OK)
+            {
+                reader = nullptr;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            index = 0;
+        }
+        if (index == 0)
+        {
+            mxlFlowRuntimeInfo runtime{};
+            if (mxlFlowReaderGetRuntimeInfo(reader, &runtime) != MXL_STATUS_OK || runtime.headIndex == 0 || runtime.headIndex == UINT64_MAX)
+            {
+                // No grain yet: wait for the next one at the current time (MXL checks the flow's file when it
+                // is too early, so a re-created flow is seen here too).
+                mxlFlowConfigInfo config{};
+                mxlFlowReaderGetConfigInfo(reader, &config);
+                index = mxlGetCurrentIndex(&config.common.grainRate) + 1;
+            }
+            else
+            {
+                index = runtime.headIndex + 1;
+            }
+        }
+        mxlGrainInfo info{};
+        std::uint8_t* payload = nullptr;
+        auto const status = mxlFlowReaderGetGrain(reader, index, 100000000, &info, &payload);
+        if (status == MXL_ERR_FLOW_INVALID)
+        {
+            mxlReleaseFlowReader(instance, reader);
+            reader = nullptr;
+            reopens += 1;
+            std::cout << "t=" << elapsed() << " flow invalid: re-open " << reopens << " after " << since << " grains" << std::endl;
+            since = 0;
+            continue;
+        }
+        if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
+        {
+            index = 0;
+            continue;
+        }
+        if (status == MXL_STATUS_OK)
+        {
+            grains += 1;
+            since += 1;
+            if (since == 1)
+            {
+                std::cout << "t=" << elapsed() << " first grain " << index << (reopens > 0 ? " after re-open" : "") << std::endl;
+            }
+            ++index;
+        }
+    }
+    std::cout << "grains " << grains << " reopens " << reopens << " since_last_reopen " << since << std::endl;
+    if (reader != nullptr)
+    {
+        mxlReleaseFlowReader(instance, reader);
+    }
+    mxlDestroyInstance(instance);
+    return since > 0 ? 0 : 2;
+}
+
 int main(int argc, char** argv)
 {
+    if (argc > 4 && std::string(argv[1]) == "follow")
+    {
+        return followFlow(argv[2], argv[3], std::atoi(argv[4]));
+    }
     if (argc > 1 && std::string(argv[1]) == "read")
     {
         return readFlow(argc > 2 ? argv[2] : "/dev/shm/mxl-b/mirror", argc > 3 ? argv[3] : "", argc > 4 ? std::atoi(argv[4]) : 20);

@@ -79,4 +79,25 @@ struct MirrorFlowPlan
 };
 
 MirrorFlowPlan planMirrorFlow(MirrorFlowInput const& in);
+
+// The origin flow was created again with another definition under the same flow id: the mirror's
+// flow_def.json (the definition it was created with) and the origin's differ in more than the descriptive
+// fields (label, description, tags, parents, version, source_id, device_id). Rate, format, media type and
+// geometry decide the mirror's layout, so such a mirror is rebuilt. False when either is empty or not a
+// JSON object (no decision without both).
+bool flowDefinitionChanged(std::string const& mirrorDef, std::string const& originDef);
+
+// POST /api/v1/mirrors/{domain_id}/{flow_id}/rebuild: the test hook that rebuilds one mirror flow.
+struct MirrorRebuildRequest
+{
+    bool matched = false; // the path is a rebuild request
+    std::string domain_id;
+    std::string flow_id;
+};
+
+MirrorRebuildRequest parseMirrorRebuildPath(std::string const& path);
+
+// The answer before anything is touched: 403 while MIRROR_ADMIN_REBUILD is off (whatever the ids),
+// 400 for ids that are not UUIDs, 404 when this agent has no such mirror flow, 0 to go ahead.
+int mirrorRebuildRefusal(bool enabled, MirrorRebuildRequest const& request, bool found);
 } // namespace mfa

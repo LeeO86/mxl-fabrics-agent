@@ -141,6 +141,7 @@ State the process writes for itself lives under `STATE_DIR` (default `/config`).
 | `MIRROR_IDLE_GRACE_S` | 300 | Drop a mirror domain after this many seconds without demand, and a mirror flow after its origin flow has been gone this long (`0`: never) |
 | `MIRROR_CLEANUP_DRY_RUN` | false | Mirror cleanup only logs `mirror_domain_would_remove` and `mirror_flow_would_remove` |
 | `MIRROR_STALE_MS` | 2000 | A mirror flow without a new grain for this long while grains are due is `stale` (see Mirror health). `0`: never |
+| `MIRROR_ADMIN_REBUILD` | false | Allow `POST /api/v1/mirrors/{domain_id}/{flow_id}/rebuild`, the test hook that rebuilds one mirror flow (see Mirror health). Read at start: setting it with `PUT /api/v1/config` needs a restart |
 | `TMPFS_RESERVE_MB` | 512 | Free space left on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | On shutdown, remove mirror domains this agent owns. Alias: `CLEANUP_MIRRORS_ON_EXIT`. With false the mirror flows stay, and readers on the host keep reading them after a restart |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |
@@ -197,6 +198,7 @@ All of these are on `WEB_PORT`.
 | GET | `/api/v1/inventory` | Local domains and flows, with each flow's `head_index` at the time of the request |
 | GET | `/api/v1/mirrors` | Mirror domains: origin, flows (with `health`: stale, rebuilt), demand, readers, age, cleanup state |
 | DELETE | `/api/v1/mirrors/{domain_id}` | Remove a mirror domain; 409 while another process maps it |
+| POST | `/api/v1/mirrors/{domain_id}/{flow_id}/rebuild` | Test hook: rebuild one mirror flow so its readers get `MXL_ERR_FLOW_INVALID`; 403 unless `MIRROR_ADMIN_REBUILD=true` |
 | GET | `/api/v1/demand` | Local IS-05 demand |
 | GET | `/api/v1/replications` | Active replications: state, `grains`, `head_index`, `lag_grains` (transfer batches for continuous flows), `lag_ms` (samples ÷ sample rate, or grains × grain period), `origin_gaps`, errors |
 | POST | `/api/v1/replications` | Peer asks this host to send a flow |
@@ -266,7 +268,7 @@ Each reconcile pass (about every 200 ms) gives every mirror flow one state:
 
 `reason`: `no_new_grains`, `no_first_grain`, `peer_down`, `link_down` (stale); `no_demand`, `origin_inactive`, `origin_not_live`, `origin_missing`, `origin_silent`, `peer_down` (idle); the removal reason (absent), e.g. `origin_missing` after the single-flow cleanup.
 
-A mirror is **rebuilt** when its data file is a new one: another inode, or the file back after it was gone. MXL readers keep the file they opened, so a reader of the old one sees no new grain again (the MXL inode quirk). The rebuild reason is why the agent removed it: `origin_gone` (origin inactive longer than `MIRROR_GRACE_S`), `origin_missing` (origin flow gone for `MIRROR_IDLE_GRACE_S`), `no_demand`, `excluded`, `mirror_domain_idle`, `mirror_domain_orphan`, `mirror_domain_same_node`, `mirror_domain_api`, or `replaced` when something else removed or replaced it. Counts and times are kept in memory for 24 h after a mirror was last seen; an agent restart starts them again. Link loss and an origin writer that re-creates its flow do not rebuild the mirror: the destination keeps its target and mirror flow, which then goes `stale` and back to `live`.
+A mirror is **rebuilt** when its data file is a new one: another inode, or the file back after it was gone. MXL readers keep the file they opened, so a reader of the old one sees no new grain again (the MXL inode quirk). The rebuild reason is why the agent removed it: `origin_gone` (origin inactive longer than `MIRROR_GRACE_S`), `origin_missing` (origin flow gone for `MIRROR_IDLE_GRACE_S`), `no_demand`, `excluded`, `mirror_domain_idle`, `mirror_domain_orphan`, `mirror_domain_same_node`, `mirror_domain_api`, `origin_config_changed` (the origin came back with another flow definition), `api` (the test hook), or `replaced` when something else removed or replaced it. Counts and times are kept in memory for 24 h after a mirror was last seen; an agent restart starts them again. Link loss and an origin writer that re-creates its flow with the same definition do not rebuild the mirror: the destination keeps its target and mirror flow, which then goes `stale` and back to `live`.
 
 `GET /api/v1/mirrors` has `health` on each flow: `state`, `reason`, `last_grain_age_ms` (`null` before the first grain), `stale_since` (Unix seconds or `null`), `stale_after_ms`, `rebuilds`, `last_rebuild` (Unix seconds or `null`), `last_rebuild_reason`.
 
@@ -281,6 +283,36 @@ Metrics (labels `domain_id`, `flow_id`, `peer` = source host):
 With `METRICS_PER_FLOW=false` only `mirrors_stale` and an unlabelled `mirror_rebuilds_total` remain. Absent mirrors have no `mirror_stale`, `mirror_state` or age series.
 
 Logs: `mirror_stale` (warn: `domain_id`, `flow_id`, `peer`, `reason`, `last_grain_age_ms`, `stale_after_ms`), `mirror_recovered` (info: the new `state` and `reason`, `stale_ms`; `state=live` is a real recovery), `mirror_rebuilt` (warn: `reason`, `rebuilds`, `old_inode`, `inode`). The same three go out as the SSE event `mirror` with `event` = `stale`, `recovered` or `rebuilt` and the `health` fields.
+
+### Rebuild rules
+
+An origin writer that restarts does not by itself rebuild the mirror. What counts is what the destination sees of the origin in the source's inventory (polled every `PEER_POLL_INTERVAL_MS`, sooner on its SSE events) while it is away:
+
+| The destination sees | Mirror | `mirror_rebuilt` reason when the origin is back |
+| --- | --- | --- |
+| The origin back with the same flow definition before a rule below fires, whatever the gap | Kept: grains go on in the same file after a stall (`stale`, then `live`) | none |
+| The origin listed but inactive (writer killed, its files left behind), with a receiver on this host | Kept (`orphaned` after `MIRROR_GRACE_S`) | none |
+| The same without a receiver on this host, longer than `MIRROR_GRACE_S` (10 s) | Removed, without a reader check | `origin_gone` |
+| The origin flow gone (MXL deletes it with its last writer on a clean exit), its domain still listed, for `MIRROR_IDLE_GRACE_S` (300 s), and no process maps the mirror flow | Removed | `origin_missing` |
+| The origin domain gone (the function deletes its domain on exit, e.g. mxl-replay), seen on one peer poll, and no process maps a file of the mirror domain at the next reader check (every 2 s) | Removed at once | `mirror_domain_orphan` |
+| The origin back with another flow definition (rate, format, media type, geometry; not label, description, tags, parents, version, source or device id) | Rebuilt at once, readers or not: the old layout is wrong for them too | `origin_config_changed` |
+| Source peer or link down; this agent restarted with `MXL_CLEANUP_ON_EXIT=false` | Kept | none |
+| `MIRROR_MODE=on-demand` and no demand for `RELEASE_GRACE_MS` | Removed | `no_demand` |
+| `POST /api/v1/mirrors/{domain_id}/{flow_id}/rebuild` | Rebuilt at once | `api` |
+
+Given the timing the outcome is deterministic, but a restart that deletes the whole origin domain races the peer poll and the reader check: a gap shorter than a poll can go unseen, and a mirror that a reader maps at the check stays. A writer killed and started again over its old files re-opens them: the origin keeps its file and its old definition, so nothing changes on the mirror either.
+
+### Test hook: rebuild one mirror
+
+`POST /api/v1/mirrors/{domain_id}/{flow_id}/rebuild` makes one mirror flow on this host look like an origin that came back with a new definition, to test a media function's re-open path without restarting a producer. It drops the flow's target and the source's connection to it, releases the agent's writer, removes the flow's files and creates the flow again from its own `flow_def.json`, under the same ids. The next reconcile pass (about 200 ms) sets up a new target and replication resumes into the new file. Readers that hold the old file get `MXL_ERR_FLOW_INVALID` once no new grain comes, and have to open the flow again (IS-05 receivers: activate them again, as for any rebuild).
+
+- Off by default. Start the agent with `MIRROR_ADMIN_REBUILD=true` to allow it; the setting is read at start, so `PUT /api/v1/config` cannot open the hook on a running agent. Like the rest of `/api/v1` the hook has no authentication (protected networks only).
+- Answers: `403` while it is off, `400` for ids that are not UUIDs, `404` when this agent has no such mirror flow, `200` with `old_inode`, `inode` and the `readers` (`pid`, `comm`) that mapped the old file, `500` when the flow could not be created again (the next pass retries while the mirror is wanted).
+- Logs `mirror_rebuild_requested` at once and `mirror_rebuilt` with reason `api` on the next pass; `mirror_rebuilds_total` rises and the SSE event `mirror` goes out like for any rebuild. `MIRROR_CLEANUP_DRY_RUN` does not apply.
+
+```bash
+curl -X POST http://<node>:8095/api/v1/mirrors/<domain_id>/<flow_id>/rebuild
+```
 
 ### Platform contract
 

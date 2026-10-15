@@ -325,7 +325,18 @@ mirror is not created, and status/metric/log report `insufficient_space`.
   next writer creates it again with a new inode. The source checks the origin's
   data file once a second (and at once on `MXL_ERR_FLOW_INVALID`); a changed or
   deleted file closes its reader and initiator, and the next check opens the new
-  flow for the same targets. The destination keeps its target and mirror.
+  flow for the same targets. The destination keeps its target and mirror when
+  the new flow has the same definition (grains go on in the same mirror file).
+- Origin created again with another definition under the same flow id (1.6.0):
+  when the origin's `flow_def.json` in the source's inventory differs from the
+  mirror's own in more than its descriptive fields (`label`, `description`,
+  `tags`, `parents`, `version`, `source_id`, `device_id`), the mirror's layout
+  (rate, format, media type, geometry) is wrong. The destination drops its
+  target and the source's connection to it, releases its writer, removes the
+  flow's files and creates the flow again from the new definition on the same
+  pass (log `mirror_origin_changed`; rebuild reason `origin_config_changed`).
+  Readers are not waited for: the old layout is wrong for them too, and they get
+  `MXL_ERR_FLOW_INVALID`. At most one such rebuild per flow per 5 s.
 - Format change at the source (mxl-decklink mints a new flow UUID): the new flow
   is mirrored like any new flow; the old one follows the "disappears" rule.
   Receivers still pointing at the old flow id are reported as `stale_reference`
@@ -399,9 +410,46 @@ Per destination mirror flow, on every reconciliation tick:
   after it was gone). MXL readers keep the file they opened and see no new
   grain on a flow that was created again, so every reader of the mirror needs a
   fresh IS-05 activation. The reason is why the agent removed it
-  (`origin_gone`, `origin_missing`, `no_demand`, `excluded`, `mirror_domain_<idle|orphan|same_node|api>`)
-  or `replaced` when something else did. Counts and times live in memory: an
-  agent restart starts them again.
+  (`origin_gone`, `origin_missing`, `no_demand`, `excluded`, `mirror_domain_<idle|orphan|same_node|api>`,
+  `origin_config_changed`, `api`) or `replaced` when something else did. Counts
+  and times live in memory: an agent restart starts them again.
+
+**Rebuild rules.** Whether an origin restart rebuilds a mirror (new files, new
+inode) or keeps it (grains go on in the same file) is decided by what the
+destination sees of the origin in the source's inventory (polled every
+`PEER_POLL_INTERVAL_MS`, sooner on its SSE events), not by the restart itself:
+
+| What the destination sees | Mirror | Rebuild reason when it comes back |
+| --- | --- | --- |
+| Origin listed again with the same definition, whatever the gap, before one of the rules below fires | kept | — |
+| Origin listed but inactive (a writer killed, its files left): with a receiver on this host | kept (`orphaned` after `MIRROR_GRACE_S`) | — |
+| the same without a receiver, longer than `MIRROR_GRACE_S` (default 10 s) | removed, no reader check | `origin_gone` |
+| Origin flow not listed (MXL deleted it with its last writer), its domain still listed, longer than `MIRROR_IDLE_GRACE_S` (default 300 s) and no process maps the mirror flow | removed | `origin_missing` |
+| Origin domain not listed (the function removed it on exit) on a peer poll, and no process maps a file of the mirror domain at the next reader check (every 2 s) | removed at once | `mirror_domain_orphan` |
+| Origin listed with another definition (§7.4) | rebuilt at once, readers or not | `origin_config_changed` |
+| Source peer down, link down, destination agent restart (`MXL_CLEANUP_ON_EXIT=false`) | kept | — |
+| `MIRROR_MODE=on-demand` and the demand gone for `RELEASE_GRACE_MS` | removed | `no_demand` |
+| `POST /api/v1/mirrors/{domain_id}/{flow_id}/rebuild` | rebuilt at once | `api` |
+
+Given the timing the outcome is deterministic. A restart that removes the whole
+origin domain races the peer poll and the reader check: a gap shorter than
+one poll may go unseen, and a mirror that a reader maps at the check stays.
+
+**Test hook.** `POST /api/v1/mirrors/{domain_id}/{flow_id}/rebuild` rebuilds one
+mirror flow of this agent under the same ids, as an origin with a new
+definition would: it drops the flow's target and the source's connection to it,
+releases the writer, removes the flow's files and creates the flow again from
+its own `flow_def.json`; the next reconciliation pass sets up a new target and
+replication resumes. Readers that map the old file get `MXL_ERR_FLOW_INVALID`
+once no new grain comes and must open the flow again. Off unless
+`MIRROR_ADMIN_REBUILD=true`, read at start (a `PUT /api/v1/config` does not
+open it on a running agent): `403` when off, `400` for ids that are not UUIDs,
+`404` when this agent has no such mirror flow, `500` when the flow could not be
+created again (the next pass retries while the mirror is wanted), `200` with
+`old_inode`, `inode` and the `readers` (`pid`, `comm`) that mapped the old file.
+Logs `mirror_rebuild_requested`; the next pass logs `mirror_rebuilt` with reason
+`api` and counts it in `mirror_rebuilds_total`. It ignores
+`MIRROR_CLEANUP_DRY_RUN`.
 
 Exposed in `GET /api/v1/mirrors` (`flows[].health`), the metrics of §12.3,
 the logs `mirror_stale`, `mirror_recovered`, `mirror_rebuilt` and the SSE event
@@ -487,6 +535,7 @@ posture as the siblings: protected networks only).
 | GET | `/peers` | peers: control plane `up`, fabric `link_up`, `link_error`, `fabric_interface` |
 | GET | `/mirrors` | local mirror domains: origin, flows (with `health`, §7.5), demand, readers, age, cleanup state |
 | DELETE | `/mirrors/{domain_id}` | remove a mirror domain; 409 while another process maps it |
+| POST | `/mirrors/{domain_id}/{flow_id}/rebuild` | test hook: rebuild one mirror flow (§7.5); 403 unless `MIRROR_ADMIN_REBUILD=true` |
 | GET | `/demand` | local demand entries and the receivers behind them |
 | GET | `/config` | effective configuration, where each key came from, `restart_required` |
 | GET | `/config/env` | the same configuration as `KEY=value` lines |
@@ -637,6 +686,7 @@ include/exclude lists apply at runtime.
 | `MIRROR_IDLE_GRACE_S` | 300 | drop a mirror domain after this long without demand, and a mirror flow after its origin flow has been missing this long (§7.4); `0` never |
 | `MIRROR_CLEANUP_DRY_RUN` | false | mirror cleanup only logs |
 | `MIRROR_STALE_MS` | 2000 | a mirror flow without a new grain this long while grains are due is `stale` (§7.5); `0` never |
+| `MIRROR_ADMIN_REBUILD` | false | allow the rebuild test hook (§7.5); read at start |
 | `TMPFS_RESERVE_MB` | 512 | minimum free space on the MXL filesystem |
 | `MXL_CLEANUP_ON_EXIT` | false | remove own mirrors on SIGTERM. Alias: `CLEANUP_MIRRORS_ON_EXIT` |
 | `DEFAULT_PROVIDER` | `verbs` | `verbs` or `tcp` |
@@ -782,6 +832,9 @@ cleanup (§7.4): `mirror_flow_origin_missing` (info; `domain_id`, `flow_id`,
 `peer`, `grace_s`), `mirror_flow_removed` (info; `domain_id`, `flow_id`,
 `path`, `reason`, `missing_s`), `mirror_flow_kept_reader` (warn; `refused`),
 `mirror_flow_would_remove` (info; dry run), `mirror_flow_remove_failed` (warn).
+Rebuilds (§7.4, §7.5): `mirror_origin_changed` (warn; `domain_id`, `flow_id`,
+`peer`), `mirror_rebuild_requested` (warn; `domain_id`, `flow_id`, `old_inode`,
+`inode`, `readers`, `error`).
 
 ### 12.6 Exit codes (aligned with siblings)
 
@@ -860,6 +913,14 @@ Single machine, `tcp` provider over loopback, two simulated hosts:
   flows in one mirror domain, two origins end → dry run logs and keeps both →
   the unread one is removed → the one a reader maps stays until the reader
   exits → the live flow and the domain stay.
+- `tests/integration/rebuild.sh`: a reader of the mirror that re-opens on
+  `MXL_ERR_FLOW_INVALID` (`mxl-pattern-writer follow`) → the rebuild hook answers
+  403 where it is off, 400 for a bad id, 404 for an unknown flow → a rebuild
+  through the hook gives a new inode, `mirror_rebuilt` (`api`) and
+  `mirror_rebuilds_total` 1, and the reader reads again → the origin writer
+  exits and comes back at 25 instead of 50 grains/s under the same flow id →
+  the mirror is rebuilt (`origin_config_changed`) with the new rate and the
+  reader reads again.
 
 ### 15.3 NMOS checks
 

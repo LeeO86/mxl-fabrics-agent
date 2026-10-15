@@ -200,6 +200,8 @@ Controller::Controller(std::shared_ptr<ConfigStore> store)
 {
     tai_ = taiOffsetSeconds();
     rootTmpfs_ = pathIsTmpfs(store_->get().mxl_root);
+    // Read once: a PUT /api/v1/config cannot open the rebuild hook of a running agent.
+    adminRebuild_ = store_->get().mirror_admin_rebuild;
     // Source grains, from the transfer to its completion.
     engine_.setTransferObserver([this](std::string const& provider, double seconds) {
         metrics_.observe("grain_transfer_seconds", seconds, {{"provider", provider}});
@@ -511,6 +513,24 @@ void Controller::tick()
             std::error_code ec;
             exists = fs::is_directory(fs::path(path) / (remote.flow->flow_id + ".mxl-flow"), ec);
         }
+        // An origin created again with another definition (rate, format, geometry) under the same flow id:
+        // the mirror keeps the layout it was created with, so it is rebuilt from the new definition. With the
+        // same definition the mirror stays and grains go on in the same file.
+        if (exists && localIds.count(remote.domain->domain_id) == 0 &&
+            flowDefinitionChanged(readText(fs::path(path) / (remote.flow->flow_id + ".mxl-flow") / "flow_def.json"),
+                remote.flow->flow_def_json))
+        {
+            auto const last = configRebuiltAt_.find(key);
+            if (last == configRebuiltAt_.end() || now - last->second >= std::chrono::seconds(5))
+            {
+                configRebuiltAt_[key] = now;
+                log::warn("mirror_origin_changed", {{"domain_id", remote.domain->domain_id}, {"flow_id", remote.flow->flow_id},
+                                                       {"peer", remote.peer->host_id}});
+                teardownMirrorFlow(path, remote.domain->domain_id, remote.flow->flow_id, "origin_config_changed");
+                std::error_code ec;
+                exists = fs::is_directory(fs::path(path) / (remote.flow->flow_id + ".mxl-flow"), ec);
+            }
+        }
         auto const estimateMb = std::max<std::uint64_t>(1, remote.flow->payload_size * std::max<std::uint64_t>(remote.flow->ring_depth, 1) / (1024ULL * 1024ULL));
         MirrorInput input;
         input.exists = exists;
@@ -798,6 +818,88 @@ std::vector<Controller::MirrorDomainView> Controller::cleanupMirrors(Config cons
         result.push_back(std::move(view));
     }
     return result;
+}
+
+void Controller::teardownMirrorFlow(std::string const& path, std::string const& domainId, std::string const& flowId,
+    std::string const& reason)
+{
+    mirrorHealth_.noteRemoved(domainId + "/" + flowId, reason);
+    engine_.resetMirrorFlow(path, domainId, flowId);
+    std::error_code ec;
+    fs::remove_all(fs::path(path) / (flowId + ".mxl-flow"), ec);
+    if (ec)
+    {
+        log::warn("mirror_flow_remove_failed", {{"domain_id", domainId}, {"flow_id", flowId}, {"path", path}, {"error", ec.message()}});
+    }
+}
+
+HttpResponse Controller::rebuildMirror(MirrorRebuildRequest const& request)
+{
+    auto const& domainId = request.domain_id;
+    auto const& flowId = request.flow_id;
+    auto const json = [](int status, picojson::object const& body) {
+        return HttpResponse{status, "application/json", picojson::value(body).serialize(), false};
+    };
+    picojson::object body;
+    body["domain_id"] = picojson::value(domainId);
+    body["flow_id"] = picojson::value(flowId);
+    if (auto const refused = mirrorRebuildRefusal(adminRebuild_, request, true); refused != 0)
+    {
+        body["error"] = picojson::value(refused == 403 ? "rebuild disabled: start the agent with MIRROR_ADMIN_REBUILD=true"
+                                                       : "domain_id and flow_id must be UUIDs");
+        return json(refused, body);
+    }
+    std::lock_guard const tickLock{tickMu_};
+    // Only a flow of this agent's own mirror domains, as for DELETE /api/v1/mirrors/{domain_id}.
+    std::string path;
+    for (auto const& domain : scanner_.snapshot().domains)
+    {
+        if (domain.domain_id == domainId && domain.kind == "mirror" && fs::path(domain.path).filename().string() == "mirror-" + domainId)
+        {
+            path = domain.path;
+        }
+    }
+    auto const flowDir = fs::path(path) / (flowId + ".mxl-flow");
+    auto const def = path.empty() ? std::string() : readText(flowDir / "flow_def.json");
+    if (mirrorRebuildRefusal(adminRebuild_, request, !path.empty() && !def.empty()) == 404)
+    {
+        body["error"] = picojson::value("no mirror flow of this agent with these ids");
+        return json(404, body);
+    }
+    // The processes that map the flow now: they get MXL_ERR_FLOW_INVALID and have to open it again.
+    std::map<FileKey, std::string> files;
+    collectFiles(flowDir.string(), flowDir.string(), files);
+    auto const scan = scanReaders(files, "/proc", static_cast<int>(::getpid()));
+    std::vector<ReaderProcess> readers;
+    removalBlocker(scan, flowDir.string(), &readers);
+    auto const oldInode = fileInode((flowDir / "data").string());
+    teardownMirrorFlow(path, domainId, flowId, "api");
+    std::string error;
+    engine_.ensureWriter(path, def, &error);
+    auto const inode = fileInode((flowDir / "data").string());
+    log::warn("mirror_rebuild_requested", {{"domain_id", domainId}, {"flow_id", flowId}, {"old_inode", std::to_string(oldInode)},
+                                              {"inode", std::to_string(inode)}, {"readers", std::to_string(readers.size())},
+                                              {"error", error}});
+    body["old_inode"] = picojson::value(static_cast<double>(oldInode));
+    body["inode"] = picojson::value(static_cast<double>(inode));
+    picojson::array pids;
+    for (auto const& reader : readers)
+    {
+        picojson::object r;
+        r["pid"] = picojson::value(static_cast<double>(reader.pid));
+        r["comm"] = picojson::value(reader.comm);
+        pids.push_back(picojson::value(r));
+    }
+    body["readers"] = picojson::value(pids);
+    if (inode == 0)
+    {
+        // Torn down, not created again: the next reconcile pass creates it when the mirror is still wanted.
+        body["rebuilt"] = picojson::value(false);
+        body["error"] = picojson::value(error.empty() ? std::string("mirror flow not created again") : error);
+        return json(500, body);
+    }
+    body["rebuilt"] = picojson::value(true);
+    return json(200, body);
 }
 
 std::string Controller::removeMirrorDomain(std::string const& domainId, std::string const& path, std::string const& reason,
@@ -1541,6 +1643,13 @@ HttpResponse Controller::handle(HttpRequest const& request)
             arr.push_back(picojson::value(obj));
         }
         return json(200, picojson::value(arr).serialize());
+    }
+    if (request.method == "POST")
+    {
+        if (auto const rebuild = parseMirrorRebuildPath(request.path); rebuild.matched)
+        {
+            return rebuildMirror(rebuild);
+        }
     }
     if (request.method == "DELETE" && request.path.rfind("/api/v1/mirrors/", 0) == 0)
     {
