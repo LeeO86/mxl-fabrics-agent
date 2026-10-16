@@ -214,7 +214,12 @@ void DomainScanner::loop()
     }
     while (!stop_.load())
     {
+        auto const scanStart = std::chrono::steady_clock::now();
         auto next = scanOnce(root_, host_);
+        auto const scanSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - scanStart).count();
+        for (auto seen = scanMax_.load(); scanSeconds > seen && !scanMax_.compare_exchange_weak(seen, scanSeconds);)
+        {
+        }
         std::string canonical = next.canonicalJson();
         bool changed = false;
         {
@@ -259,5 +264,9 @@ void DomainScanner::loop()
     {
         ::close(fd);
     }
+}
+double DomainScanner::takeScanSeconds()
+{
+    return scanMax_.exchange(0.0);
 }
 } // namespace mfa

@@ -51,6 +51,12 @@ struct ReplicaView
     int cq_depth = 0;
 };
 
+struct LaneStatsSnapshot
+{
+    std::vector<LaneStats> live;
+    std::vector<LaneStats> retired;
+};
+
 class ReplicationEngine
 {
 public:
@@ -65,11 +71,16 @@ public:
     PostResult post(PostRequest const& request, std::string const& domainPath);
     bool eraseTarget(std::string const& replicationId, std::string const& destHostId);
     std::vector<ReplicaView> status() const;
-    std::shared_ptr<FabricDomain> domain(std::string const& path);
+    // The lane of one flow in a domain (opened when it does not exist yet). Each flow has its own fabric thread.
+    std::shared_ptr<FabricDomain> domain(std::string const& path, std::string const& flowId);
+    // Every lane of a domain.
     void releaseDomain(std::string const& path);
+    // Drops the lanes with nothing left in them (a safety net for the drops after each release; once per tick).
+    std::size_t sweepIdleLanes();
+    std::size_t laneCount() const;
+    // The stats of the lanes there are, and the final stats of those that went since the last call.
+    LaneStatsSnapshot takeLaneStats();
     void releaseAll(bool keepFlows = false);
-    // grain_transfer_seconds of source grains; set before the first domain is opened.
-    void setTransferObserver(TransferObserver observer);
     bool ensureWriter(std::string const& path, std::string const& flowDef, std::string* error);
     void releaseWriter(std::string const& path, std::string const& flowId);
     // Before a mirror flow is rebuilt: drops its destination targets (and the sources' connections to them),
@@ -104,15 +115,27 @@ private:
 
     std::string endpointFor(std::string const& peer, std::string* provider, bool* fallback) const;
     FabricEndpoint endpoint(std::string const& peer) const;
+    // The lane if it exists (nothing is opened).
+    std::shared_ptr<FabricDomain> findLane(std::string const& path, std::string const& flowId) const;
+    // Drops the lane when nothing is left in it (no writer, target or initiator) and nobody else holds it.
+    bool dropIfIdle(std::string const& path, std::string const& flowId);
+    std::shared_ptr<SharedInstance> sharedInstance(std::string const& path, std::string* error);
+    std::vector<std::shared_ptr<FabricDomain>> lanes() const;
+    // Final stats of lanes that left the map (into retired_), then the lanes go.
+    void retire(std::vector<std::shared_ptr<FabricDomain>> lanes);
 
     mutable std::mutex mu_;
     Config cfg_;
     HandshakeTable handshake_;
-    std::map<std::string, std::shared_ptr<FabricDomain>> domains_;
+    std::map<std::string, std::shared_ptr<FabricDomain>> domains_; // by laneKey(path, flow id)
     std::map<std::string, DestState> dest_;
     std::map<std::string, std::string> linksDown_;
     std::map<std::string, std::uint64_t> sourceRestarts_;
-    TransferObserver transferObserver_;
+    std::map<std::string, std::string> laneErrors_; // path → last logged lane error (under mu_)
+    std::vector<std::shared_ptr<FabricDomain>> retiring_; // out of the map, final stats not taken yet (under mu_)
+    std::vector<LaneStats> retired_;                      // final stats for takeLaneStats (under mu_)
+    std::mutex instancesMu_;
+    std::map<std::string, std::weak_ptr<SharedInstance>> instances_; // one MXL instance per domain path
     int nextPort_;
 };
 } // namespace mfa

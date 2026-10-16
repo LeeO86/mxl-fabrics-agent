@@ -202,10 +202,6 @@ Controller::Controller(std::shared_ptr<ConfigStore> store)
     rootTmpfs_ = pathIsTmpfs(store_->get().mxl_root);
     // Environment only, read once: neither the config file nor PUT /api/v1/config can open the rebuild hook.
     adminRebuild_ = store_->get().mirror_admin_rebuild;
-    // Source grains, from the transfer to its completion.
-    engine_.setTransferObserver([this](std::string const& provider, double seconds) {
-        metrics_.observe("grain_transfer_seconds", seconds, {{"provider", provider}});
-    });
 }
 
 Controller::~Controller()
@@ -333,6 +329,14 @@ void Controller::loop()
 void Controller::tick()
 {
     std::lock_guard const tickLock{tickMu_};
+    auto const tickStart = std::chrono::steady_clock::now();
+    auto stepStart = tickStart;
+    // Durations of the periodic work, as a histogram (reconcile_work_seconds{work}) and debug lines.
+    auto const step = [&](char const* work) {
+        auto const now = std::chrono::steady_clock::now();
+        noteWork(work, now - stepStart);
+        stepStart = now;
+    };
     auto const cfg = store_->get();
     engine_.updateConfig(cfg);
     peers_.updateConfig(cfg);
@@ -663,7 +667,9 @@ void Controller::tick()
         }
     }
     lastDemand_ = std::move(rawDemand);
+    step("plan");
     engine_.setPulls(pulls);
+    step("pulls");
     // Whole mirror domains, after setPulls has dropped the targets they no longer need. Orphans only
     // once the peers are known: 30 s after start and, with NMOS, while the registry answers.
     bool const truthOk = now - started_ >= std::chrono::seconds(30) && (!cfg.nmos_enable || nmos.registry_up);
@@ -673,9 +679,12 @@ void Controller::tick()
     settle_.update(peerSnap, now, std::max<std::chrono::steady_clock::duration>(std::chrono::seconds(60),
                                      std::chrono::milliseconds(3LL * cfg.peer_poll_interval_ms)));
     auto domainViews = cleanupMirrors(cfg, inventory, peerSnap, truthOk, localIds, peerDomains, wantedDomains, mirrorViews);
+    step("cleanup_domains");
     // Then single flows whose origin is gone in the domains that stay; the health below shows them absent.
     cleanupMirrorFlows(cfg, inventory, peerSnap, truthOk, seen);
+    step("cleanup_flows");
     observeMirrors(cfg, inventory, peerSnap, std::move(remoteObservations), seen);
+    step("health");
     {
         std::lock_guard const lock{mu_};
         mirrorHealthView_ = mirrorHealth_.entries();
@@ -684,7 +693,21 @@ void Controller::tick()
         mirrors_ = std::move(mirrorViews);
         links_ = std::move(links);
     }
+    // Lanes that have nothing left (a safety net: each release drops its lane when nobody else holds it).
+    engine_.sweepIdleLanes();
+    step("lanes");
     renderMetrics();
+    step("metrics");
+    noteWork("tick", std::chrono::steady_clock::now() - tickStart);
+    // The peer poll and the inventory scan run on their own threads; their longest run since the last tick.
+    if (auto const poll = peers_.takePollSeconds(); poll > 0)
+    {
+        noteWork("peer_poll", poll);
+    }
+    if (auto const scan = scanner_.takeScanSeconds(); scan > 0)
+    {
+        noteWork("inventory_scan", scan);
+    }
     publish("inventory", std::to_string(inventory.revision));
 }
 
@@ -838,6 +861,36 @@ std::vector<Controller::MirrorDomainView> Controller::cleanupMirrors(Config cons
     return result;
 }
 
+ReaderScan Controller::scanProcReaders(std::map<FileKey, std::string> const& files)
+{
+    auto const start = std::chrono::steady_clock::now();
+    auto scan = scanReaders(files, "/proc", static_cast<int>(::getpid()));
+    noteWork("reader_scan", std::chrono::steady_clock::now() - start);
+    return scan;
+}
+
+void Controller::noteWork(char const* work, std::chrono::steady_clock::duration took)
+{
+    noteWork(work, std::chrono::duration<double>(took).count());
+}
+
+void Controller::noteWork(char const* work, double seconds)
+{
+    metrics_.observe("reconcile_work_seconds", seconds, {{"work", work}});
+    log::debug("work_timing", {{"work", work}, {"ms", std::to_string(seconds * 1000.0)}});
+    // A step this slow holds up the reconcile loop (and the handshakes it repeats): one line per 10 s.
+    if (seconds > 0.5)
+    {
+        auto const now = std::chrono::steady_clock::now();
+        std::lock_guard const lock{workLogMu_}; // the HTTP handlers time their reader scans too
+        if (now - slowWorkLogged_ >= std::chrono::seconds(10))
+        {
+            slowWorkLogged_ = now;
+            log::info("reconcile_work_slow", {{"work", work}, {"ms", std::to_string(seconds * 1000.0)}});
+        }
+    }
+}
+
 void Controller::teardownMirrorFlow(std::string const& path, std::string const& domainId, std::string const& flowId,
     std::string const& reason)
 {
@@ -887,7 +940,7 @@ HttpResponse Controller::rebuildMirror(MirrorRebuildRequest const& request)
     // The processes that map the flow now: they get MXL_ERR_FLOW_INVALID and have to open it again.
     std::map<FileKey, std::string> files;
     collectFiles(flowDir.string(), flowDir.string(), files);
-    auto const scan = scanReaders(files, "/proc", static_cast<int>(::getpid()));
+    auto const scan = scanProcReaders(files);
     std::vector<ReaderProcess> readers;
     removalBlocker(scan, flowDir.string(), &readers);
     auto const oldInode = fileInode((flowDir / "data").string());
@@ -926,7 +979,7 @@ std::string Controller::removeMirrorDomain(std::string const& domainId, std::str
     auto const check = [&]() -> std::string {
         std::map<FileKey, std::string> files;
         collectFiles(path, path, files);
-        return removalBlocker(scanReaders(files, "/proc", static_cast<int>(::getpid())), path, readers);
+        return removalBlocker(scanProcReaders(files), path, readers);
     };
     if (auto const busy = check(); !busy.empty())
     {
@@ -1083,13 +1136,13 @@ void Controller::cleanupMirrorFlows(Config const& cfg, Inventory const& inventor
     }
     // Per flow: the files of one flow directory, matched by device and inode in /proc/<pid>/maps of every
     // other process (one pass for all candidates). A flow some process maps stays.
-    auto const scanFlows = [](std::vector<Candidate const*> const& flows) {
+    auto const scanFlows = [this](std::vector<Candidate const*> const& flows) {
         std::map<FileKey, std::string> files;
         for (auto const* c : flows)
         {
             collectFiles(c->flow_path, c->flow_path, files);
         }
-        return scanReaders(files, "/proc", static_cast<int>(::getpid()));
+        return scanProcReaders(files);
     };
     auto const keep = [&](Candidate const& c, std::string const& refused) {
         if (flowLogged_[c.key] != "refused:" + refused)
@@ -1276,9 +1329,17 @@ void Controller::reportMirrorEvents(std::vector<MirrorEvent> const& events, int 
     }
 }
 
+void Controller::renderLaneMetrics(bool perFlow)
+{
+    auto snapshot = engine_.takeLaneStats();
+    laneMetrics_.retire(snapshot.retired, perFlow);
+    laneMetrics_.render(metrics_, snapshot.live, perFlow);
+}
+
 void Controller::renderMetrics()
 {
     auto const cfg = store_->get();
+    renderLaneMetrics(cfg.metrics_per_flow);
     auto const inventory = scanner_.snapshot();
     auto const peerSnap = peers_.snapshot();
     auto const nmos = observer_.snapshot();
@@ -1611,7 +1672,7 @@ HttpResponse Controller::handle(HttpRequest const& request)
                 collectFiles(view.path, view.path, files);
             }
         }
-        auto const scan = scanReaders(files, "/proc", static_cast<int>(::getpid()));
+        auto const scan = scanProcReaders(files);
         auto const nowUnix = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         picojson::array arr;
         for (auto const& view : views)
@@ -2024,7 +2085,7 @@ HttpResponse Controller::testPeer(std::string const& hostId)
         body["error"] = picojson::value(error);
         return HttpResponse{200, "application/json", picojson::value(body).serialize(), false};
     }
-    auto dom = engine_.domain(localDir.string());
+    auto dom = engine_.domain(localDir.string(), id);
     std::uint64_t index = 0;
     if (!dom->commitPattern(id, &index, &error))
     {

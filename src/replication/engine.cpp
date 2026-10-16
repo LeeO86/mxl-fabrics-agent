@@ -17,6 +17,23 @@ std::string pullKey(PullRequest const& pull)
 {
     return pull.peer + "/" + pull.domain_id + "/" + pull.flow_id;
 }
+
+// The flow id of a destination key (peer/domain/flow).
+std::string flowOfKey(std::string const& key)
+{
+    auto const slash = key.rfind('/');
+    return slash == std::string::npos ? key : key.substr(slash + 1);
+}
+
+std::string laneKey(std::string const& path, std::string const& flowId)
+{
+    return path + '\n' + flowId;
+}
+
+std::string flowIdOfDef(std::string const& flowDef)
+{
+    return json::asString(json::objectOrEmpty(json::parse(flowDef)), "id").value_or("");
+}
 } // namespace
 
 ReplicationEngine::ReplicationEngine(Config cfg)
@@ -66,11 +83,29 @@ FabricEndpoint ReplicationEngine::endpoint(std::string const& peer) const
     return ep;
 }
 
-std::shared_ptr<FabricDomain> ReplicationEngine::domain(std::string const& path)
+std::shared_ptr<SharedInstance> ReplicationEngine::sharedInstance(std::string const& path, std::string* error)
 {
+    std::lock_guard const lock{instancesMu_};
+    if (auto existing = instances_[path].lock())
+    {
+        return existing;
+    }
+    auto created = openSharedInstance(path, error);
+    instances_[path] = created;
+    // Forget the paths whose instance has gone.
+    for (auto it = instances_.begin(); it != instances_.end();)
+    {
+        it = it->second.expired() && it->first != path ? instances_.erase(it) : std::next(it);
+    }
+    return created;
+}
+
+std::shared_ptr<FabricDomain> ReplicationEngine::domain(std::string const& path, std::string const& flowId)
+{
+    auto const laneId = laneKey(path, flowId);
     {
         std::lock_guard const lock{mu_};
-        auto const it = domains_.find(path);
+        auto const it = domains_.find(laneId);
         if (it != domains_.end())
         {
             return it->second;
@@ -78,60 +113,194 @@ std::shared_ptr<FabricDomain> ReplicationEngine::domain(std::string const& path)
     }
     int rt = 0;
     std::vector<int> cpus;
-    TransferObserver observer;
     {
         std::lock_guard const lock{mu_};
         rt = cfg_.rt_priority;
         cpus = cfg_.cpu_affinity;
-        observer = transferObserver_;
     }
-    auto created = std::make_shared<FabricDomain>(path, rt, cpus);
+    std::string instanceError;
+    auto instance = sharedInstance(path, &instanceError);
+    auto created = std::make_shared<FabricDomain>(path, flowId, instance, rt, cpus);
     if (!created->ok())
     {
-        log::error("domain_fabric_failed", {{"path", path}, {"error", created->error()}});
-    }
-    if (observer)
-    {
-        created->setTransferObserver(std::move(observer));
+        auto const error = instance ? created->error() : instanceError;
+        bool logIt = false;
+        {
+            std::lock_guard const lock{mu_};
+            logIt = std::exchange(laneErrors_[path], error) != error;
+        }
+        // One line per domain while the error stays the same (the lane is set up again on each pass).
+        if (logIt)
+        {
+            log::error("domain_fabric_failed", {{"path", path}, {"flow_id", flowId}, {"error", error}});
+        }
+        return created; // not kept: the callers fail and the next call tries again
     }
     std::lock_guard const lock{mu_};
-    auto const it = domains_.find(path);
+    laneErrors_.erase(path);
+    auto const it = domains_.find(laneId);
     if (it != domains_.end())
     {
         return it->second;
     }
-    domains_[path] = created;
+    domains_[laneId] = created;
     return created;
+}
+
+std::shared_ptr<FabricDomain> ReplicationEngine::findLane(std::string const& path, std::string const& flowId) const
+{
+    std::lock_guard const lock{mu_};
+    auto const it = domains_.find(laneKey(path, flowId));
+    return it == domains_.end() ? nullptr : it->second;
+}
+
+bool ReplicationEngine::dropIfIdle(std::string const& path, std::string const& flowId)
+{
+    auto lane = findLane(path, flowId);
+    std::uint64_t seq = 0;
+    if (!lane || !lane->idle(&seq))
+    {
+        return false;
+    }
+    std::shared_ptr<FabricDomain> dropped;
+    {
+        std::lock_guard const lock{mu_};
+        auto const it = domains_.find(laneKey(path, flowId));
+        // Atomic against a caller that took the lane meanwhile: only the map and this function hold it (lanes are
+        // only handed out under mu_), and no call came in since the idle check. Otherwise the next check drops it.
+        if (it != domains_.end() && it->second == lane && lane.use_count() == 2 && lane->callCount() == seq)
+        {
+            dropped = std::move(it->second);
+            domains_.erase(it);
+            retiring_.push_back(dropped);
+        }
+    }
+    lane.reset();
+    if (!dropped)
+    {
+        return false;
+    }
+    retire({std::move(dropped)}); // the lane's thread stops there, outside the lock
+    return true;
+}
+
+void ReplicationEngine::retire(std::vector<std::shared_ptr<FabricDomain>> lanes)
+{
+    for (auto& lane : lanes)
+    {
+        auto final = lane->finalStats();
+        std::lock_guard const lock{mu_};
+        retiring_.erase(std::remove(retiring_.begin(), retiring_.end(), lane), retiring_.end());
+        retired_.push_back(std::move(final));
+    }
+    lanes.clear();
+}
+
+std::size_t ReplicationEngine::sweepIdleLanes()
+{
+    std::vector<std::pair<std::string, std::string>> keys;
+    {
+        std::lock_guard const lock{mu_};
+        for (auto const& [_, lane] : domains_)
+        {
+            keys.emplace_back(lane->path(), lane->flowId());
+        }
+    }
+    std::size_t dropped = 0;
+    for (auto const& [path, flowId] : keys)
+    {
+        dropped += dropIfIdle(path, flowId) ? 1 : 0;
+    }
+    return dropped;
+}
+
+std::size_t ReplicationEngine::laneCount() const
+{
+    std::lock_guard const lock{mu_};
+    return domains_.size();
+}
+
+LaneStatsSnapshot ReplicationEngine::takeLaneStats()
+{
+    // In one step against retire: a lane that goes is in exactly one of the two lists.
+    LaneStatsSnapshot out;
+    std::lock_guard const lock{mu_};
+    for (auto const& [_, lane] : domains_)
+    {
+        out.live.push_back(lane->stats());
+    }
+    for (auto const& lane : retiring_)
+    {
+        out.live.push_back(lane->stats());
+    }
+    out.retired.swap(retired_);
+    return out;
+}
+
+std::vector<std::shared_ptr<FabricDomain>> ReplicationEngine::lanes() const
+{
+    std::vector<std::shared_ptr<FabricDomain>> out;
+    std::lock_guard const lock{mu_};
+    out.reserve(domains_.size());
+    for (auto const& [_, lane] : domains_)
+    {
+        out.push_back(lane);
+    }
+    return out;
 }
 
 void ReplicationEngine::releaseDomain(std::string const& path)
 {
-    std::lock_guard const lock{mu_};
-    domains_.erase(path);
-}
-
-void ReplicationEngine::setTransferObserver(TransferObserver observer)
-{
-    std::lock_guard const lock{mu_};
-    transferObserver_ = std::move(observer);
+    std::vector<std::shared_ptr<FabricDomain>> dropped;
+    {
+        std::lock_guard const lock{mu_};
+        auto const prefix = path + '\n';
+        for (auto it = domains_.begin(); it != domains_.end();)
+        {
+            if (it->first.compare(0, prefix.size(), prefix) == 0)
+            {
+                dropped.push_back(std::move(it->second));
+                retiring_.push_back(dropped.back());
+                it = domains_.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+    retire(std::move(dropped));
 }
 
 void ReplicationEngine::releaseAll(bool keepFlows)
 {
-    std::lock_guard const lock{mu_};
+    std::map<std::string, std::shared_ptr<FabricDomain>> dropped;
+    {
+        std::lock_guard const lock{mu_};
+        dropped.swap(domains_);
+    }
     if (keepFlows)
     {
-        for (auto const& [_, dom] : domains_)
+        for (auto const& [_, dom] : dropped)
         {
             dom->keepFlowsOnExit();
         }
     }
-    domains_.clear();
+    dropped.clear();
 }
 
 bool ReplicationEngine::ensureWriter(std::string const& path, std::string const& flowDef, std::string* error)
 {
-    auto dom = domain(path);
+    auto const flowId = flowIdOfDef(flowDef);
+    if (flowId.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "flow definition has no id";
+        }
+        return false;
+    }
+    auto dom = domain(path, flowId);
     if (!dom || !dom->ok())
     {
         if (error != nullptr)
@@ -145,17 +314,14 @@ bool ReplicationEngine::ensureWriter(std::string const& path, std::string const&
 
 void ReplicationEngine::releaseWriter(std::string const& path, std::string const& flowId)
 {
-    std::shared_ptr<FabricDomain> dom;
+    auto dom = findLane(path, flowId);
+    if (!dom)
     {
-        std::lock_guard const lock{mu_};
-        auto const it = domains_.find(path);
-        if (it == domains_.end())
-        {
-            return;
-        }
-        dom = it->second;
+        return;
     }
     dom->releaseWriter(flowId);
+    dom.reset();
+    dropIfIdle(path, flowId);
 }
 
 void ReplicationEngine::resetMirrorFlow(std::string const& path, std::string const& domainId, std::string const& flowId)
@@ -182,7 +348,7 @@ void ReplicationEngine::resetMirrorFlow(std::string const& path, std::string con
         {
             httpRequest("DELETE", state.control_url + "/replications/" + state.replication_id + "/targets/" + cfg_.host_id);
         }
-        if (auto dom = domain(state.mirror_path.empty() ? path : state.mirror_path))
+        if (auto dom = findLane(state.mirror_path.empty() ? path : state.mirror_path, flowId))
         {
             dom->destroyTarget(key);
         }
@@ -222,10 +388,11 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
         }
         if (!state.mirror_path.empty())
         {
-            if (auto dom = domain(state.mirror_path))
+            if (auto dom = findLane(state.mirror_path, flowOfKey(key)))
             {
                 dom->destroyTarget(key);
             }
+            dropIfIdle(state.mirror_path, flowOfKey(key)); // the writer may be gone already (plan.remove)
         }
         log::info("replication_released", {{"peer", key.substr(0, key.find('/'))}, {"replication_id", state.replication_id}});
     }
@@ -240,7 +407,7 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
         if (peerRestarted || revisionReset)
         {
             log::info("peer_restarted", {{"peer", pull.peer}, {"flow_id", pull.flow_id}});
-            auto dom = domain(pull.mirror_path);
+            auto dom = findLane(pull.mirror_path, pull.flow_id);
             if (dom)
             {
                 dom->destroyTarget(key);
@@ -261,7 +428,7 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
         {
             if (!state.link_down)
             {
-                if (auto dom = domain(pull.mirror_path))
+                if (auto dom = findLane(pull.mirror_path, pull.flow_id))
                 {
                     dom->destroyTarget(key);
                 }
@@ -288,7 +455,7 @@ void ReplicationEngine::setPulls(std::vector<PullRequest> const& pulls)
         {
             continue;
         }
-        auto dom = domain(pull.mirror_path);
+        auto dom = domain(pull.mirror_path, pull.flow_id);
         if (!dom || !dom->ok())
         {
             state.state = "error";
@@ -458,14 +625,17 @@ PostResult ReplicationEngine::post(PostRequest const& request, std::string const
             return result;
         }
     }
-    // A failure goes back with its reason, which the destination shows.
+    std::shared_ptr<FabricDomain> dom;
+    // A failure goes back with its reason, which the destination shows. A lane left empty goes.
     auto failed = [&](std::string const& error) {
         result.status = 500;
         result.state = "error";
         result.error = error;
+        dom.reset();
+        dropIfIdle(domainPath, request.flow_id);
         return result;
     };
-    auto dom = domain(domainPath);
+    dom = domain(domainPath, request.flow_id);
     if (!dom || !dom->ok())
     {
         return failed(dom ? dom->error() : "no domain");
@@ -515,26 +685,39 @@ bool ReplicationEngine::eraseTarget(std::string const& replicationId, std::strin
             return false;
         }
     }
-    for (auto const& [path, dom] : domains_)
+    // Only the lanes of that flow can hold its initiator.
+    std::vector<std::shared_ptr<FabricDomain>> flowLanes;
+    for (auto const& lane : lanes())
     {
-        dom->removeInitiatorTarget(replicationId, destHostId);
-        auto const updated = handshake_.find(replicationId);
-        if (updated && updated->targets.size() <= 1)
+        if (lane->flowId() == row->flow_id)
         {
-            // erase below removes the last target and the row
+            flowLanes.push_back(lane);
         }
     }
+    for (auto const& lane : flowLanes)
+    {
+        lane->removeInitiatorTarget(replicationId, destHostId);
+    }
     bool removed = false;
+    bool last = false;
     {
         std::lock_guard const lock{mu_};
         removed = handshake_.eraseTarget(replicationId, destHostId);
-        if (removed && !handshake_.find(replicationId))
+        last = removed && !handshake_.find(replicationId);
+    }
+    std::vector<std::string> paths;
+    for (auto const& lane : flowLanes)
+    {
+        if (last)
         {
-            for (auto const& [_, dom] : domains_)
-            {
-                dom->destroyInitiator(replicationId);
-            }
+            lane->destroyInitiator(replicationId);
         }
+        paths.push_back(lane->path());
+    }
+    flowLanes.clear(); // dropIfIdle drops only a lane nobody else holds
+    for (auto const& path : paths)
+    {
+        dropIfIdle(path, row->flow_id);
     }
     return removed;
 }
@@ -547,7 +730,7 @@ std::vector<ReplicaView> ReplicationEngine::status() const
         linksDown = linksDown_;
     }
     std::vector<ReplicaView> out;
-    for (auto const& [_, dom] : domains_)
+    for (auto const& dom : lanes())
     {
         for (auto const& row : dom->rows())
         {

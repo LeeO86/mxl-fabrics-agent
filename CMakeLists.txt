@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(mxl-fabrics-agent VERSION 1.7.1 LANGUAGES CXX)
+project(mxl-fabrics-agent VERSION 1.7.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,6 +29,7 @@ set(MFA_CORE_SOURCES
     src/replication/handshake.cpp
     src/replication/policy.cpp
     src/ops/metrics.cpp
+    src/ops/lanemetrics.cpp
     src/ops/httpserver.cpp
     src/peer/manager.cpp
     src/nmos/observer.cpp
@@ -98,6 +99,14 @@ if(MFA_WITH_NMOS)
     set_source_files_properties(src/nmos/node.cpp PROPERTIES CXX_STANDARD 17 COMPILE_OPTIONS "-w")
 else()
     target_sources(mxl-fabrics-agent PRIVATE src/nmos/node.cpp)
+endif()
+
+if(MFA_BUILD_TESTS)
+    # Lane lifecycle against a real MXL domain.
+    add_executable(lane-tests tests/lanes/test_lanes.cpp src/fabric/domain.cpp src/replication/engine.cpp)
+    target_include_directories(lane-tests PRIVATE src third_party)
+    target_link_libraries(lane-tests PRIVATE mfa-core mxl::mxl mxl::mxl-fabrics PkgConfig::libfabric)
+    add_test(NAME lane-tests COMMAND lane-tests)
 endif()
 
 add_executable(mxl-pattern-writer tests/tools/pattern_writer.cpp)
