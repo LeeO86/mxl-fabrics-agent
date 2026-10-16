@@ -9,9 +9,10 @@ namespace
 char const* const kHistogramNames[] = {"replication_sample_age_seconds", "replication_delivery_gap_seconds", "sample_transfer_seconds",
     "grain_transfer_seconds", "fabric_thread_stall_seconds"};
 char const* const kMaxNames[] = {"replication_sample_age_max_seconds", "sample_transfer_max_seconds"};
+char const* const kCounterNames[] = {"replication_late_deliveries_total", "sample_transfer_stalls_total", "grain_transfer_stalls_total"};
 } // namespace
 
-void LaneMetrics::collect(LaneStats const& lane, bool perFlow, Histograms& histograms, std::map<Labels, double>& late,
+void LaneMetrics::collect(LaneStats const& lane, bool perFlow, Histograms& histograms, Counters& counters,
     std::map<std::string, std::map<Labels, double>>* maxes)
 {
     Labels flow;
@@ -42,16 +43,26 @@ void LaneMetrics::collect(LaneStats const& lane, bool perFlow, Histograms& histo
     }
     auto const gap = static_cast<std::size_t>(LaneMetric::DeliveryGap);
     add("replication_delivery_gap_seconds", flow, lane.histograms[gap]);
-    if (lane.histograms[gap].count != 0)
+    // Continuous and (since 1.7.3) discrete destinations.
+    if (lane.deliveries != 0 || lane.histograms[gap].count != 0)
     {
-        late[flow] += static_cast<double>(lane.lateDeliveries);
+        counters["replication_late_deliveries_total"][flow] += static_cast<double>(lane.lateDeliveries);
     }
     auto const sample = static_cast<std::size_t>(LaneMetric::SampleTransfer);
     auto transferLabels = flow;
     transferLabels["provider"] = lane.provider;
     add("sample_transfer_seconds", transferLabels, lane.histograms[sample]);
     max("sample_transfer_max_seconds", transferLabels, lane.maxes[sample], lane.histograms[sample]);
-    add("grain_transfer_seconds", {{"provider", lane.provider}}, lane.histograms[static_cast<std::size_t>(LaneMetric::GrainTransfer)]);
+    if (lane.histograms[sample].count != 0)
+    {
+        counters["sample_transfer_stalls_total"][transferLabels] += static_cast<double>(lane.sampleTransferStalls);
+    }
+    auto const grain = static_cast<std::size_t>(LaneMetric::GrainTransfer);
+    add("grain_transfer_seconds", {{"provider", lane.provider}}, lane.histograms[grain]);
+    if (lane.histograms[grain].count != 0)
+    {
+        counters["grain_transfer_stalls_total"][{{"provider", lane.provider}}] += static_cast<double>(lane.grainTransferStalls);
+    }
     for (auto const& [task, histogram] : lane.stalls)
     {
         add("fabric_thread_stall_seconds", {{"task", task}}, histogram);
@@ -61,10 +72,10 @@ void LaneMetrics::collect(LaneStats const& lane, bool perFlow, Histograms& histo
 void LaneMetrics::retire(std::vector<LaneStats> const& gone, bool perFlow)
 {
     Histograms histograms;
-    std::map<Labels, double> late;
+    Counters counters;
     for (auto const& lane : gone)
     {
-        collect(lane, perFlow, histograms, late, nullptr);
+        collect(lane, perFlow, histograms, counters, nullptr);
     }
     // Only the summed series (no flow label) keep a total.
     for (auto const& [metric, series] : histograms)
@@ -77,11 +88,14 @@ void LaneMetrics::retire(std::vector<LaneStats> const& gone, bool perFlow)
             }
         }
     }
-    for (auto const& [labels, value] : late)
+    for (auto const& [metric, series] : counters)
     {
-        if (labels.count("flow_id") == 0)
+        for (auto const& [labels, value] : series)
         {
-            retiredLate_[labels] += value;
+            if (labels.count("flow_id") == 0)
+            {
+                retiredCounters_[metric][labels] += value;
+            }
         }
     }
 }
@@ -89,11 +103,11 @@ void LaneMetrics::retire(std::vector<LaneStats> const& gone, bool perFlow)
 void LaneMetrics::render(Metrics& metrics, std::vector<LaneStats> const& live, bool perFlow) const
 {
     Histograms histograms = retiredHistograms_;
-    std::map<Labels, double> late = retiredLate_;
+    Counters counters = retiredCounters_;
     std::map<std::string, std::map<Labels, double>> maxes;
     for (auto const& lane : live)
     {
-        collect(lane, perFlow, histograms, late, &maxes);
+        collect(lane, perFlow, histograms, counters, &maxes);
     }
     for (auto const* metric : kHistogramNames)
     {
@@ -109,6 +123,10 @@ void LaneMetrics::render(Metrics& metrics, std::vector<LaneStats> const& live, b
         std::vector<std::pair<Labels, double>> series(maxes[metric].begin(), maxes[metric].end());
         metrics.setGauges(metric, series);
     }
-    metrics.setCounters("replication_late_deliveries_total", {late.begin(), late.end()});
+    for (auto const* metric : kCounterNames)
+    {
+        auto const& series = counters[metric];
+        metrics.setCounters(metric, {series.begin(), series.end()});
+    }
 }
 } // namespace mfa

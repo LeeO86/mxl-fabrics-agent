@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <map>
@@ -124,16 +125,68 @@ struct LaneStats
     std::array<LaneHistogram, kLaneMetrics> histograms{};
     std::array<double, kLaneMetrics> maxes{}; // rolling maximum of the last RollingMax::kSeconds
     std::map<std::string, LaneHistogram> stalls; // by the task that held the thread ("pass": none)
-    std::uint64_t lateDeliveries = 0;    // delivery gaps that lateGap counts
+    std::uint64_t deliveries = 0;        // destination: passes that committed samples or grains
+    std::uint64_t lateDeliveries = 0;    // of those, the late ones (lateGap, lateGrainGap)
+    std::uint64_t sampleTransferStalls = 0; // source: sample transfers longer than half the ACK timeout
+    std::uint64_t grainTransferStalls = 0;  // source: the same for grain transfers
 };
 
-// A delivery gap counts as late when it is longer than twice the lane's usual gap (a moving average of
-// the gaps) and at least 10 ms: about 6 ms with 3 ms transfers; 20 ms with 1 ms commits.
+// A delivery gap counts as late when it is longer than twice the flow's usual gap and at least 10 ms.
 inline bool lateGap(double gapSeconds, double usualSeconds)
 {
     auto const threshold = usualSeconds * 2.0 > 0.01 ? usualSeconds * 2.0 : 0.01;
     return gapSeconds > threshold;
 }
+
+// A discrete flow (video, data) delivers a grain per grain period: a gap is late when it is longer than two grain
+// periods and at least 10 ms (50p: 40 ms).
+inline bool lateGrainGap(double gapSeconds, double grainPeriodSeconds)
+{
+    return lateGap(gapSeconds, grainPeriodSeconds);
+}
+
+// The usual delivery gap of a continuous flow: the 98th percentile of its last 256 gaps (about 0.5 to 1 s of
+// audio). 1.7.2 took a moving average, and a flow whose deliveries come in bursts (several transfers 2 to 3 ms
+// apart, then a longer wait for the origin's next commit) had an average far below its regular long gap, which
+// then counted as late every time (likely the platform's 514 in 30 s on one flow). A percentile keeps such a gap in
+// the usual one, while a single long gap (a retransmission) stays out of it.
+class GapWindow
+{
+public:
+    static constexpr std::size_t kSize = 256;
+    static constexpr std::size_t kMinimum = 32; // gaps before a usual one exists
+    static constexpr double kQuantile = 0.98;
+
+    void add(double gapSeconds)
+    {
+        gaps_[next_] = gapSeconds;
+        next_ = (next_ + 1) % kSize;
+        count_ = std::min(count_ + 1, kSize);
+        // Every 16 gaps (nth_element over 256 values, about 1 us).
+        if (count_ >= kMinimum && (++sinceUpdate_ >= 16 || usual_ == 0))
+        {
+            sinceUpdate_ = 0;
+            std::array<double, kSize> copy{};
+            std::copy_n(gaps_.begin(), count_, copy.begin());
+            auto const index = static_cast<std::size_t>(kQuantile * static_cast<double>(count_ - 1));
+            std::nth_element(copy.begin(), copy.begin() + static_cast<std::ptrdiff_t>(index), copy.begin() + static_cast<std::ptrdiff_t>(count_));
+            usual_ = copy[index];
+        }
+    }
+
+    // 0 until kMinimum gaps were seen.
+    double usual() const
+    {
+        return usual_;
+    }
+
+private:
+    std::array<double, kSize> gaps_{};
+    std::size_t next_ = 0;
+    std::size_t count_ = 0;
+    std::size_t sinceUpdate_ = 0;
+    double usual_ = 0;
+};
 
 // Bucket bounds (seconds). The default ones are those of grain_transfer_seconds since 1.0.
 std::vector<double> const& laneBounds(LaneMetric metric);

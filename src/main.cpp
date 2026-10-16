@@ -1,6 +1,7 @@
 #include "config/config.hpp"
 #include "config/store.hpp"
 #include "fabric/domain.hpp"
+#include "fabric/qpcontrol.hpp"
 #include "ops/httpserver.hpp"
 #include "reconcile/controller.hpp"
 #include "util/logging.hpp"
@@ -130,6 +131,26 @@ int main(int argc, char** argv)
             mfa::log::warn("provider_fallback_default", {{"from", cfg.default_provider}, {"to", "tcp"}});
         }
         mfa::log::info("startup", {{"version", mfa::kVersion}, {"host_id", cfg.host_id}, {"mxl", mfa::kMxlPin}, {"capabilities", capabilities}});
+        // Before the first lane: every connection of the verbs provider takes them (src/fabric/qpcontrol.hpp).
+        mfa::qp::configure({cfg.fabric_ack_timeout, cfg.fabric_retry_count});
+        mfa::setAudioPassMs(cfg.audio_pass_ms);
+        {
+            auto const settings = mfa::qp::settings();
+            auto const effective = mfa::qp::effectiveAckTimeout(settings);
+            bool const hooked = mfa::qp::hooksResolved();
+            std::vector<mfa::log::Field> fields{{"ack_timeout", settings.ackTimeout == 0 ? std::string("rdma_cm") : std::to_string(settings.ackTimeout)},
+                {"ack_timeout_ms", std::to_string(mfa::qp::ackTimeoutSeconds(effective) * 1000.0)}, {"retry_count", std::to_string(settings.retryCount)},
+                {"transfer_stall_ms", std::to_string(mfa::qp::transferStallThresholdSeconds(settings) * 1000.0)},
+                {"audio_pass_ms", std::to_string(mfa::audioPassMs())}, {"rdma_cm_hooks", hooked ? "true" : "false"}};
+            if (hooked)
+            {
+                mfa::log::info("fabric_qp_settings", fields);
+            }
+            else
+            {
+                mfa::log::warn("fabric_qp_settings", fields);
+            }
+        }
         // 1.1.0 only: over verbs MXL's target keeps one receive for immediate data, and every paced
         // batch carries one, so pacing multiplied retransmissions. The setting is ignored now.
         if (char const* pacing = std::getenv("TRANSFER_PACING"); pacing != nullptr && std::string(pacing) != "off")

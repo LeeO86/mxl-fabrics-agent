@@ -24,10 +24,11 @@ public:
 private:
     using Labels = std::map<std::string, std::string>;
     using Histograms = std::map<std::string, std::map<Labels, LaneHistogram>>; // metric → labels → histogram
-    static void collect(LaneStats const& lane, bool perFlow, Histograms& histograms, std::map<Labels, double>& late,
+    using Counters = std::map<std::string, std::map<Labels, double>>;         // metric → labels → total
+    static void collect(LaneStats const& lane, bool perFlow, Histograms& histograms, Counters& counters,
         std::map<std::string, std::map<Labels, double>>* maxes);
 
     Histograms retiredHistograms_;
-    std::map<Labels, double> retiredLate_;
+    Counters retiredCounters_;
 };
 } // namespace mfa

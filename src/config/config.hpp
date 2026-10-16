@@ -46,6 +46,12 @@ struct Config
     std::string fabric_interface;
     int fabric_port_base = 23500;
     int fabric_port_count = 100;
+    // RDMA ACK timeout of a queue pair: the IB exponent n of 4.096 us x 2^n (14 = 67 ms), and its retry count. Set
+    // through rdma_cm on every connection the verbs provider makes (src/fabric/qpcontrol.hpp).
+    int fabric_ack_timeout = 14;
+    int fabric_retry_count = 7;
+    // Pass interval of a continuous (audio) lane and the least time between two of its sample transfers.
+    int audio_pass_ms = 2;
     std::vector<PeerConfig> peers;
     int peer_poll_interval_ms = 2000;
     int release_grace_ms = 2000;

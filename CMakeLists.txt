@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(mxl-fabrics-agent VERSION 1.7.2 LANGUAGES CXX)
+project(mxl-fabrics-agent VERSION 1.7.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,6 +10,8 @@ option(MFA_WITH_NMOS "Link Sony nmos-cpp for the agent Node" OFF)
 set(NMOS_CPP_DIR "" CACHE PATH "Path to sony/nmos-cpp Development/")
 
 find_package(Threads REQUIRED)
+# rdma_cm headers (librdmacm-dev) for the queue pair settings (src/fabric/qpcontrol.hpp).
+find_path(RDMACM_INCLUDE_DIR rdma/rdma_cma.h)
 
 set(MFA_CORE_SOURCES
     src/util/logging.cpp
@@ -35,8 +37,15 @@ set(MFA_CORE_SOURCES
     src/nmos/observer.cpp
 )
 
+if(RDMACM_INCLUDE_DIR)
+    list(APPEND MFA_CORE_SOURCES src/fabric/qpcontrol.cpp)
+endif()
+
 add_library(mfa-core STATIC ${MFA_CORE_SOURCES})
 target_include_directories(mfa-core PUBLIC src third_party)
+if(RDMACM_INCLUDE_DIR)
+    target_include_directories(mfa-core PUBLIC ${RDMACM_INCLUDE_DIR})
+endif()
 target_link_libraries(mfa-core PUBLIC Threads::Threads)
 target_compile_options(mfa-core PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
@@ -54,6 +63,9 @@ if(MFA_BUILD_TESTS)
         tests/unit/test_metrics.cpp
         tests/unit/test_policy.cpp
     )
+    if(RDMACM_INCLUDE_DIR)
+        target_sources(unit-tests PRIVATE tests/unit/test_qpcontrol.cpp)
+    endif()
     target_include_directories(unit-tests PRIVATE src third_party)
     target_link_libraries(unit-tests PRIVATE mfa-core)
     add_test(NAME unit-tests COMMAND unit-tests)
@@ -63,6 +75,19 @@ find_package(mxl CONFIG)
 if(mxl_FOUND)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(libfabric REQUIRED IMPORTED_TARGET libfabric)
+if(NOT RDMACM_INCLUDE_DIR)
+    message(FATAL_ERROR "rdma/rdma_cma.h not found (librdmacm-dev)")
+endif()
+
+# The binary's own rdma_connect, rdma_accept, rdma_get_cm_event and rdma_destroy_id (src/fabric/rdmahook.cpp):
+# exported, so that the dynamic linker binds libfabric's calls to them.
+function(mfa_rdma_hooks target)
+    target_sources(${target} PRIVATE src/fabric/rdmahook.cpp)
+    target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+    foreach(symbol rdma_connect rdma_accept rdma_get_cm_event rdma_destroy_id)
+        target_link_options(${target} PRIVATE "LINKER:--export-dynamic-symbol=${symbol}")
+    endforeach()
+endfunction()
 
 set(MFA_APP_SOURCES
     src/fabric/domain.cpp
@@ -75,6 +100,7 @@ add_executable(mxl-fabrics-agent ${MFA_APP_SOURCES})
 target_include_directories(mxl-fabrics-agent PRIVATE src third_party ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(mxl-fabrics-agent PRIVATE mfa-core mxl::mxl mxl::mxl-fabrics PkgConfig::libfabric)
 target_compile_options(mxl-fabrics-agent PRIVATE -Wall -Wextra -Wno-unused-parameter)
+mfa_rdma_hooks(mxl-fabrics-agent)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/web/dist/index.html")
     include(cmake/EmbedFile.cmake)
@@ -106,6 +132,7 @@ if(MFA_BUILD_TESTS)
     add_executable(lane-tests tests/lanes/test_lanes.cpp src/fabric/domain.cpp src/replication/engine.cpp)
     target_include_directories(lane-tests PRIVATE src third_party)
     target_link_libraries(lane-tests PRIVATE mfa-core mxl::mxl mxl::mxl-fabrics PkgConfig::libfabric)
+    mfa_rdma_hooks(lane-tests)
     add_test(NAME lane-tests COMMAND lane-tests)
 endif()
 
