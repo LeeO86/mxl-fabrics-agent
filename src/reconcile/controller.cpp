@@ -202,57 +202,6 @@ Controller::Controller(std::shared_ptr<ConfigStore> store)
     rootTmpfs_ = pathIsTmpfs(store_->get().mxl_root);
     // Environment only, read once: neither the config file nor PUT /api/v1/config can open the rebuild hook.
     adminRebuild_ = store_->get().mirror_admin_rebuild;
-    metricsPerFlow_ = store_->get().metrics_per_flow;
-    FabricObservers observers;
-    // Source grains, from the transfer to its completion.
-    observers.transfer = [this](std::string const& provider, double seconds) {
-        metrics_.observe("grain_transfer_seconds", seconds, {{"provider", provider}});
-    };
-    // Continuous flows: how far behind the current time the samples are when the origin is read, when the
-    // source sends them and when the destination commits them (the read window of a media function).
-    observers.sampleAge = [this](std::string const& stage, std::string const& flowId, double seconds) {
-        static std::vector<double> const bounds{0.002, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.12, 0.2, 0.5, 1.0};
-        std::map<std::string, std::string> labels{{"stage", stage}};
-        if (metricsPerFlow_)
-        {
-            labels["flow_id"] = flowId;
-        }
-        metrics_.observe("replication_sample_age_seconds", seconds, labels, bounds);
-        // The largest since the last scrape: a 1 s scrape of lag_ms sees one instant, this sees every batch.
-        metrics_.observeMax("replication_sample_age_max_seconds", seconds, labels);
-    };
-    // Continuous flows at the source: each transfer from its post to its completion (a transport stall).
-    observers.sampleTransfer = [this](std::string const& provider, std::string const& flowId, double seconds) {
-        static std::vector<double> const bounds{0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0};
-        std::map<std::string, std::string> labels{{"provider", provider}};
-        if (metricsPerFlow_)
-        {
-            labels["flow_id"] = flowId;
-        }
-        metrics_.observe("sample_transfer_seconds", seconds, labels, bounds);
-        metrics_.observeMax("sample_transfer_max_seconds", seconds, labels);
-    };
-    // Continuous flows at the destination: the time between two passes that committed samples (about one
-    // transfer period), and those longer than 20 ms (one 50p grain) counted as late deliveries.
-    observers.deliveryGap = [this](std::string const& flowId, double seconds) {
-        static std::vector<double> const bounds{0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0};
-        std::map<std::string, std::string> labels;
-        if (metricsPerFlow_)
-        {
-            labels["flow_id"] = flowId;
-        }
-        metrics_.observe("replication_delivery_gap_seconds", seconds, labels, bounds);
-        if (seconds > 0.02)
-        {
-            metrics_.addCounter("replication_late_deliveries_total", 1, labels);
-        }
-    };
-    // A lane's fabric thread that made no pass for longer than the stall threshold, and the call that held it.
-    observers.stall = [this](std::string const&, std::string const& task, double seconds) {
-        static std::vector<double> const bounds{0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0};
-        metrics_.observe("fabric_thread_stall_seconds", seconds, {{"task", task}}, bounds);
-    };
-    engine_.setObservers(std::move(observers));
 }
 
 Controller::~Controller()
@@ -390,7 +339,6 @@ void Controller::tick()
     };
     auto const cfg = store_->get();
     engine_.updateConfig(cfg);
-    metricsPerFlow_ = cfg.metrics_per_flow;
     peers_.updateConfig(cfg);
     observer_.updateConfig(cfg);
     auto const nmos = observer_.snapshot();
@@ -745,6 +693,9 @@ void Controller::tick()
         mirrors_ = std::move(mirrorViews);
         links_ = std::move(links);
     }
+    // Lanes that have nothing left (a safety net: each release drops its lane when nobody else holds it).
+    engine_.sweepIdleLanes();
+    step("lanes");
     renderMetrics();
     step("metrics");
     noteWork("tick", std::chrono::steady_clock::now() - tickStart);
@@ -1378,9 +1329,79 @@ void Controller::reportMirrorEvents(std::vector<MirrorEvent> const& events, int 
     }
 }
 
+void Controller::renderLaneMetrics(bool perFlow)
+{
+    using Labels = std::map<std::string, std::string>;
+    std::map<std::string, std::map<Labels, LaneHistogram>> histograms; // metric → labels → merged histogram
+    std::map<std::string, std::map<Labels, double>> maxes;
+    std::map<Labels, double> late;
+    for (auto const& lane : engine_.laneStats())
+    {
+        Labels flow;
+        if (perFlow)
+        {
+            flow["flow_id"] = lane.flowId;
+        }
+        auto add = [&](std::string const& metric, Labels const& labels, LaneHistogram const& histogram) {
+            histograms[metric][labels].merge(histogram);
+        };
+        for (auto const& [key, histogram] : lane.histograms)
+        {
+            auto labels = flow;
+            if (key.rfind("sample_age:", 0) == 0)
+            {
+                labels["stage"] = key.substr(11);
+                add("replication_sample_age_seconds", labels, histogram);
+                auto& max = maxes["replication_sample_age_max_seconds"][labels];
+                max = std::max(max, lane.maxes.count(key) != 0 ? lane.maxes.at(key) : 0.0);
+            }
+            else if (key == "delivery_gap")
+            {
+                add("replication_delivery_gap_seconds", labels, histogram);
+            }
+            else if (key == "sample_transfer")
+            {
+                labels["provider"] = lane.provider;
+                add("sample_transfer_seconds", labels, histogram);
+                auto& max = maxes["sample_transfer_max_seconds"][labels];
+                max = std::max(max, lane.maxes.count(key) != 0 ? lane.maxes.at(key) : 0.0);
+            }
+            else if (key == "grain_transfer")
+            {
+                add("grain_transfer_seconds", {{"provider", lane.provider}}, histogram);
+            }
+            else if (key.rfind("stall:", 0) == 0)
+            {
+                add("fabric_thread_stall_seconds", {{"task", key.substr(6)}}, histogram);
+            }
+        }
+        if (lane.histograms.count("delivery_gap") != 0)
+        {
+            late[flow] += static_cast<double>(lane.lateDeliveries);
+        }
+    }
+    for (auto const* metric : {"replication_sample_age_seconds", "replication_delivery_gap_seconds", "sample_transfer_seconds",
+             "grain_transfer_seconds", "fabric_thread_stall_seconds"})
+    {
+        std::vector<std::pair<Labels, LaneHistogram>> series;
+        for (auto const& [labels, histogram] : histograms[metric])
+        {
+            series.emplace_back(labels, histogram);
+        }
+        metrics_.setHistograms(metric, series);
+    }
+    for (auto const* metric : {"replication_sample_age_max_seconds", "sample_transfer_max_seconds"})
+    {
+        std::vector<std::pair<Labels, double>> series(maxes[metric].begin(), maxes[metric].end());
+        metrics_.setGauges(metric, series);
+    }
+    metrics_.setCounters("replication_late_deliveries_total", {late.begin(), late.end()});
+}
+
 void Controller::renderMetrics()
 {
     auto const cfg = store_->get();
+    renderLaneMetrics(cfg.metrics_per_flow);
     auto const inventory = scanner_.snapshot();
     auto const peerSnap = peers_.snapshot();
     auto const nmos = observer_.snapshot();

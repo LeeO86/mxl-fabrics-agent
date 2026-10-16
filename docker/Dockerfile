@@ -64,7 +64,8 @@ RUN cmake -S /src -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_PREFIX_PATH="/opt/mxl;/tmp/mxl/build/vcpkg_installed/x64-linux" \
         -DMFA_WITH_NMOS=ON -DNMOS_CPP_DIR=/opt/nmos-cpp/Development \
     && cmake --build /src/build -j"$(nproc)" \
-    && /src/build/unit-tests
+    && /src/build/unit-tests \
+    && FI_PROVIDER=tcp /src/build/lane-tests
 
 FROM ubuntu:24.04 AS runtime
 # ibverbs-providers holds the user-space NIC drivers (irdma for E810, mlx5, rxe) and

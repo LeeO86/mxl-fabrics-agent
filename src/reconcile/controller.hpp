@@ -80,6 +80,8 @@ private:
     // Duration of one piece of periodic work: histogram, debug line, an info line when it takes over 0.5 s.
     void noteWork(char const* work, std::chrono::steady_clock::duration took);
     void noteWork(char const* work, double seconds);
+    // Delivery timing counted on the lanes (histograms, rolling maxima, late deliveries), copied into metrics_.
+    void renderLaneMetrics(bool perFlow);
     HttpResponse rebuildMirror(MirrorRebuildRequest const& request);
 
     std::shared_ptr<ConfigStore> store_;
@@ -95,7 +97,6 @@ private:
     bool stop_ = false;
     std::thread thread_;
     std::atomic<bool> ready_{false};
-    std::atomic<bool> metricsPerFlow_{true}; // METRICS_PER_FLOW, for the lanes' sample age observations
     std::atomic<bool> nmosReady_{false};
     std::atomic<bool> nmosRegistered_{false};
     std::atomic<int> fatal_{0};

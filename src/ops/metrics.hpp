@@ -1,5 +1,7 @@
 #pragma once
 
+#include "fabric/lanestats.hpp"
+
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -21,8 +23,10 @@ public:
     /// The same with the histogram's own bucket bounds (ascending; the first observation of a series sets them).
     void observe(std::string const& name, double seconds, std::map<std::string, std::string> const& labels,
         std::vector<double> const& bounds);
-    /// A gauge of the largest value since the last render (a scrape): render shows it and starts it again at 0.
-    void observeMax(std::string const& name, double value, std::map<std::string, std::string> const& labels = {});
+    /// Replaces every series of a histogram counted elsewhere (the lanes); series that are gone disappear.
+    void setHistograms(std::string const& name, std::vector<std::pair<std::map<std::string, std::string>, LaneHistogram>> const& series);
+    /// The same for a counter kept elsewhere.
+    void setCounters(std::string const& name, std::vector<std::pair<std::map<std::string, std::string>, double>> const& series);
     std::string render() const;
 
 private:
@@ -45,6 +49,5 @@ private:
     std::vector<Series> gauges_;
     std::vector<Series> counters_;
     std::vector<Hist> hists_;
-    mutable std::vector<Series> maxes_;
 };
 } // namespace mfa

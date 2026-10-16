@@ -71,6 +71,7 @@ jobs:
             -DMFA_WITH_NMOS=ON -DNMOS_CPP_DIR=/opt/nmos-cpp/Development
           cmake --build build -j"$(nproc)"
           ./build/unit-tests
+          LD_LIBRARY_PATH=/opt/mxl/lib:/usr/local/lib FI_PROVIDER=tcp ./build/lane-tests
       - name: integration
         run: |
           sudo ldconfig

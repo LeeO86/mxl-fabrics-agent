@@ -8,7 +8,7 @@ namespace mfa
 {
 namespace
 {
-std::vector<double> const kBuckets = {0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0};
+std::vector<double> const& kBuckets = defaultBounds();
 
 std::string boundText(double bound)
 {
@@ -138,15 +138,26 @@ void Metrics::observe(std::string const& name, double seconds, std::map<std::str
     }
 }
 
-void Metrics::observeMax(std::string const& name, double value, std::map<std::string, std::string> const& labels)
+void Metrics::setHistograms(std::string const& name, std::vector<std::pair<std::map<std::string, std::string>, LaneHistogram>> const& series)
 {
     std::lock_guard const lock{mu_};
-    if (auto* row = find(maxes_, name, labels))
+    hists_.erase(std::remove_if(hists_.begin(), hists_.end(), [&](Hist const& row) { return row.name == name; }), hists_.end());
+    for (auto const& [labels, histogram] : series)
     {
-        row->value = std::max(row->value, value);
-        return;
+        auto buckets = histogram.buckets;
+        buckets.resize(histogram.bounds.size(), 0);
+        hists_.push_back(Hist{name, labels, histogram.count, histogram.sum, histogram.bounds, std::move(buckets)});
     }
-    maxes_.push_back(Series{name, labels, value});
+}
+
+void Metrics::setCounters(std::string const& name, std::vector<std::pair<std::map<std::string, std::string>, double>> const& series)
+{
+    std::lock_guard const lock{mu_};
+    counters_.erase(std::remove_if(counters_.begin(), counters_.end(), [&](Series const& row) { return row.name == name; }), counters_.end());
+    for (auto const& [labels, value] : series)
+    {
+        counters_.push_back(Series{name, labels, value});
+    }
 }
 
 std::string Metrics::render() const
@@ -154,17 +165,6 @@ std::string Metrics::render() const
     std::lock_guard const lock{mu_};
     std::ostringstream out;
     std::set<std::string> seen;
-    for (auto& row : maxes_)
-    {
-        auto const metric = "mxl_fabrics_agent_" + row.name;
-        if (seen.insert(metric).second)
-        {
-            out << "# TYPE " << metric << " gauge\n";
-        }
-        out << metric << labelsOf(row.labels) << " " << row.value << "\n";
-        row.value = 0;
-    }
-    seen.clear();
     auto typeOnce = [&](std::string const& metric, char const* kind) {
         if (seen.insert(metric).second)
         {

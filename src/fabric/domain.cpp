@@ -14,6 +14,8 @@
 #include <mxl/time.h>
 #include <rdma/fabric.h>
 
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -219,6 +221,7 @@ struct TargetSlot
     std::uint64_t head = 0;
     std::size_t lastBatch = 1; // samples in the last committed batch (a "grain" of a continuous flow)
     std::chrono::steady_clock::time_point deliveredAt{}; // last pass that committed samples (continuous)
+    double usualGap = 0; // moving average of the delivery gaps (seconds)
     std::string lastError;
     std::string state = "pending";
     bool closed = false; // the MXL target was released after a failed read (see closeFailedTarget)
@@ -269,11 +272,62 @@ struct InitiatorSlot
     std::uint64_t entryBytes = 0; // smallest bounce buffer entry of the targets (continuous flows), 0 = unknown
 };
 
+} // namespace
+
+struct SharedInstance
+{
+    std::string path;
+    mxlInstance instance = nullptr;
+    std::atomic<bool> keep{false}; // shutdown keeping the flows: MXL would delete them with the instance
+
+    ~SharedInstance()
+    {
+        if (instance != nullptr && !keep)
+        {
+            mxlDestroyInstance(instance);
+        }
+    }
+};
+
+std::shared_ptr<SharedInstance> openSharedInstance(std::string const& path, std::string* error)
+{
+    errno = 0;
+    auto* instance = mxlCreateInstance(path.c_str(), "");
+    auto const err = errno;
+    if (instance == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = "mxlCreateInstance failed for " + path;
+            // Each MXL instance opens an inotify instance (its DomainWatcher), counted per user on the whole host.
+            if (err == EMFILE || err == ENFILE || err == ENOSPC || err == ENOMEM)
+            {
+                *error += std::string(" (") + std::strerror(err) +
+                          "; each MXL instance needs an inotify instance: raise fs.inotify.max_user_instances, e.g. to 1024)";
+            }
+        }
+        return nullptr;
+    }
+    auto shared = std::make_shared<SharedInstance>();
+    shared->path = path;
+    shared->instance = instance;
+    return shared;
+}
+
+namespace
+{
+std::int64_t steadySecond()
+{
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 class Session
 {
 public:
-    explicit Session(std::string path)
+    Session(std::string path, std::shared_ptr<SharedInstance> shared)
         : path_(std::move(path))
+        , shared_(std::move(shared))
+        , instance_(shared_ ? shared_->instance : nullptr)
     {}
 
     ~Session()
@@ -283,16 +337,15 @@ public:
 
     bool open(std::string* error)
     {
-        if (instance_ != nullptr)
+        if (fabrics_ != nullptr)
         {
             return true;
         }
-        instance_ = mxlCreateInstance(path_.c_str(), "");
         if (instance_ == nullptr)
         {
             if (error != nullptr)
             {
-                *error = "mxlCreateInstance failed for " + path_;
+                *error = "no MXL instance for " + path_;
             }
             return false;
         }
@@ -303,8 +356,7 @@ public:
             {
                 *error = "mxlFabricsCreateInstance failed (" + statusText(status) + ")";
             }
-            mxlDestroyInstance(instance_);
-            instance_ = nullptr;
+            fabrics_ = nullptr;
             return false;
         }
         return true;
@@ -337,16 +389,17 @@ public:
             mxlFabricsDestroyInstance(fabrics_);
             fabrics_ = nullptr;
         }
-        if (instance_ != nullptr && !keepFlows_)
-        {
-            mxlDestroyInstance(instance_);
-        }
+        // The domain's MXL instance goes with its last lane (SharedInstance).
         instance_ = nullptr;
     }
 
     void keepFlowsOnExit()
     {
         keepFlows_ = true;
+        if (shared_)
+        {
+            shared_->keep = true;
+        }
     }
 
     bool ensureWriter(std::string const& flowDef, std::string* error)
@@ -796,9 +849,32 @@ public:
         return runtime.headIndex;
     }
 
-    void setObservers(FabricObservers observers)
+    // Counted on this thread, handed out by statsSnapshot.
+    void note(std::string const& key, std::vector<double> const& bounds, double value)
     {
-        observers_ = std::move(observers);
+        auto& histogram = stats_.histograms[key];
+        if (histogram.bounds.empty())
+        {
+            histogram.bounds = bounds;
+        }
+        histogram.observe(value);
+        maxes_[key].observe(value, steadySecond());
+    }
+
+    LaneStats statsSnapshot(std::string const& flowId) const
+    {
+        auto out = stats_;
+        out.flowId = flowId;
+        auto const second = steadySecond();
+        for (auto const& [key, max] : maxes_)
+        {
+            out.maxes[key] = max.value(second);
+        }
+        for (auto const& [_, slot] : initiators_)
+        {
+            out.provider = slot.provider;
+        }
+        return out;
     }
 
     // How long the lane's thread waits for the next pass: 1 ms for a continuous flow, 2 ms for a discrete one,
@@ -1037,18 +1113,12 @@ private:
         if (std::exchange(slot.inFlight, false))
         {
             slot.completedAt = now;
-            if (observers_.sampleTransfer)
-            {
-                observers_.sampleTransfer(slot.provider, slot.flowId, std::chrono::duration<double>(now - slot.sampleSentAt).count());
-            }
+            note("sample_transfer", sampleTransferBounds(), std::chrono::duration<double>(now - slot.sampleSentAt).count());
         }
         slot.progressAt = now;
         if (slot.awaitingCompletion)
         {
-            if (observers_.transfer)
-            {
-                observers_.transfer(slot.provider, std::chrono::duration<double>(now - slot.transferStart).count());
-            }
+            note("grain_transfer", defaultBounds(), std::chrono::duration<double>(now - slot.transferStart).count());
             slot.awaitingCompletion = false;
         }
         auto const errorsBefore = slot.errors;
@@ -1214,15 +1284,11 @@ private:
             slot.sampleHead += count;
             slot.inFlight = true;
             slot.sampleSentAt = std::chrono::steady_clock::now();
-            if (observers_.sampleAge)
+            auto const& rate = slot.info.common.grainRate;
+            if (auto const now = mxlGetCurrentIndex(&rate); now != MXL_UNDEFINED_INDEX)
             {
-                auto const& rate = slot.info.common.grainRate;
-                auto const now = mxlGetCurrentIndex(&rate);
-                if (now != MXL_UNDEFINED_INDEX)
-                {
-                    observers_.sampleAge("origin", slot.flowId, indexSeconds(now, runtime.headIndex, rate));
-                    observers_.sampleAge("sent", slot.flowId, indexSeconds(now, slot.sampleHead, rate));
-                }
+                note("sample_age:origin", sampleAgeBounds(), indexSeconds(now, runtime.headIndex, rate));
+                note("sample_age:sent", sampleAgeBounds(), indexSeconds(now, slot.sampleHead, rate));
             }
         }
     }
@@ -1297,21 +1363,25 @@ private:
                 slot.head = item.head;
                 slot.lastBatch = item.count;
                 ++committed;
-                if (observers_.sampleAge)
+                auto const& rate = writer->second.info.common.grainRate;
+                if (auto const now = mxlGetCurrentIndex(&rate); now != MXL_UNDEFINED_INDEX)
                 {
-                    auto const& rate = writer->second.info.common.grainRate;
-                    auto const now = mxlGetCurrentIndex(&rate);
-                    if (now != MXL_UNDEFINED_INDEX)
-                    {
-                        observers_.sampleAge("delivered", slot.flowId, indexSeconds(now, item.head, rate));
-                    }
+                    note("sample_age:delivered", sampleAgeBounds(), indexSeconds(now, item.head, rate));
                 }
             }
             if (committed > 0)
             {
-                if (observers_.deliveryGap && slot.deliveredAt != std::chrono::steady_clock::time_point{})
+                // Includes the origin's own pauses: a writer that commits nothing for 50 ms gives a 50 ms gap.
+                if (slot.deliveredAt != std::chrono::steady_clock::time_point{})
                 {
-                    observers_.deliveryGap(slot.flowId, std::chrono::duration<double>(passStart - slot.deliveredAt).count());
+                    auto const gap = std::chrono::duration<double>(passStart - slot.deliveredAt).count();
+                    note("delivery_gap", deliveryGapBounds(), gap);
+                    if (slot.usualGap > 0 && lateGap(gap, slot.usualGap))
+                    {
+                        stats_.lateDeliveries += 1;
+                    }
+                    // The usual gap: a slow moving average that a single burst hardly moves.
+                    slot.usualGap = slot.usualGap > 0 ? slot.usualGap * 0.98 + std::min(gap, 4.0 * slot.usualGap) * 0.02 : gap;
                 }
                 slot.deliveredAt = passStart;
             }
@@ -1442,14 +1512,16 @@ private:
     }
 
     std::string path_;
-    mxlInstance instance_ = nullptr;
+    std::shared_ptr<SharedInstance> shared_;
+    mxlInstance instance_ = nullptr; // shared_->instance
     mxlFabricsInstance fabrics_ = nullptr;
     std::map<std::string, WriterSlot> writers_;
     std::map<std::string, TargetSlot> targets_;
     std::map<std::string, InitiatorSlot> initiators_;
     std::vector<FabricRow> rows_;
     bool keepFlows_ = false;
-    FabricObservers observers_;
+    LaneStats stats_;
+    std::map<std::string, RollingMax> maxes_;
 };
 
 struct Task
@@ -1475,15 +1547,16 @@ struct FabricDomain::Impl
     std::mutex rowsMu;
     std::vector<FabricRow> rows;
 
-    std::mutex observersMu;
-    FabricObservers observers; // the stall observer, read on the thread
+    std::atomic<std::uint64_t> calls{0}; // calls queued so far (FabricDomain::idle, callCount)
+    mutable std::mutex statsMu;
+    LaneStats stats; // the session's, copied about every 100 ms
 
-    explicit Impl(std::string inPath, std::string inFlowId, int inRt, std::vector<int> inCpus)
+    Impl(std::string inPath, std::string inFlowId, std::shared_ptr<SharedInstance> instance, int inRt, std::vector<int> inCpus)
         : path(std::move(inPath))
         , flowId(std::move(inFlowId))
         , rt(inRt)
         , cpus(std::move(inCpus))
-        , session(path)
+        , session(path, std::move(instance))
     {}
 
     void loop()
@@ -1493,6 +1566,7 @@ struct FabricDomain::Impl
         auto lastLog = std::chrono::steady_clock::time_point{};
         std::uint64_t unlogged = 0;
         bool wasActive = false; // the last pass had something to pump (its waits were short)
+        auto statsAt = std::chrono::steady_clock::time_point{};
         while (true)
         {
             std::vector<Task> batch;
@@ -1544,6 +1618,13 @@ struct FabricDomain::Impl
                     noteStall(slowest, gap, slowestTook, now, lastLog, unlogged);
                 }
                 wasActive = active;
+                if (now - statsAt >= std::chrono::milliseconds(100))
+                {
+                    statsAt = now;
+                    auto copy = session.statsSnapshot(flowId);
+                    std::lock_guard const lock{statsMu};
+                    stats = std::move(copy);
+                }
             }
         }
         session.shutdown();
@@ -1552,14 +1633,7 @@ struct FabricDomain::Impl
     void noteStall(char const* task, std::chrono::steady_clock::duration gap, std::chrono::steady_clock::duration took,
         std::chrono::steady_clock::time_point now, std::chrono::steady_clock::time_point& lastLog, std::uint64_t& unlogged)
     {
-        auto const seconds = std::chrono::duration<double>(gap).count();
-        {
-            std::lock_guard const lock{observersMu};
-            if (observers.stall)
-            {
-                observers.stall(flowId, task, seconds);
-            }
-        }
+        session.note(std::string("stall:") + task, stallBounds(), std::chrono::duration<double>(gap).count());
         // At most one line per second and lane; the counter has every one.
         if (now - lastLog < std::chrono::seconds(1))
         {
@@ -1572,19 +1646,23 @@ struct FabricDomain::Impl
                                              {"unlogged", std::to_string(std::exchange(unlogged, 0))}});
     }
 
+    // Runs fn on the lane's thread and returns its number in the order of calls.
     template <typename F>
-    void call(char const* name, F&& fn)
+    std::uint64_t call(char const* name, F&& fn)
     {
         Task task;
         task.name = name;
         task.fn = std::forward<F>(fn);
         auto future = task.done.get_future();
+        std::uint64_t seq = 0;
         {
             std::lock_guard const lock{mu};
+            seq = ++calls;
             queue.push_back(std::move(task));
         }
         cv.notify_one();
         future.get();
+        return seq;
     }
 };
 
@@ -1634,10 +1712,10 @@ ProviderProbe probeFabrics(std::string const& scratchDir)
     return probe;
 }
 
-FabricDomain::FabricDomain(std::string path, std::string flowId, int rtPriority, std::vector<int> cpus)
+FabricDomain::FabricDomain(std::string path, std::string flowId, std::shared_ptr<SharedInstance> instance, int rtPriority, std::vector<int> cpus)
     : path_(std::move(path))
     , flowId_(std::move(flowId))
-    , impl_(std::make_unique<Impl>(path_, flowId_, rtPriority, std::move(cpus)))
+    , impl_(std::make_unique<Impl>(path_, flowId_, std::move(instance), rtPriority, std::move(cpus)))
 {
     impl_->thread = std::thread([this] { impl_->loop(); });
     std::string error;
@@ -1737,20 +1815,26 @@ std::optional<std::uint64_t> FabricDomain::originHead(std::string const& key)
     return head;
 }
 
-void FabricDomain::setObservers(FabricObservers observers)
-{
-    {
-        std::lock_guard const lock{impl_->observersMu};
-        impl_->observers = observers;
-    }
-    impl_->call("set_observers", [&](Session& session) { session.setObservers(std::move(observers)); });
-}
-
-bool FabricDomain::idle()
+bool FabricDomain::idle(std::uint64_t* seq)
 {
     bool idle = false;
-    impl_->call("idle", [&](Session& session) { idle = session.idle(); });
+    auto const number = impl_->call("idle", [&](Session& session) { idle = session.idle(); });
+    if (seq != nullptr)
+    {
+        *seq = number;
+    }
     return idle;
+}
+
+std::uint64_t FabricDomain::callCount() const
+{
+    return impl_->calls.load();
+}
+
+LaneStats FabricDomain::stats() const
+{
+    std::lock_guard const lock{impl_->statsMu};
+    return impl_->stats;
 }
 
 void FabricDomain::keepFlowsOnExit()

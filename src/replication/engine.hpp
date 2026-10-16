@@ -69,9 +69,11 @@ public:
     std::shared_ptr<FabricDomain> domain(std::string const& path, std::string const& flowId);
     // Every lane of a domain.
     void releaseDomain(std::string const& path);
+    // Drops the lanes with nothing left in them (a safety net for the drops after each release; once per tick).
+    std::size_t sweepIdleLanes();
+    std::size_t laneCount() const;
+    std::vector<LaneStats> laneStats() const;
     void releaseAll(bool keepFlows = false);
-    // Metrics callbacks of every lane (transfer times, sample ages, stalls); set before the first lane is opened.
-    void setObservers(FabricObservers observers);
     bool ensureWriter(std::string const& path, std::string const& flowDef, std::string* error);
     void releaseWriter(std::string const& path, std::string const& flowId);
     // Before a mirror flow is rebuilt: drops its destination targets (and the sources' connections to them),
@@ -108,8 +110,9 @@ private:
     FabricEndpoint endpoint(std::string const& peer) const;
     // The lane if it exists (nothing is opened).
     std::shared_ptr<FabricDomain> findLane(std::string const& path, std::string const& flowId) const;
-    // Drops the lane when nothing is left in it (no writer, target or initiator).
-    void dropIfIdle(std::string const& path, std::string const& flowId);
+    // Drops the lane when nothing is left in it (no writer, target or initiator) and nobody else holds it.
+    bool dropIfIdle(std::string const& path, std::string const& flowId);
+    std::shared_ptr<SharedInstance> sharedInstance(std::string const& path, std::string* error);
     std::vector<std::shared_ptr<FabricDomain>> lanes() const;
 
     mutable std::mutex mu_;
@@ -119,7 +122,9 @@ private:
     std::map<std::string, DestState> dest_;
     std::map<std::string, std::string> linksDown_;
     std::map<std::string, std::uint64_t> sourceRestarts_;
-    FabricObservers observers_;
+    std::map<std::string, std::string> laneErrors_; // path → last logged lane error (under mu_)
+    std::mutex instancesMu_;
+    std::map<std::string, std::weak_ptr<SharedInstance>> instances_; // one MXL instance per domain path
     int nextPort_;
 };
 } // namespace mfa
