@@ -645,8 +645,9 @@ the set of hosts or the choice changes and exports `origin_conflicts`.
   initiator set up again, its memory registered, a writer opened or released)
   held up the transfers of all the others in that domain. A lane goes when
   its flow has no writer, target or initiator left. The thread of a lane with
-  a continuous flow makes a pass every 1 ms, of a discrete one every 2 ms, of
-  an empty one every 50 ms; a call wakes it at once. A lane is dropped only
+  a continuous flow makes a pass every `AUDIO_PASS_MS` (default 2 ms as in
+  1.7.1; 1.7.2 used 1 ms), of a discrete one every 2 ms, of an empty one every
+  50 ms; a call wakes it at once. A lane is dropped only
   when it is idle and no call came in since the check and nobody else holds
   it, so a request that took the lane meanwhile keeps it; the reconcile pass
   sweeps idle lanes once per pass.
@@ -655,8 +656,8 @@ the set of hosts or the choice changes and exports `origin_conflicts`.
   Continuous (audio) flows use MXL's sample transfer. One transfer carries
   every sample written since the last one, up to what the targets' bounce
   buffer entry holds (its size is in the target info; MXL sizes it from the
-  mirror's sync batch, 10 ms by default), and starts 2 ms after the source saw
-  the last one complete: over `verbs` MXL's target
+  mirror's sync batch, 10 ms by default), and starts `AUDIO_PASS_MS` (at least
+  2 ms) after the pass that saw the last one complete: over `verbs` MXL's target
   posts the receive for the next immediate only when its agent drains the last
   transfer. 1.2.2 sent one sync batch per pass (48 samples from the ST 2110
   gateway): half of a 48 kHz flow arrived, 8 % over `verbs` on the platform.
@@ -683,6 +684,29 @@ the set of hosts or the choice changes and exports `origin_conflicts`.
   origin (indices, flow ids and ring geometry are preserved by the Fabrics API).
 - Optional real-time scheduling for the fabric thread: `RT_PRIORITY` (0 = off,
   default), `CPU_AFFINITY` (list).
+- Queue pair ACK timeout and retry count (since 1.7.3). An RC queue pair
+  retransmits when no ACK came for 4.096 µs × 2^`FABRIC_ACK_TIMEOUT`, at most
+  `FABRIC_RETRY_COUNT` times, then fails. libfabric 2.3.1's `verbs` provider
+  connects through rdma_cm and sets neither (retry count 15, which the kernel
+  takes as 7; rdma_cm's timeout on RoCE is 17 = 537 ms), and MXL 218ddaa gives
+  no access to its endpoints. The agent binary therefore defines
+  `rdma_connect`, `rdma_accept`, `rdma_get_cm_event`, `rdma_destroy_id` and
+  `rdma_destroy_ep`
+  itself (exported, so the dynamic linker binds libfabric's calls to them) and
+  calls librdmacm's own behind them: before a connect or accept it sets
+  `RDMA_OPTION_ID_ACK_TIMEOUT` (level `RDMA_OPTION_ID`) on the rdma_cm id (the kernel applies it when the
+  queue pair goes to RTS), and the connect carries the retry count (the
+  accepting side's queue pair takes the initiator's). On `ESTABLISHED` it reads
+  both back with `ibv_query_qp` and logs `fabric_qp` (role, flow_id, peer,
+  local and remote address, device, qp_num, `ack_timeout`, `ack_timeout_ms`,
+  `retry_count`, `rnr_retry`, the settings, `checked` and `applied`; warn when the queue
+  pair reports a timeout or retry count other than the setting, or rdma_set_option
+  refused the timeout; a driver that reports no timeout is `checked: false`, info). Whether the NIC uses the timeout is the driver's
+  business: mlx5 and rxe do; E810 with the in-tree or Intel's irdma ignores it
+  (its retransmit timer is the device's `roce_rtomin`, and its `ibv_query_qp`
+  reports no timeout: `ack_timeout` `unreported`). `FABRIC_ACK_TIMEOUT=0` leaves
+  the timeout to rdma_cm. LD_PRELOAD would not do: the image's binary has file
+  capabilities and the loader ignores LD_PRELOAD for it.
 - Error handling per replication: on error, tear down only that replication,
   back off exponentially (`250 ms` → `30 s`, 10 s before 1.3.0), retry. Never
   affect other replications. A repeated failure is logged when it starts or its
@@ -753,6 +777,9 @@ include/exclude lists apply at runtime.
 | `WEB_PORT` | 8095 | UI, REST, health, metrics |
 | `WEB_ENABLE` | true | `false` hides the UI and `PUT /api/v1/config`. `/api/v1` stays up |
 | `RT_PRIORITY` / `CPU_AFFINITY` | 0 / empty | fabric thread scheduling |
+| `FABRIC_ACK_TIMEOUT` | 14 | queue pair ACK timeout 4.096 µs × 2^n (14 = 67 ms); 0 or 4–24; 0 leaves rdma_cm's (RoCE 17 = 537 ms) (since 1.7.3) |
+| `FABRIC_RETRY_COUNT` | 7 | queue pair retry count, 1–7 (since 1.7.3) |
+| `AUDIO_PASS_MS` | 2 | pass interval of a continuous lane, 1–4; also the least time from a completed sample transfer to the next (at least 2 ms). Above 4 the source cannot catch up after a stall: a transfer carries at most one bounce-buffer entry (10 ms by default) and a cycle takes about two passes (since 1.7.3; 1.7.2: 1) |
 | `LOG_LEVEL` | `info` | structured JSON logs |
 | `SHUTDOWN_TIMEOUT_S` | 10 | SIGTERM budget before exit 143 |
 | `AGENT_CONFIG_FILE` | unset | optional JSON file. Saves use `$STATE_DIR/agent.json` when that directory is writable |
@@ -840,10 +867,16 @@ Tabs:
 | `grain_transfer_seconds` | histogram | provider; source grains, transfer to completion |
 | `sample_transfer_seconds` | histogram | provider, flow_id; source, continuous flows: each transfer from its post to the pass that saw it complete (one is in flight at a time, so a long one holds back every later sample) (since 1.7.2) |
 | `sample_transfer_max_seconds` | gauge | provider, flow_id; the longest of those in the last 10 s (since 1.7.2) |
+| `sample_transfer_stalls_total` | counter | provider, flow_id; sample transfers longer than 25 ms: most likely a retransmission (since 1.7.3) |
+| `grain_transfer_stalls_total` | counter | provider; grain transfers longer than 40 ms (a 2160p grain normally takes about 7 ms over `verbs` at 25 Gb/s, 16 ms over the lab's `tcp` loopback) (since 1.7.3) |
+| `transfer_stall_threshold_seconds` | gauge | kind (`sample` 0.025, `grain` 0.040); fixed, independent of `FABRIC_ACK_TIMEOUT` (since 1.7.3) |
+| `fabric_requested_ack_timeout_seconds` / `fabric_requested_retry_count` | gauge | —; what the agent requests for every queue pair (0 s: left to rdma_cm); not what the NIC does (since 1.7.3) |
+| `fabric_qp_established_total` | counter | role, ack_timeout, retry_count; queue pairs established, with the values `ibv_query_qp` read back (`unreported`: the driver gives no timeout, as irdma; `unknown` in both labels: `ibv_query_qp` failed) (since 1.7.3) |
+| `fabric_qp_option_failures_total` | counter | —; rdma_set_option refused the ACK timeout (the connection goes on with rdma_cm's) (since 1.7.3) |
 | `replication_sample_age_seconds` | histogram | stage, flow_id; continuous flows, how far behind the current TAI sample index: `origin` (the origin head when the source sends), `sent` (the newest sample of a transfer when it is posted), `delivered` (the newest sample of a batch when the destination commits it); 0 when at or ahead of the current index (since 1.7.2) |
 | `replication_sample_age_max_seconds` | gauge | stage, flow_id; the largest of those in the last 10 s (since 1.7.2) |
 | `replication_delivery_gap_seconds` | histogram | flow_id; destination, continuous flows: time between two passes that committed samples (since 1.7.2) |
-| `replication_late_deliveries_total` | counter | flow_id; those gaps longer than twice the flow's usual gap and at least 10 ms; gaps include the origin's pauses (since 1.7.2) |
+| `replication_late_deliveries_total` | counter | flow_id; destination: a continuous flow's gaps longer than twice its usual gap (the 98th percentile of its last 256 gaps, so more than about 6 long gaps in 256 deliveries, about 1 s, become the usual gap and stop counting; 1.7.2: a moving average) and at least 10 ms; a discrete flow's gaps between two passes that committed grains longer than two grain periods and at least 10 ms (since 1.7.3; 1.7.2 counted no discrete flow); gaps include the origin's pauses (since 1.7.2) |
 | `fabric_thread_stall_seconds` | histogram | task; a lane's thread made no pass for longer than 20 ms while it had something to pump, with the slowest call into the lane in between (`pass`: none, the thread got no CPU or a pass was slow) (since 1.7.2) |
 | `reconcile_work_seconds` | histogram | work (`plan`, `pulls`, `lanes`, `cleanup_domains`, `cleanup_flows`, `health`, `metrics`, `tick`, `reader_scan`, `peer_poll`, `inventory_scan`); durations of the periodic work (since 1.7.2) |
 | `setup_seconds` | histogram | phase (target_setup, handshake, first_grain) (not implemented yet) |

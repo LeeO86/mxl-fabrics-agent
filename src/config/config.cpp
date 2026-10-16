@@ -256,7 +256,7 @@ std::vector<std::string> configKeys()
     return {"HOST_ID", "MXL_DOMAIN_SCAN_PATH", "MXL_ROOT", "STATE_DIR", "SCAN_INTERVAL_MS", "MIRROR_MODE",
         "MIRROR_INCLUDE_DOMAINS", "MIRROR_INCLUDE_FLOWS", "MIRROR_EXCLUDE_DOMAINS", "MIRROR_EXCLUDE_FLOWS", "MIRROR_GRACE_S",
         "MIRROR_IDLE_GRACE_S", "MIRROR_CLEANUP_DRY_RUN", "MIRROR_STALE_MS", "TMPFS_RESERVE_MB", "MXL_CLEANUP_ON_EXIT", "CLEANUP_MIRRORS_ON_EXIT", "DEFAULT_PROVIDER", "PROVIDER_FALLBACK",
-        "FABRIC_INTERFACE", "FABRIC_PORT_BASE", "FABRIC_PORT_COUNT", "PEERS", "PEER_POLL_INTERVAL_MS", "RELEASE_GRACE_MS",
+        "FABRIC_INTERFACE", "FABRIC_PORT_BASE", "FABRIC_PORT_COUNT", "FABRIC_ACK_TIMEOUT", "FABRIC_RETRY_COUNT", "AUDIO_PASS_MS", "PEERS", "PEER_POLL_INTERVAL_MS", "RELEASE_GRACE_MS",
         "NMOS_ENABLE", "NMOS_SEED", "NMOS_LABEL", "NMOS_TAGS", "NMOS_DNS_SD", "NMOS_HOST_ADDRESS", "NMOS_REGISTRY_ADDRESS",
         "NMOS_REGISTRY_PORT", "NMOS_QUERY_ADDRESS", "NMOS_QUERY_PORT", "NMOS_POLL_INTERVAL_MS", "NMOS_PORT", "LOCAL_NODE_IDS",
         "LOCAL_NODE_HOSTNAMES", "LOCAL_NODE_CIDRS", "WEB_PORT", "WEB_ENABLE", "RT_PRIORITY", "CPU_AFFINITY", "LOG_LEVEL",
@@ -327,6 +327,19 @@ Config parseConfig(std::map<std::string, std::string> const& values)
     {
         throw ConfigError("FABRIC_PORT_BASE + FABRIC_PORT_COUNT exceeds 65535");
     }
+    // 4.096 us x 2^n: 4 = 66 us, 14 = 67 ms, 17 = 537 ms, 24 = 68.7 s. 0 leaves the queue pair's timeout to rdma_cm
+    // (RoCE: 17), as before 1.7.3; IB's own 0 (wait forever) is never set.
+    cfg.fabric_ack_timeout = parseInt("FABRIC_ACK_TIMEOUT", valueOr(values, "FABRIC_ACK_TIMEOUT", "14"), 0, 24);
+    if (cfg.fabric_ack_timeout != 0 && cfg.fabric_ack_timeout < 4)
+    {
+        throw ConfigError("FABRIC_ACK_TIMEOUT must be 0 (rdma_cm default) or 4 to 24 (4.096 us x 2^n)");
+    }
+    // A 3-bit field; 0 would fail the queue pair on the first lost packet.
+    cfg.fabric_retry_count = parseInt("FABRIC_RETRY_COUNT", valueOr(values, "FABRIC_RETRY_COUNT", "7"), 1, 7);
+    // At most 4: a transfer carries at most one bounce-buffer entry (the mirror's sync batch, 10 ms by default) and
+    // a cycle takes about two passes (one sees the completion, the gate waits one more), so at 5 ms the source would
+    // only just keep up with real time and never catch up after a stall.
+    cfg.audio_pass_ms = parseInt("AUDIO_PASS_MS", valueOr(values, "AUDIO_PASS_MS", "2"), 1, 4);
     cfg.peers = parsePeers(valueOr(values, "PEERS", "[]"));
     cfg.peer_poll_interval_ms = parseInt("PEER_POLL_INTERVAL_MS", valueOr(values, "PEER_POLL_INTERVAL_MS", "2000"), 100, 600000);
     cfg.release_grace_ms = parseInt("RELEASE_GRACE_MS", valueOr(values, "RELEASE_GRACE_MS", "2000"), 0, 600000);
@@ -488,6 +501,9 @@ std::map<std::string, std::string> configToMap(Config const& cfg)
     values["FABRIC_INTERFACE"] = cfg.fabric_interface;
     values["FABRIC_PORT_BASE"] = std::to_string(cfg.fabric_port_base);
     values["FABRIC_PORT_COUNT"] = std::to_string(cfg.fabric_port_count);
+    values["FABRIC_ACK_TIMEOUT"] = std::to_string(cfg.fabric_ack_timeout);
+    values["FABRIC_RETRY_COUNT"] = std::to_string(cfg.fabric_retry_count);
+    values["AUDIO_PASS_MS"] = std::to_string(cfg.audio_pass_ms);
     values["PEERS"] = peersToJson(cfg.peers);
     values["PEER_POLL_INTERVAL_MS"] = std::to_string(cfg.peer_poll_interval_ms);
     values["RELEASE_GRACE_MS"] = std::to_string(cfg.release_grace_ms);

@@ -1,7 +1,9 @@
 #include <doctest/doctest.h>
 
 #include <string>
+#include <vector>
 
+#include "fabric/qpsettings.hpp"
 #include "ops/lanemetrics.hpp"
 #include "ops/metrics.hpp"
 
@@ -167,4 +169,147 @@ TEST_CASE("per-flow lane series go with their lane, the summed ones stay")
     auto const text = m.render();
     CHECK(text.find("flow_id=\"f1\"") == std::string::npos);
     CHECK(has(text, "mxl_fabrics_agent_grain_transfer_seconds_count{provider=\"verbs\"} 3"));
+}
+
+TEST_CASE("a discrete flow is late after more than two grain periods, at least 10 ms")
+{
+    CHECK_FALSE(lateGrainGap(0.020, 0.020)); // 50p, one period
+    CHECK_FALSE(lateGrainGap(0.040, 0.020)); // two periods: not yet
+    CHECK(lateGrainGap(0.041, 0.020));
+    CHECK_FALSE(lateGrainGap(0.080, 0.040)); // 25p
+    CHECK(lateGrainGap(0.081, 0.040));
+    CHECK_FALSE(lateGrainGap(0.009, 0.002)); // 500 grains/s: the 10 ms floor
+    CHECK(lateGrainGap(0.011, 0.002));
+    CHECK(lateGrainGap(0.54, 0.020)); // a retransmission
+}
+
+namespace
+{
+// Counts the late gaps of a sequence as the destination does (pumpTarget).
+int lateCount(std::vector<double> const& gaps)
+{
+    GapWindow window;
+    int late = 0;
+    for (auto const gap : gaps)
+    {
+        if (window.usual() > 0 && lateGap(gap, window.usual()))
+        {
+            ++late;
+        }
+        window.add(gap);
+    }
+    return late;
+}
+} // namespace
+
+TEST_CASE("the usual gap of a continuous flow keeps a regular long gap, not a single stall")
+{
+    // Bursts: four transfers 3 ms apart, then 12 ms to the origin's next commit (25 ms cycle). The 1.7.2 moving
+    // average (about 5 ms) took every 12 ms gap for late: 40 a second.
+    std::vector<double> bursts;
+    for (int cycle = 0; cycle < 400; ++cycle)
+    {
+        for (auto const gap : {0.003, 0.003, 0.003, 0.012})
+        {
+            bursts.push_back(gap);
+        }
+    }
+    CHECK(lateCount(bursts) == 0);
+    {
+        double usual = 0;
+        int late = 0;
+        for (auto const gap : bursts)
+        {
+            if (usual > 0 && lateGap(gap, usual))
+            {
+                ++late;
+            }
+            usual = usual > 0 ? usual * 0.98 + std::min(gap, 4.0 * usual) * 0.02 : gap;
+        }
+        CHECK(late > 300); // the 1.7.2 rule on the same gaps
+    }
+    // Steady 3 ms deliveries with a 0.54 s retransmission stall now and then: each stall counts once.
+    std::vector<double> steady(2000, 0.003);
+    steady[500] = 0.54;
+    steady[1200] = 0.54;
+    steady[1201] = 0.02; // a 20 ms gap right after: over 10 ms, late as well
+    auto const late = lateCount(steady);
+    CHECK(late == 3);
+    // Nothing before 32 gaps.
+    CHECK(lateCount({0.003, 0.5}) == 0);
+    // The limit: up to 6 long gaps per 256 still count; more often they become the usual gap.
+    std::vector<double> rare(2560, 0.003);
+    for (std::size_t i = 300; i < rare.size(); i += 64) // 4 per 256
+    {
+        rare[i] = 0.054;
+    }
+    CHECK(lateCount(rare) == 36);
+    std::vector<double> frequent(2560, 0.003);
+    std::size_t stalls = 0;
+    for (std::size_t i = 300; i < frequent.size(); i += 16) // 16 per 256
+    {
+        frequent[i] = 0.054;
+        ++stalls;
+    }
+    CHECK(lateCount(frequent) < stalls / 4);
+}
+
+TEST_CASE("transfer stalls are counted per flow and summed without the flow label")
+{
+    LaneStats lane;
+    lane.flowId = "a1";
+    lane.provider = "verbs";
+    auto& sample = lane.histograms[static_cast<std::size_t>(LaneMetric::SampleTransfer)];
+    sample.bounds = sampleTransferBounds();
+    sample.observe(0.003);
+    sample.observe(0.54);
+    lane.sampleTransferStalls = 1;
+    LaneStats video;
+    video.flowId = "v1";
+    video.provider = "verbs";
+    auto& grain = video.histograms[static_cast<std::size_t>(LaneMetric::GrainTransfer)];
+    grain.bounds = defaultBounds();
+    grain.observe(0.6);
+    video.grainTransferStalls = 1;
+    video.deliveries = 0;
+    LaneMetrics lanes;
+    Metrics m;
+    lanes.render(m, {lane, video}, true);
+    auto text = m.render();
+    CHECK(has(text, "mxl_fabrics_agent_sample_transfer_stalls_total{flow_id=\"a1\",provider=\"verbs\"} 1"));
+    CHECK(has(text, "mxl_fabrics_agent_grain_transfer_stalls_total{provider=\"verbs\"} 1"));
+    lanes.retire({lane, video}, false);
+    lanes.render(m, {}, false);
+    text = m.render();
+    CHECK(has(text, "mxl_fabrics_agent_sample_transfer_stalls_total{provider=\"verbs\"} 1"));
+    CHECK(has(text, "mxl_fabrics_agent_grain_transfer_stalls_total{provider=\"verbs\"} 1"));
+}
+
+TEST_CASE("a discrete destination reports late deliveries without a delivery gap histogram")
+{
+    LaneStats video;
+    video.flowId = "v1";
+    video.deliveries = 100;
+    video.lateDeliveries = 2;
+    LaneMetrics lanes;
+    Metrics m;
+    lanes.render(m, {video}, true);
+    auto const text = m.render();
+    CHECK(has(text, "mxl_fabrics_agent_replication_late_deliveries_total{flow_id=\"v1\"} 2"));
+    CHECK(text.find("replication_delivery_gap_seconds_count{flow_id=\"v1\"}") == std::string::npos);
+}
+
+TEST_CASE("ACK timeout: 4.096 us x 2^n; the stall threshold is fixed")
+{
+    CHECK(qp::ackTimeoutSeconds(14) == doctest::Approx(0.0671088));
+    CHECK(qp::ackTimeoutSeconds(17) == doctest::Approx(0.5368709));
+    CHECK(qp::ackTimeoutSeconds(4) == doctest::Approx(65.536e-6));
+    // Left to rdma_cm: RoCE's 17.
+    CHECK(qp::effectiveAckTimeout({0, 7}) == 17);
+    // Catches irdma's retransmission with roce_rtomin 5 (about 54 ms) and mlx5's with the default 14 (67 ms).
+    for (auto const threshold : {qp::kSampleTransferStallSeconds, qp::kGrainTransferStallSeconds})
+    {
+        CHECK(threshold < 0.054);
+        CHECK(threshold < qp::ackTimeoutSeconds(qp::kDefaultAckTimeout));
+    }
 }

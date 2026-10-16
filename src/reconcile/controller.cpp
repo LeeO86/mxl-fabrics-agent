@@ -1,5 +1,7 @@
 #include "reconcile/controller.hpp"
 
+#include "fabric/qpcontrol.hpp"
+
 #include "mirror/lifecycle.hpp"
 #include "replication/policy.hpp"
 #include "util/httpclient.hpp"
@@ -1334,6 +1336,20 @@ void Controller::renderLaneMetrics(bool perFlow)
     auto snapshot = engine_.takeLaneStats();
     laneMetrics_.retire(snapshot.retired, perFlow);
     laneMetrics_.render(metrics_, snapshot.live, perFlow);
+    // Queue pairs of the verbs provider (src/fabric/qpcontrol.hpp): what the agent requests (whether the NIC uses it
+    // is the driver's business; fabric_qp_established_total has what the queue pairs report).
+    auto const settings = qp::settings();
+    metrics_.setGauge("fabric_requested_ack_timeout_seconds", settings.ackTimeout != 0 ? qp::ackTimeoutSeconds(settings.ackTimeout) : 0.0);
+    metrics_.setGauge("fabric_requested_retry_count", settings.retryCount);
+    metrics_.setGauge("transfer_stall_threshold_seconds", qp::kSampleTransferStallSeconds, {{"kind", "sample"}});
+    metrics_.setGauge("transfer_stall_threshold_seconds", qp::kGrainTransferStallSeconds, {{"kind", "grain"}});
+    std::vector<std::pair<std::map<std::string, std::string>, double>> established;
+    for (auto const& [key, count] : qp::establishedCounts())
+    {
+        established.push_back({{{"role", std::get<0>(key)}, {"ack_timeout", std::get<1>(key)}, {"retry_count", std::get<2>(key)}}, static_cast<double>(count)});
+    }
+    metrics_.setCounters("fabric_qp_established_total", established);
+    metrics_.setCounter("fabric_qp_option_failures_total", static_cast<double>(qp::optionFailures()));
 }
 
 void Controller::renderMetrics()

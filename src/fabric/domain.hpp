@@ -66,6 +66,11 @@ struct ProviderProbe
 
 ProviderProbe probeFabrics(std::string const& scratchDir);
 
+// AUDIO_PASS_MS (1 to 4, default 2 as 1.7.1; 1 is 1.7.2's timing): the pass interval of a continuous lane, and the
+// least time from the pass that saw a sample transfer complete to the next one (at least 2 ms). Set at start.
+void setAudioPassMs(int ms);
+int audioPassMs();
+
 // One lane: the fabric thread and Fabrics instance of one flow of one domain (its writer, its targets or its
 // initiator), on the domain's shared MXL instance. Until 1.7.1 one thread served every flow of a domain, and a
 // slow call for one flow (a target or initiator set up again, memory registered, a writer opened) held up the

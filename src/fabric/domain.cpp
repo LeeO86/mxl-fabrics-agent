@@ -1,5 +1,7 @@
 #include "fabric/domain.hpp"
 
+#include "fabric/qpcontrol.hpp"
+#include "fabric/qpsettings.hpp"
 #include "replication/policy.hpp"
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
@@ -38,10 +40,22 @@ std::string statusText(mxlStatus status)
 
 // The fabric thread makes a pass (initiator progress, target drains) at least this often.
 constexpr auto kPassInterval = std::chrono::milliseconds(2);
-// The same for a lane of a continuous flow (audio): it sees a completed transfer and drains its target sooner.
-constexpr auto kContinuousPassInterval = std::chrono::milliseconds(1);
-// A continuous transfer starts this long after the source saw the last one complete (see pumpSamples).
-constexpr auto kSampleGate = std::chrono::milliseconds(2);
+// The same for a lane of a continuous flow (audio), AUDIO_PASS_MS. 2 ms is 1.7.1's timing. 1.7.2 passed every 1 ms:
+// more and smaller transfers (lab: 312 instead of 241 a second per flow), and on the platform's RoCE mesh each lost
+// packet held a flow for a retransmission timeout, 3 to 7 times as many audio read timeouts as with 1.7.1.
+std::atomic<int> gAudioPassMs{2};
+
+std::chrono::steady_clock::duration audioPass()
+{
+    return std::chrono::milliseconds(gAudioPassMs.load(std::memory_order_relaxed));
+}
+
+// A continuous transfer starts this long after the pass that saw the last one complete (see pumpSamples): the pass
+// interval, at least 2 ms (over verbs MXL's target posts the next receive only when its lane drains the last transfer).
+std::chrono::steady_clock::duration sampleGate()
+{
+    return std::max<std::chrono::steady_clock::duration>(audioPass(), std::chrono::milliseconds(2));
+}
 // A lane with nothing to pump (only a writer, or nothing) waits this long between passes; a call wakes it.
 constexpr auto kIdleInterval = std::chrono::milliseconds(50);
 // A pass that comes this much later than the one before is a stall (logged, counted).
@@ -220,9 +234,10 @@ struct TargetSlot
     std::uint64_t bytes = 0;
     std::uint64_t errors = 0;
     std::uint64_t head = 0;
+    std::string peerHost; // the source host (for the fabric_qp log)
     std::size_t lastBatch = 1; // samples in the last committed batch (a "grain" of a continuous flow)
-    std::chrono::steady_clock::time_point deliveredAt{}; // last pass that committed samples (continuous)
-    double usualGap = 0; // moving average of the delivery gaps (seconds)
+    std::chrono::steady_clock::time_point deliveredAt{}; // last pass that committed samples or grains
+    GapWindow gaps; // the delivery gaps of a continuous flow (the usual one for replication_late_deliveries_total)
     std::string lastError;
     std::string state = "pending";
     bool closed = false; // the MXL target was released after a failed read (see closeFailedTarget)
@@ -577,6 +592,11 @@ public:
             }
             TargetSlot slot;
             slot.flowId = flowId;
+            // The replication engine's key is "<source host>/<domain>/<flow>".
+            if (auto const slash = key.find('/'); slash != std::string::npos && key.find('/', slash + 1) != std::string::npos)
+            {
+                slot.peerHost = key.substr(0, slash);
+            }
             slot.target = target;
             slot.provider = provider;
             slot.fallback = fallback;
@@ -886,8 +906,8 @@ public:
         return out;
     }
 
-    // How long the lane's thread waits for the next pass: 1 ms for a continuous flow, 2 ms for a discrete one,
-    // longer with nothing to pump.
+    // How long the lane's thread waits for the next pass: AUDIO_PASS_MS for a continuous flow, 2 ms for a discrete
+    // one, longer with nothing to pump.
     std::chrono::steady_clock::duration passInterval() const
     {
         if (!active())
@@ -898,14 +918,14 @@ public:
         {
             if (slot.continuous && !slot.targets.empty())
             {
-                return kContinuousPassInterval;
+                return audioPass();
             }
         }
         for (auto const& [_, slot] : targets_)
         {
             if (auto const writer = writers_.find(slot.flowId); writer != writers_.end() && writer->second.continuous)
             {
-                return kContinuousPassInterval;
+                return audioPass();
             }
         }
         return kPassInterval;
@@ -1072,6 +1092,22 @@ private:
         {
             return;
         }
+        // MakeProgress connects (rdma_connect and its events): the hooks log the queue pair with this flow and peer.
+        std::function<std::string(std::string const&)> const peerOf = [&slot](std::string const& remote) {
+            for (auto const& [host, text] : slot.targetTexts)
+            {
+                if (!remote.empty() && qp::targetAddress(text) == remote)
+                {
+                    return host;
+                }
+            }
+            return slot.targets.size() == 1 ? slot.targets.begin()->first : std::string{};
+        };
+        qp::Context context;
+        context.role = "source";
+        context.flowId = &slot.flowId;
+        context.peerOf = &peerOf;
+        qp::Scope const scope{context};
         auto const progress = mxlFabricsInitiatorMakeProgressNonBlocking(slot.initiator);
         if (progress == MXL_ERR_INTERRUPTED)
         {
@@ -1123,13 +1159,23 @@ private:
         {
             slot.completedAt = now;
             stats_.provider = slot.provider; // kept after the initiator goes (the series' label)
-            note(LaneMetric::SampleTransfer, std::chrono::duration<double>(now - slot.sampleSentAt).count());
+            auto const took = std::chrono::duration<double>(now - slot.sampleSentAt).count();
+            note(LaneMetric::SampleTransfer, took);
+            if (took > qp::kSampleTransferStallSeconds)
+            {
+                stats_.sampleTransferStalls += 1;
+            }
         }
         slot.progressAt = now;
         if (slot.awaitingCompletion)
         {
             stats_.provider = slot.provider;
-            note(LaneMetric::GrainTransfer, std::chrono::duration<double>(now - slot.transferStart).count());
+            auto const took = std::chrono::duration<double>(now - slot.transferStart).count();
+            note(LaneMetric::GrainTransfer, took);
+            if (took > qp::kGrainTransferStallSeconds)
+            {
+                stats_.grainTransferStalls += 1;
+            }
             slot.awaitingCompletion = false;
         }
         auto const errorsBefore = slot.errors;
@@ -1233,7 +1279,7 @@ private:
         // waits a pass after the last one completed and carries every sample written since. 1.2.2
         // sent one sync batch (48 samples from the ST 2110 gateway) per pass: half of a 48 kHz flow
         // arrived, 8 % over verbs on the platform's E810.
-        if (std::chrono::steady_clock::now() - slot.completedAt < kSampleGate)
+        if (std::chrono::steady_clock::now() - slot.completedAt < sampleGate())
         {
             return;
         }
@@ -1328,6 +1374,12 @@ private:
         }
         auto const errorsBefore = slot.errors;
         auto const grainsBefore = slot.grains;
+        // The reads accept the source's connection (rdma_accept and its events): see pumpInitiator.
+        qp::Context context;
+        context.role = "destination";
+        context.flowId = &slot.flowId;
+        context.peer = &slot.peerHost;
+        qp::Scope const scope{context};
         if (writer->second.continuous)
         {
             for (int n = 0; n < 32; ++n)
@@ -1382,23 +1434,24 @@ private:
             }
             if (committed > 0)
             {
+                stats_.deliveries += 1;
                 // Includes the origin's own pauses: a writer that commits nothing for 50 ms gives a 50 ms gap.
                 if (slot.deliveredAt != std::chrono::steady_clock::time_point{})
                 {
                     auto const gap = std::chrono::duration<double>(passStart - slot.deliveredAt).count();
                     note(LaneMetric::DeliveryGap, gap);
-                    if (slot.usualGap > 0 && lateGap(gap, slot.usualGap))
+                    if (slot.gaps.usual() > 0 && lateGap(gap, slot.gaps.usual()))
                     {
                         stats_.lateDeliveries += 1;
                     }
-                    // The usual gap: a slow moving average that a single burst hardly moves.
-                    slot.usualGap = slot.usualGap > 0 ? slot.usualGap * 0.98 + std::min(gap, 4.0 * slot.usualGap) * 0.02 : gap;
+                    slot.gaps.add(gap);
                 }
                 slot.deliveredAt = passStart;
             }
         }
         else
         {
+            auto const passStart = std::chrono::steady_clock::now();
             for (int n = 0; n < 64; ++n)
             {
                 std::uint64_t index = 0;
@@ -1450,6 +1503,23 @@ private:
                 slot.bytes += snapshot.grainSize;
                 slot.head = index;
                 ++committed;
+            }
+            if (committed > 0)
+            {
+                stats_.deliveries += 1;
+                // Late: more than two grain periods (and 10 ms) since the last pass that committed a grain. As for
+                // audio the origin's own pauses count. 1.7.2 counted no discrete flow.
+                auto const& rate = writer->second.info.common.grainRate;
+                if (slot.deliveredAt != std::chrono::steady_clock::time_point{} && rate.numerator > 0 && rate.denominator > 0)
+                {
+                    auto const gap = std::chrono::duration<double>(passStart - slot.deliveredAt).count();
+                    auto const period = static_cast<double>(rate.denominator) / static_cast<double>(rate.numerator);
+                    if (lateGrainGap(gap, period))
+                    {
+                        stats_.lateDeliveries += 1;
+                    }
+                }
+                slot.deliveredAt = passStart;
             }
         }
         // Back from error only when grains arrive again: a pass without data must not make a dead
@@ -1676,6 +1746,16 @@ struct FabricDomain::Impl
         return seq;
     }
 };
+
+void setAudioPassMs(int ms)
+{
+    gAudioPassMs.store(std::clamp(ms, 1, 4));
+}
+
+int audioPassMs()
+{
+    return gAudioPassMs.load();
+}
 
 ProviderProbe probeFabrics(std::string const& scratchDir)
 {

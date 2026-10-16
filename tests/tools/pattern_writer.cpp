@@ -78,6 +78,13 @@ std::string videoRate()
     return rate != nullptr && std::atoi(rate) > 0 ? std::to_string(std::atoi(rate)) : std::string("50");
 }
 
+// Frame size of the video pattern: 1920x1080, or 3840x2160 with PATTERN_VIDEO_SIZE=2160 (the largest grain transfer).
+bool videoUhd()
+{
+    char const* size = std::getenv("PATTERN_VIDEO_SIZE");
+    return size != nullptr && std::string(size) == "2160";
+}
+
 // A 1080p50 v210 flow in its own domain with the given history, written in real
 // time for `seconds`; each grain carries its index in the first 8 bytes. With `recreateAfter`
 // (seconds, > 0) the writer is released and created again then, as by a function that restarts:
@@ -94,11 +101,15 @@ int writeVideo(std::string const& domain, std::string const& domainId, std::stri
     std::string const def = std::string("{\"id\":\"") + flowId +
                             "\",\"format\":\"urn:x-nmos:format:video\",\"label\":\"pattern video\",\"description\":\"integration writer\","
                             "\"tags\":{\"urn:x-nmos:tag:grouphint/v1.0\":[\"pattern:Video\"]},\"parents\":[],\"media_type\":\"video/v210\","
-                            "\"grain_rate\":{\"numerator\":" + videoRate() + ",\"denominator\":1},\"frame_width\":1920,\"frame_height\":1080,"
-                            "\"interlace_mode\":\"progressive\",\"colorspace\":\"BT709\",\"components\":["
-                            "{\"name\":\"Y\",\"width\":1920,\"height\":1080,\"bit_depth\":10},"
-                            "{\"name\":\"Cb\",\"width\":960,\"height\":1080,\"bit_depth\":10},"
-                            "{\"name\":\"Cr\",\"width\":960,\"height\":1080,\"bit_depth\":10}]}";
+                            "\"grain_rate\":{\"numerator\":" + videoRate() + ",\"denominator\":1}," +
+                            (videoUhd() ? std::string("\"frame_width\":3840,\"frame_height\":2160,\"interlace_mode\":\"progressive\",\"colorspace\":\"BT709\",\"components\":["
+                                                      "{\"name\":\"Y\",\"width\":3840,\"height\":2160,\"bit_depth\":10},"
+                                                      "{\"name\":\"Cb\",\"width\":1920,\"height\":2160,\"bit_depth\":10},"
+                                                      "{\"name\":\"Cr\",\"width\":1920,\"height\":2160,\"bit_depth\":10}]}")
+                                        : std::string("\"frame_width\":1920,\"frame_height\":1080,\"interlace_mode\":\"progressive\",\"colorspace\":\"BT709\",\"components\":["
+                                                      "{\"name\":\"Y\",\"width\":1920,\"height\":1080,\"bit_depth\":10},"
+                                                      "{\"name\":\"Cb\",\"width\":960,\"height\":1080,\"bit_depth\":10},"
+                                                      "{\"name\":\"Cr\",\"width\":960,\"height\":1080,\"bit_depth\":10}]}"));
     auto* instance = mxlCreateInstance(domain.c_str(), "");
     if (instance == nullptr)
     {
@@ -113,7 +124,7 @@ int writeVideo(std::string const& domain, std::string const& domainId, std::stri
         std::cerr << "mxlCreateFlowWriter failed\n";
         return 1;
     }
-    std::cout << "writing 1080p50 v210 to " << flowId << " for " << seconds << " s, history " << historyMs << " ms\n";
+    std::cout << "writing " << (videoUhd() ? "2160p" : "1080p") << " v210 to " << flowId << " for " << seconds << " s, history " << historyMs << " ms\n";
     auto const end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     auto const recreateAt = std::chrono::steady_clock::now() + std::chrono::seconds(recreateAfter);
     bool recreate = recreateAfter > 0;

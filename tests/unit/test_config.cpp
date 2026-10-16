@@ -141,3 +141,35 @@ TEST_CASE("peers json")
     CHECK(cfg.peers[0].host_id == "node-b");
     CHECK(cfg.peers[0].local_fabric_addr == "192.168.12.1");
 }
+
+TEST_CASE("fabric ACK timeout, retry count and audio pass interval")
+{
+    auto cfg = parseConfig(baseValues());
+    CHECK(cfg.fabric_ack_timeout == 14);
+    CHECK(cfg.fabric_retry_count == 7);
+    CHECK(cfg.audio_pass_ms == 2);
+    auto values = baseValues();
+    values["FABRIC_ACK_TIMEOUT"] = "17";
+    values["FABRIC_RETRY_COUNT"] = "3";
+    values["AUDIO_PASS_MS"] = "1";
+    cfg = parseConfig(values);
+    auto four = baseValues();
+    four["AUDIO_PASS_MS"] = "4";
+    CHECK(parseConfig(four).audio_pass_ms == 4);
+    CHECK(cfg.fabric_ack_timeout == 17);
+    CHECK(cfg.fabric_retry_count == 3);
+    CHECK(cfg.audio_pass_ms == 1);
+    CHECK(configToMap(cfg).at("FABRIC_ACK_TIMEOUT") == "17");
+    CHECK(configToMap(cfg).at("FABRIC_RETRY_COUNT") == "3");
+    CHECK(configToMap(cfg).at("AUDIO_PASS_MS") == "1");
+    values["FABRIC_ACK_TIMEOUT"] = "0"; // rdma_cm's own timeout, as before 1.7.3
+    CHECK(parseConfig(values).fabric_ack_timeout == 0);
+    for (auto const& [key, bad] : std::vector<std::pair<std::string, std::string>>{{"FABRIC_ACK_TIMEOUT", "-1"}, {"FABRIC_ACK_TIMEOUT", "3"},
+             {"FABRIC_ACK_TIMEOUT", "25"}, {"FABRIC_ACK_TIMEOUT", "14ms"}, {"FABRIC_RETRY_COUNT", "0"}, {"FABRIC_RETRY_COUNT", "8"},
+             {"AUDIO_PASS_MS", "0"}, {"AUDIO_PASS_MS", "5"}})
+    {
+        auto wrong = baseValues();
+        wrong[key] = bad;
+        CHECK_THROWS_AS(parseConfig(wrong), ConfigError);
+    }
+}
