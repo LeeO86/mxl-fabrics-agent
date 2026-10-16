@@ -140,7 +140,8 @@ int main(int argc, char** argv)
             bool const hooked = mfa::qp::hooksResolved();
             std::vector<mfa::log::Field> fields{{"ack_timeout", settings.ackTimeout == 0 ? std::string("rdma_cm") : std::to_string(settings.ackTimeout)},
                 {"ack_timeout_ms", std::to_string(mfa::qp::ackTimeoutSeconds(effective) * 1000.0)}, {"retry_count", std::to_string(settings.retryCount)},
-                {"transfer_stall_ms", std::to_string(mfa::qp::transferStallThresholdSeconds(settings) * 1000.0)},
+                {"sample_stall_ms", std::to_string(mfa::qp::kSampleTransferStallSeconds * 1000.0)},
+                {"grain_stall_ms", std::to_string(mfa::qp::kGrainTransferStallSeconds * 1000.0)},
                 {"audio_pass_ms", std::to_string(mfa::audioPassMs())}, {"rdma_cm_hooks", hooked ? "true" : "false"}};
             if (hooked)
             {

@@ -86,7 +86,7 @@ spec:
               value: "14"
             - name: FABRIC_RETRY_COUNT
               value: "7"
-            # Audio lanes pass every 2 ms, as 1.7.1 (1.7.2: 1 ms).
+            # Audio lanes pass every 2 ms, as 1.7.1 (1.7.2: 1 ms); 1 to 4.
             - name: AUDIO_PASS_MS
               value: "2"
             - name: SHUTDOWN_TIMEOUT_S

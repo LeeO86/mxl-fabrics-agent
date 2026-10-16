@@ -237,6 +237,21 @@ TEST_CASE("the usual gap of a continuous flow keeps a regular long gap, not a si
     CHECK(late == 3);
     // Nothing before 32 gaps.
     CHECK(lateCount({0.003, 0.5}) == 0);
+    // The limit: up to 6 long gaps per 256 still count; more often they become the usual gap.
+    std::vector<double> rare(2560, 0.003);
+    for (std::size_t i = 300; i < rare.size(); i += 64) // 4 per 256
+    {
+        rare[i] = 0.054;
+    }
+    CHECK(lateCount(rare) == 36);
+    std::vector<double> frequent(2560, 0.003);
+    std::size_t stalls = 0;
+    for (std::size_t i = 300; i < frequent.size(); i += 16) // 16 per 256
+    {
+        frequent[i] = 0.054;
+        ++stalls;
+    }
+    CHECK(lateCount(frequent) < stalls / 4);
 }
 
 TEST_CASE("transfer stalls are counted per flow and summed without the flow label")
@@ -284,13 +299,17 @@ TEST_CASE("a discrete destination reports late deliveries without a delivery gap
     CHECK(text.find("replication_delivery_gap_seconds_count{flow_id=\"v1\"}") == std::string::npos);
 }
 
-TEST_CASE("ACK timeout: 4.096 us x 2^n, and the stall threshold is half of it")
+TEST_CASE("ACK timeout: 4.096 us x 2^n; the stall threshold is fixed")
 {
     CHECK(qp::ackTimeoutSeconds(14) == doctest::Approx(0.0671088));
     CHECK(qp::ackTimeoutSeconds(17) == doctest::Approx(0.5368709));
     CHECK(qp::ackTimeoutSeconds(4) == doctest::Approx(65.536e-6));
-    CHECK(qp::transferStallThresholdSeconds({14, 7}) == doctest::Approx(0.0335544));
     // Left to rdma_cm: RoCE's 17.
     CHECK(qp::effectiveAckTimeout({0, 7}) == 17);
-    CHECK(qp::transferStallThresholdSeconds({0, 7}) == doctest::Approx(0.2684355));
+    // Catches irdma's retransmission with roce_rtomin 5 (about 54 ms) and mlx5's with the default 14 (67 ms).
+    for (auto const threshold : {qp::kSampleTransferStallSeconds, qp::kGrainTransferStallSeconds})
+    {
+        CHECK(threshold < 0.054);
+        CHECK(threshold < qp::ackTimeoutSeconds(qp::kDefaultAckTimeout));
+    }
 }

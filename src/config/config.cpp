@@ -336,7 +336,10 @@ Config parseConfig(std::map<std::string, std::string> const& values)
     }
     // A 3-bit field; 0 would fail the queue pair on the first lost packet.
     cfg.fabric_retry_count = parseInt("FABRIC_RETRY_COUNT", valueOr(values, "FABRIC_RETRY_COUNT", "7"), 1, 7);
-    cfg.audio_pass_ms = parseInt("AUDIO_PASS_MS", valueOr(values, "AUDIO_PASS_MS", "2"), 1, 20);
+    // At most 4: a transfer carries at most one bounce-buffer entry (the mirror's sync batch, 10 ms by default) and
+    // a cycle takes about two passes (one sees the completion, the gate waits one more), so at 5 ms the source would
+    // only just keep up with real time and never catch up after a stall.
+    cfg.audio_pass_ms = parseInt("AUDIO_PASS_MS", valueOr(values, "AUDIO_PASS_MS", "2"), 1, 4);
     cfg.peers = parsePeers(valueOr(values, "PEERS", "[]"));
     cfg.peer_poll_interval_ms = parseInt("PEER_POLL_INTERVAL_MS", valueOr(values, "PEER_POLL_INTERVAL_MS", "2000"), 100, 600000);
     cfg.release_grace_ms = parseInt("RELEASE_GRACE_MS", valueOr(values, "RELEASE_GRACE_MS", "2000"), 0, 600000);

@@ -16,16 +16,17 @@ namespace
 {
 thread_local Context const* tCurrent = nullptr;
 
+// Never destroyed: libfabric may still call rdma_cm (and so record) while static objects are torn down after main.
 std::mutex& countsMu()
 {
-    static std::mutex mu;
-    return mu;
+    static auto* mu = new std::mutex;
+    return *mu;
 }
 
 std::map<EstablishedKey, std::uint64_t>& counts()
 {
-    static std::map<EstablishedKey, std::uint64_t> value;
-    return value;
+    static auto* value = new std::map<EstablishedKey, std::uint64_t>;
+    return *value;
 }
 
 std::uint64_t& failures()
@@ -189,10 +190,11 @@ void Hooks::prepare(rdma_cm_id* id, char const* role, Settings const& settings)
     // Only a reliable connection has an ACK timeout (rdma_set_ack_timeout refuses anything else).
     if (settings.ackTimeout != 0 && id->qp_type == IBV_QPT_RC && ops_.setOption != nullptr)
     {
-        // The kernel takes exactly one byte (ucma_set_option_id).
+        // Level RDMA_OPTION_ID (the IB level only knows RDMA_OPTION_IB_PATH and answers ENOSYS), and exactly one
+        // byte (ucma_set_option_id).
         std::uint8_t timeout = static_cast<std::uint8_t>(settings.ackTimeout);
         errno = 0;
-        if (ops_.setOption(id, RDMA_OPTION_IB, RDMA_OPTION_ID_ACK_TIMEOUT, &timeout, sizeof(timeout)) == 0)
+        if (ops_.setOption(id, RDMA_OPTION_ID, RDMA_OPTION_ID_ACK_TIMEOUT, &timeout, sizeof(timeout)) == 0)
         {
             report.optionSet = true;
         }
@@ -289,6 +291,15 @@ int Hooks::getEvent(rdma_event_channel* channel, rdma_cm_event** event)
     return result;
 }
 
+void Hooks::destroyEp(rdma_cm_id* id)
+{
+    forget(id); // librdmacm destroys the id inside, without the rdma_destroy_id hook
+    if (ops_.destroyEp != nullptr)
+    {
+        ops_.destroyEp(id);
+    }
+}
+
 int Hooks::destroyId(rdma_cm_id* id)
 {
     if (ops_.destroyId == nullptr)
@@ -373,6 +384,19 @@ void Hooks::established(rdma_cm_id* id)
     }
 }
 
+Verdict judge(Report const& report)
+{
+    Verdict verdict;
+    // The timeout counts only where the queue pair reports one: irdma's ibv_query_qp gives none (0).
+    verdict.checked = report.wantAckTimeout != 0 && report.queried && report.ackTimeout > 0;
+    bool const timeoutOk = !verdict.checked || report.ackTimeout == report.wantAckTimeout;
+    // The source's retry count goes into the connection request; a destination's queue pair takes the source's.
+    bool const retryOk = report.role != "source" || !report.queried || report.retryCount == report.wantRetryCount;
+    verdict.applied = timeoutOk && retryOk && report.optionError.empty();
+    verdict.warn = !verdict.applied;
+    return verdict;
+}
+
 void record(Report const& report)
 {
     auto const timeoutText = !report.queried ? std::string("unknown") : report.ackTimeout == 0 ? std::string("unreported") : std::to_string(report.ackTimeout);
@@ -412,11 +436,10 @@ void record(Report const& report)
     {
         fields.emplace_back("query_error", report.queryError);
     }
-    // Applied: the queue pair reports the timeout that was set (a destination's retry count is the source's).
-    bool const timeoutApplied = report.wantAckTimeout == 0 || (report.queried && report.ackTimeout == report.wantAckTimeout);
-    bool const retryApplied = report.role != "source" || (report.queried && report.retryCount == report.wantRetryCount);
-    fields.emplace_back("applied", timeoutApplied && retryApplied ? "true" : "false");
-    if (timeoutApplied && retryApplied)
+    auto const verdict = judge(report);
+    fields.emplace_back("checked", verdict.checked ? "true" : "false");
+    fields.emplace_back("applied", verdict.applied ? "true" : "false");
+    if (!verdict.warn)
     {
         log::info("fabric_qp", fields);
     }

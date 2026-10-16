@@ -2,6 +2,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "fabric/qpcontrol.hpp"
 #include "replication/engine.hpp"
 
 #include <unistd.h>
@@ -62,6 +63,12 @@ Config config()
     return cfg;
 }
 } // namespace
+
+TEST_CASE("libfabric gets the binary's rdma_cm hooks, and librdmacm's are behind them")
+{
+    // A toolchain or link change that drops the export (or the definitions) would leave the ACK timeout unset.
+    CHECK(mfa::qp::hooksResolved());
+}
 
 TEST_CASE("a lane goes when its flow has nothing left")
 {

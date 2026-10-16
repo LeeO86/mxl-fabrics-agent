@@ -66,7 +66,7 @@ struct ProviderProbe
 
 ProviderProbe probeFabrics(std::string const& scratchDir);
 
-// AUDIO_PASS_MS (1 to 20, default 2 as 1.7.1; 1 is 1.7.2's timing): the pass interval of a continuous lane, and the
+// AUDIO_PASS_MS (1 to 4, default 2 as 1.7.1; 1 is 1.7.2's timing): the pass interval of a continuous lane, and the
 // least time from the pass that saw a sample transfer complete to the next one (at least 2 ms). Set at start.
 void setAudioPassMs(int ms);
 int audioPassMs();

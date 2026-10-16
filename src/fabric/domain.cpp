@@ -1,6 +1,7 @@
 #include "fabric/domain.hpp"
 
 #include "fabric/qpcontrol.hpp"
+#include "fabric/qpsettings.hpp"
 #include "replication/policy.hpp"
 #include "util/jsonutil.hpp"
 #include "util/logging.hpp"
@@ -1160,7 +1161,7 @@ private:
             stats_.provider = slot.provider; // kept after the initiator goes (the series' label)
             auto const took = std::chrono::duration<double>(now - slot.sampleSentAt).count();
             note(LaneMetric::SampleTransfer, took);
-            if (took > qp::transferStallThresholdSeconds(qp::settings()))
+            if (took > qp::kSampleTransferStallSeconds)
             {
                 stats_.sampleTransferStalls += 1;
             }
@@ -1171,7 +1172,7 @@ private:
             stats_.provider = slot.provider;
             auto const took = std::chrono::duration<double>(now - slot.transferStart).count();
             note(LaneMetric::GrainTransfer, took);
-            if (took > qp::transferStallThresholdSeconds(qp::settings()))
+            if (took > qp::kGrainTransferStallSeconds)
             {
                 stats_.grainTransferStalls += 1;
             }
@@ -1748,7 +1749,7 @@ struct FabricDomain::Impl
 
 void setAudioPassMs(int ms)
 {
-    gAudioPassMs.store(std::clamp(ms, 1, 20));
+    gAudioPassMs.store(std::clamp(ms, 1, 4));
 }
 
 int audioPassMs()

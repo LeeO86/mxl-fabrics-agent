@@ -79,12 +79,12 @@ if(NOT RDMACM_INCLUDE_DIR)
     message(FATAL_ERROR "rdma/rdma_cma.h not found (librdmacm-dev)")
 endif()
 
-# The binary's own rdma_connect, rdma_accept, rdma_get_cm_event and rdma_destroy_id (src/fabric/rdmahook.cpp):
+# The binary's own rdma_connect, rdma_accept, rdma_get_cm_event, rdma_destroy_id and rdma_destroy_ep (src/fabric/rdmahook.cpp):
 # exported, so that the dynamic linker binds libfabric's calls to them.
 function(mfa_rdma_hooks target)
     target_sources(${target} PRIVATE src/fabric/rdmahook.cpp)
     target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
-    foreach(symbol rdma_connect rdma_accept rdma_get_cm_event rdma_destroy_id)
+    foreach(symbol rdma_connect rdma_accept rdma_get_cm_event rdma_destroy_id rdma_destroy_ep)
         target_link_options(${target} PRIVATE "LINKER:--export-dynamic-symbol=${symbol}")
     endforeach()
 endfunction()

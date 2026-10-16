@@ -1336,11 +1336,13 @@ void Controller::renderLaneMetrics(bool perFlow)
     auto snapshot = engine_.takeLaneStats();
     laneMetrics_.retire(snapshot.retired, perFlow);
     laneMetrics_.render(metrics_, snapshot.live, perFlow);
-    // Queue pairs of the verbs provider (src/fabric/qpcontrol.hpp): the settings and what the queue pairs report.
+    // Queue pairs of the verbs provider (src/fabric/qpcontrol.hpp): what the agent requests (whether the NIC uses it
+    // is the driver's business; fabric_qp_established_total has what the queue pairs report).
     auto const settings = qp::settings();
-    metrics_.setGauge("fabric_ack_timeout_seconds", qp::ackTimeoutSeconds(qp::effectiveAckTimeout(settings)));
-    metrics_.setGauge("fabric_retry_count", settings.retryCount);
-    metrics_.setGauge("transfer_stall_threshold_seconds", qp::transferStallThresholdSeconds(settings));
+    metrics_.setGauge("fabric_requested_ack_timeout_seconds", settings.ackTimeout != 0 ? qp::ackTimeoutSeconds(settings.ackTimeout) : 0.0);
+    metrics_.setGauge("fabric_requested_retry_count", settings.retryCount);
+    metrics_.setGauge("transfer_stall_threshold_seconds", qp::kSampleTransferStallSeconds, {{"kind", "sample"}});
+    metrics_.setGauge("transfer_stall_threshold_seconds", qp::kGrainTransferStallSeconds, {{"kind", "grain"}});
     std::vector<std::pair<std::map<std::string, std::string>, double>> established;
     for (auto const& [key, count] : qp::establishedCounts())
     {

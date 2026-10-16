@@ -37,6 +37,18 @@ int fakeSetOption(rdma_cm_id*, int level, int name, void* value, size_t len)
     gFake->optionName = name;
     gFake->optionLen = len;
     gFake->optionValue = len == 1 ? *static_cast<std::uint8_t*>(value) : -1;
+    // As the kernel (ucma_set_option_level): the ACK timeout is an RDMA_OPTION_ID option of one byte; the IB level
+    // only knows RDMA_OPTION_IB_PATH and answers ENOSYS.
+    if (level != RDMA_OPTION_ID)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    if (name != RDMA_OPTION_ID_ACK_TIMEOUT || len != 1)
+    {
+        errno = EINVAL;
+        return -1;
+    }
     if (gFake->optionResult != 0)
     {
         errno = gFake->optionResult;
@@ -76,6 +88,11 @@ int fakeDestroy(rdma_cm_id*)
     return 0;
 }
 
+void fakeDestroyEp(rdma_cm_id*)
+{
+    gFake->calls.push_back("destroy_ep");
+}
+
 int fakeQuery(ibv_qp*, ibv_qp_attr* attr, int mask, ibv_qp_init_attr*)
 {
     gFake->calls.push_back("query");
@@ -93,6 +110,7 @@ qp::Ops fakeOps()
     ops.accept = fakeAccept;
     ops.getEvent = fakeGetEvent;
     ops.destroyId = fakeDestroy;
+    ops.destroyEp = fakeDestroyEp;
     ops.queryQp = fakeQuery;
     return ops;
 }
@@ -180,7 +198,7 @@ TEST_CASE("connect sets the ACK timeout before rdma_connect and the retry count 
         CHECK(hooks.connect(&c.id, &param) == 0);
     }
     CHECK(fake.calls == std::vector<std::string>{"set_option", "connect"});
-    CHECK(fake.optionLevel == RDMA_OPTION_IB);
+    CHECK(fake.optionLevel == RDMA_OPTION_ID);
     CHECK(fake.optionName == RDMA_OPTION_ID_ACK_TIMEOUT);
     CHECK(fake.optionLen == 1);
     CHECK(fake.optionValue == 14);
@@ -203,6 +221,7 @@ TEST_CASE("connect sets the ACK timeout before rdma_connect and the retry count 
     CHECK(r.device == "mlx5_0");
     CHECK(r.qpNum == 0x1234);
     CHECK(r.optionSet);
+    CHECK(r.optionError.empty());
     CHECK(r.queried);
     CHECK(r.ackTimeout == 14);
     CHECK(r.retryCount == 7);
@@ -303,6 +322,15 @@ TEST_CASE("a failed connect, an error event or a destroyed id forget the connect
     CHECK(hooks.accept(&c.id, &param) == 0);
     CHECK(hooks.destroyId(&c.id) == 0);
     CHECK(hooks.pending() == 0);
+
+    // libfabric closes a connected endpoint with rdma_destroy_ep (librdmacm destroys the id inside).
+    Connection e;
+    CHECK(hooks.connect(&e.id, &param) == 0);
+    CHECK(hooks.pending() == 1);
+    fake.calls.clear();
+    hooks.destroyEp(&e.id);
+    CHECK(fake.calls == std::vector<std::string>{"destroy_ep"});
+    CHECK(hooks.pending() == 0);
     CHECK(reports.empty());
 
     // A UD id (no ACK timeout) is not given the option.
@@ -332,4 +360,59 @@ TEST_CASE("the address of an MXL target info")
     CHECK(qp::targetAddress(info) == "192.168.250.2:23501");
     CHECK(qp::targetAddress(R"({"fabricAddress":"AAA"})").empty());
     CHECK(qp::targetAddress("not json").empty());
+}
+
+TEST_CASE("fabric_qp warns only when a reported value differs")
+{
+    qp::Report r;
+    r.role = "source";
+    r.wantAckTimeout = 14;
+    r.wantRetryCount = 7;
+    r.optionSet = true;
+    r.queried = true;
+    r.ackTimeout = 14;
+    r.retryCount = 7;
+    auto v = qp::judge(r);
+    CHECK(v.checked);
+    CHECK(v.applied);
+    CHECK_FALSE(v.warn);
+    // irdma: no timeout reported. Not checked, info.
+    r.ackTimeout = 0;
+    v = qp::judge(r);
+    CHECK_FALSE(v.checked);
+    CHECK(v.applied);
+    CHECK_FALSE(v.warn);
+    // A destination reports the same at the other end.
+    r.role = "destination";
+    CHECK_FALSE(qp::judge(r).warn);
+    // A reported timeout that differs.
+    r.ackTimeout = 17;
+    v = qp::judge(r);
+    CHECK(v.checked);
+    CHECK_FALSE(v.applied);
+    CHECK(v.warn);
+    // The source's retry count differs; a destination's is the source's (not compared).
+    r.ackTimeout = 14;
+    r.role = "source";
+    r.retryCount = 6;
+    CHECK(qp::judge(r).warn);
+    r.role = "destination";
+    CHECK_FALSE(qp::judge(r).warn);
+    // rdma_set_option refused the timeout.
+    r.retryCount = 7;
+    r.ackTimeout = 0;
+    r.optionSet = false;
+    r.optionError = "Function not implemented";
+    CHECK(qp::judge(r).warn);
+    // Left to rdma_cm: nothing to compare.
+    qp::Report cm;
+    cm.role = "source";
+    cm.wantAckTimeout = 0;
+    cm.wantRetryCount = 7;
+    cm.queried = true;
+    cm.ackTimeout = 17;
+    cm.retryCount = 7;
+    v = qp::judge(cm);
+    CHECK_FALSE(v.checked);
+    CHECK_FALSE(v.warn);
 }

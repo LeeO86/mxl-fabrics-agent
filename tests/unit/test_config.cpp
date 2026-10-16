@@ -153,6 +153,9 @@ TEST_CASE("fabric ACK timeout, retry count and audio pass interval")
     values["FABRIC_RETRY_COUNT"] = "3";
     values["AUDIO_PASS_MS"] = "1";
     cfg = parseConfig(values);
+    auto four = baseValues();
+    four["AUDIO_PASS_MS"] = "4";
+    CHECK(parseConfig(four).audio_pass_ms == 4);
     CHECK(cfg.fabric_ack_timeout == 17);
     CHECK(cfg.fabric_retry_count == 3);
     CHECK(cfg.audio_pass_ms == 1);
@@ -163,7 +166,7 @@ TEST_CASE("fabric ACK timeout, retry count and audio pass interval")
     CHECK(parseConfig(values).fabric_ack_timeout == 0);
     for (auto const& [key, bad] : std::vector<std::pair<std::string, std::string>>{{"FABRIC_ACK_TIMEOUT", "-1"}, {"FABRIC_ACK_TIMEOUT", "3"},
              {"FABRIC_ACK_TIMEOUT", "25"}, {"FABRIC_ACK_TIMEOUT", "14ms"}, {"FABRIC_RETRY_COUNT", "0"}, {"FABRIC_RETRY_COUNT", "8"},
-             {"AUDIO_PASS_MS", "0"}, {"AUDIO_PASS_MS", "21"}})
+             {"AUDIO_PASS_MS", "0"}, {"AUDIO_PASS_MS", "5"}})
     {
         auto wrong = baseValues();
         wrong[key] = bad;

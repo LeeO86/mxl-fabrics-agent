@@ -127,8 +127,8 @@ struct LaneStats
     std::map<std::string, LaneHistogram> stalls; // by the task that held the thread ("pass": none)
     std::uint64_t deliveries = 0;        // destination: passes that committed samples or grains
     std::uint64_t lateDeliveries = 0;    // of those, the late ones (lateGap, lateGrainGap)
-    std::uint64_t sampleTransferStalls = 0; // source: sample transfers longer than half the ACK timeout
-    std::uint64_t grainTransferStalls = 0;  // source: the same for grain transfers
+    std::uint64_t sampleTransferStalls = 0; // source: sample transfers longer than qp::kSampleTransferStallSeconds
+    std::uint64_t grainTransferStalls = 0;  // source: grain transfers longer than qp::kGrainTransferStallSeconds
 };
 
 // A delivery gap counts as late when it is longer than twice the flow's usual gap and at least 10 ms.
@@ -149,7 +149,9 @@ inline bool lateGrainGap(double gapSeconds, double grainPeriodSeconds)
 // audio). 1.7.2 took a moving average, and a flow whose deliveries come in bursts (several transfers 2 to 3 ms
 // apart, then a longer wait for the origin's next commit) had an average far below its regular long gap, which
 // then counted as late every time (likely the platform's 514 in 30 s on one flow). A percentile keeps such a gap in
-// the usual one, while a single long gap (a retransmission) stays out of it.
+// the usual one, while a single long gap (a retransmission) stays out of it. The limit: the 98th percentile of 256
+// gaps leaves out the 6 longest, so when more than about 6 long gaps come within 256 deliveries (about 1 s at 4 ms per
+// delivery) they become the usual gap and are no longer counted.
 class GapWindow
 {
 public:

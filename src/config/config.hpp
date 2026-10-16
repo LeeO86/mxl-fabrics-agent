@@ -50,7 +50,7 @@ struct Config
     // through rdma_cm on every connection the verbs provider makes (src/fabric/qpcontrol.hpp).
     int fabric_ack_timeout = 14;
     int fabric_retry_count = 7;
-    // Pass interval of a continuous (audio) lane and the least time between two of its sample transfers.
+    // Pass interval of a continuous (audio) lane and the least time between two of its sample transfers (1 to 4).
     int audio_pass_ms = 2;
     std::vector<PeerConfig> peers;
     int peer_poll_interval_ms = 2000;

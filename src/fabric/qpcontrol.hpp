@@ -16,9 +16,9 @@
 // MXL 218ddaa creates its endpoints inside its fabrics library, and libfabric 2.3.1's verbs provider has no
 // setting for either: it connects through rdma_cm with retry_count 15 (the kernel takes 7) and never calls
 // rdma_set_option, so a RoCE queue pair gets rdma_cm's timeout 17 (537 ms). The agent binary defines
-// rdma_connect, rdma_accept, rdma_get_cm_event and rdma_destroy_id itself (src/fabric/rdmahook.cpp); the dynamic
+// rdma_connect, rdma_accept, rdma_get_cm_event, rdma_destroy_id and rdma_destroy_ep itself (src/fabric/rdmahook.cpp); the dynamic
 // linker binds libfabric's calls to them, and they call librdmacm's (dlsym RTLD_NEXT). Before a connect or an
-// accept the hook sets RDMA_OPTION_ID_ACK_TIMEOUT on the rdma_cm id (the kernel applies it when it moves the
+// accept the hook sets RDMA_OPTION_ID_ACK_TIMEOUT (level RDMA_OPTION_ID) on the rdma_cm id (the kernel applies it when it moves the
 // queue pair to RTS) and the connect's retry_count (the accepting side's queue pair takes the initiator's). When the
 // connection is established it reads both back from the queue pair (ibv_query_qp) and logs them with the lane's
 // flow and peer (fabric_qp). LD_PRELOAD would not do: the image's binary has file capabilities, and the loader
@@ -88,6 +88,7 @@ struct Ops
     int (*accept)(rdma_cm_id*, rdma_conn_param*) = nullptr;
     int (*getEvent)(rdma_event_channel*, rdma_cm_event**) = nullptr;
     int (*destroyId)(rdma_cm_id*) = nullptr;
+    void (*destroyEp)(rdma_cm_id*) = nullptr;
     int (*queryQp)(ibv_qp*, ibv_qp_attr*, int, ibv_qp_init_attr*) = nullptr;
 };
 
@@ -102,6 +103,8 @@ public:
     int accept(rdma_cm_id* id, rdma_conn_param* param);
     int getEvent(rdma_event_channel* channel, rdma_cm_event** event);
     int destroyId(rdma_cm_id* id);
+    // libfabric closes a connected endpoint with rdma_destroy_ep, which destroys the id inside librdmacm.
+    void destroyEp(rdma_cm_id* id);
 
     // Connections set up and not yet established or gone.
     std::size_t pending() const;
@@ -117,11 +120,22 @@ private:
     std::map<rdma_cm_id*, Report> pending_;
 };
 
-// The agent's sink: logs fabric_qp and counts it for fabric_qp_established_total.
+// How fabric_qp judges a queue pair. checked: it reported a timeout to compare (irdma reports none). applied: what
+// it reports matches the settings (a destination's retry count is the source's) and rdma_set_option took the timeout.
+// warn: not applied.
+struct Verdict
+{
+    bool checked = false;
+    bool applied = true;
+    bool warn = false;
+};
+Verdict judge(Report const& report);
+
+// The agent's sink: logs fabric_qp (info, warn when not applied) and counts it for fabric_qp_established_total.
 void record(Report const& report);
 
 // fabric_qp_established_total: by role, the read-back ack_timeout ("unreported" when the driver reports none) and
-// retry count.
+// retry count ("unknown" for both when ibv_query_qp failed).
 using EstablishedKey = std::tuple<std::string, std::string, std::string>;
 std::map<EstablishedKey, std::uint64_t> establishedCounts();
 // fabric_qp_option_failures_total: rdma_set_option refused the timeout.

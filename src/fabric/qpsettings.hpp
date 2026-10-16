@@ -56,9 +56,14 @@ inline int effectiveAckTimeout(Settings const& s)
     return s.ackTimeout != 0 ? s.ackTimeout : kRdmaCmAckTimeout;
 }
 
-// A transfer longer than half the ACK timeout most likely waited for a retransmission (sample_transfer_stalls_total).
-inline double transferStallThresholdSeconds(Settings const& s)
-{
-    return ackTimeoutSeconds(effectiveAckTimeout(s)) / 2.0;
-}
+// A transfer that takes longer than this most likely waited for a retransmission (sample_transfer_stalls_total,
+// grain_transfer_stalls_total). Fixed, not derived from FABRIC_ACK_TIMEOUT: E810's irdma ignores the QP timeout and
+// retransmits after its device-wide roce_rtomin (small: 5, about 54 ms; 50, about 540 ms, when PFC is detected), and
+// mlx5 after at least the QP timeout (14: 67 ms). A retransmission adds that wait to the transfer's own time.
+// Audio: a normal transfer takes about 2 to 4 ms (lab, tcp).
+inline constexpr double kSampleTransferStallSeconds = 0.025;
+// Video: the largest grain (2160p v210, 22 MB) takes about 7 ms over verbs at 25 Gb/s and 16 ms on average over the
+// lab's tcp loopback (none over 40 ms in 60 s; see CHANGELOG 1.7.3).
+inline constexpr double kGrainTransferStallSeconds = 0.040;
+
 } // namespace mfa::qp

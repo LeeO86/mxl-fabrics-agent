@@ -7,29 +7,50 @@
 #include <dlfcn.h>
 
 #include <cerrno>
+#include <utility>
 
 namespace
 {
-template <typename F>
-F next(char const* name)
+// A symbol of `library` behind the binary's own: the next definition in the global scope, or, when the library was
+// loaded with dlopen (RTLD_LOCAL, as a provider plugin would), from its own handle.
+void* lookup(char const* library, char const* name, void* scope)
 {
-    return reinterpret_cast<F>(::dlsym(RTLD_NEXT, name));
+    if (auto* symbol = ::dlsym(scope, name); symbol != nullptr)
+    {
+        return symbol;
+    }
+    auto* handle = ::dlopen(library, RTLD_LAZY | RTLD_NOLOAD);
+    if (handle == nullptr)
+    {
+        return nullptr;
+    }
+    auto* symbol = ::dlsym(handle, name);
+    ::dlclose(handle); // drops the reference NOLOAD took; the library stays loaded
+    return symbol;
 }
 
+template <typename F>
+F rdmacm(char const* name)
+{
+    return reinterpret_cast<F>(lookup("librdmacm.so.1", name, RTLD_NEXT));
+}
+
+// Never destroyed: libfabric may call rdma_cm while static objects are torn down after main returns.
 mfa::qp::Hooks& hooks()
 {
-    static mfa::qp::Hooks instance = [] {
+    static auto* instance = [] {
         mfa::qp::Ops ops;
-        ops.setOption = next<decltype(ops.setOption)>("rdma_set_option");
-        ops.connect = next<decltype(ops.connect)>("rdma_connect");
-        ops.accept = next<decltype(ops.accept)>("rdma_accept");
-        ops.getEvent = next<decltype(ops.getEvent)>("rdma_get_cm_event");
-        ops.destroyId = next<decltype(ops.destroyId)>("rdma_destroy_id");
+        ops.setOption = rdmacm<decltype(ops.setOption)>("rdma_set_option");
+        ops.connect = rdmacm<decltype(ops.connect)>("rdma_connect");
+        ops.accept = rdmacm<decltype(ops.accept)>("rdma_accept");
+        ops.getEvent = rdmacm<decltype(ops.getEvent)>("rdma_get_cm_event");
+        ops.destroyId = rdmacm<decltype(ops.destroyId)>("rdma_destroy_id");
+        ops.destroyEp = rdmacm<decltype(ops.destroyEp)>("rdma_destroy_ep");
         // libibverbs is loaded with librdmacm (libfabric needs both).
-        ops.queryQp = reinterpret_cast<decltype(ops.queryQp)>(::dlsym(RTLD_DEFAULT, "ibv_query_qp"));
-        return mfa::qp::Hooks(ops, &mfa::qp::record);
+        ops.queryQp = reinterpret_cast<decltype(ops.queryQp)>(lookup("libibverbs.so.1", "ibv_query_qp", RTLD_DEFAULT));
+        return new mfa::qp::Hooks(ops, &mfa::qp::record);
     }();
-    return instance;
+    return *instance;
 }
 } // namespace
 
@@ -53,16 +74,30 @@ int rdma_destroy_id(struct rdma_cm_id* id)
 {
     return hooks().destroyId(id);
 }
+
+// librdmacm declares it void.
+void rdma_destroy_ep(struct rdma_cm_id* id)
+{
+    hooks().destroyEp(id);
+}
 }
 
 namespace mfa::qp
 {
-// The real librdmacm when the hooks are in place (the agent and lane-tests), for the startup log.
+// The dynamic linker hands out the binary's hooks, and librdmacm's own are behind them (the startup log, lane-tests).
 bool hooksResolved()
 {
-    auto* self = reinterpret_cast<void*>(&rdma_connect);
-    auto* bound = ::dlsym(RTLD_DEFAULT, "rdma_connect");
-    auto* real = ::dlsym(RTLD_NEXT, "rdma_connect");
-    return bound == self && real != nullptr && real != self;
+    std::pair<char const*, void*> const hooked[] = {{"rdma_connect", reinterpret_cast<void*>(&rdma_connect)},
+        {"rdma_accept", reinterpret_cast<void*>(&rdma_accept)}, {"rdma_get_cm_event", reinterpret_cast<void*>(&rdma_get_cm_event)},
+        {"rdma_destroy_id", reinterpret_cast<void*>(&rdma_destroy_id)}, {"rdma_destroy_ep", reinterpret_cast<void*>(&rdma_destroy_ep)}};
+    for (auto const& [name, self] : hooked)
+    {
+        auto* real = lookup("librdmacm.so.1", name, RTLD_NEXT);
+        if (::dlsym(RTLD_DEFAULT, name) != self || real == nullptr || real == self)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 } // namespace mfa::qp
