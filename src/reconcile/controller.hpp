@@ -9,6 +9,7 @@
 #include "nmos/node.hpp"
 #include "nmos/observer.hpp"
 #include "ops/httpserver.hpp"
+#include "ops/lanemetrics.hpp"
 #include "ops/metrics.hpp"
 #include "peer/manager.hpp"
 #include "replication/engine.hpp"
@@ -125,6 +126,7 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> configRebuiltAt_;
     bool adminRebuild_ = false; // MIRROR_ADMIN_REBUILD at start
     std::chrono::steady_clock::time_point nextFlowReaderScan_{};
+    LaneMetrics laneMetrics_; // reconcile thread only
     std::mutex workLogMu_;
     std::chrono::steady_clock::time_point slowWorkLogged_{}; // under workLogMu_
     std::map<std::string, FabricLink> links_;  // per peer, from the last tick (mu_)

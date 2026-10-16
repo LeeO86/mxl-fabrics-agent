@@ -51,6 +51,12 @@ struct ReplicaView
     int cq_depth = 0;
 };
 
+struct LaneStatsSnapshot
+{
+    std::vector<LaneStats> live;
+    std::vector<LaneStats> retired;
+};
+
 class ReplicationEngine
 {
 public:
@@ -72,7 +78,8 @@ public:
     // Drops the lanes with nothing left in them (a safety net for the drops after each release; once per tick).
     std::size_t sweepIdleLanes();
     std::size_t laneCount() const;
-    std::vector<LaneStats> laneStats() const;
+    // The stats of the lanes there are, and the final stats of those that went since the last call.
+    LaneStatsSnapshot takeLaneStats();
     void releaseAll(bool keepFlows = false);
     bool ensureWriter(std::string const& path, std::string const& flowDef, std::string* error);
     void releaseWriter(std::string const& path, std::string const& flowId);
@@ -114,6 +121,8 @@ private:
     bool dropIfIdle(std::string const& path, std::string const& flowId);
     std::shared_ptr<SharedInstance> sharedInstance(std::string const& path, std::string* error);
     std::vector<std::shared_ptr<FabricDomain>> lanes() const;
+    // Final stats of lanes that left the map (into retired_), then the lanes go.
+    void retire(std::vector<std::shared_ptr<FabricDomain>> lanes);
 
     mutable std::mutex mu_;
     Config cfg_;
@@ -123,6 +132,8 @@ private:
     std::map<std::string, std::string> linksDown_;
     std::map<std::string, std::uint64_t> sourceRestarts_;
     std::map<std::string, std::string> laneErrors_; // path → last logged lane error (under mu_)
+    std::vector<std::shared_ptr<FabricDomain>> retiring_; // out of the map, final stats not taken yet (under mu_)
+    std::vector<LaneStats> retired_;                      // final stats for takeLaneStats (under mu_)
     std::mutex instancesMu_;
     std::map<std::string, std::weak_ptr<SharedInstance>> instances_; // one MXL instance per domain path
     int nextPort_;

@@ -72,6 +72,11 @@ TEST_CASE("a lane goes when its flow has nothing left")
     CHECK(engine.laneCount() == 1);
     engine.releaseWriter(domain.path.string(), kFlowId);
     CHECK(engine.laneCount() == 0);
+    // Its final stats are handed out once, as retired.
+    auto first = engine.takeLaneStats();
+    CHECK(first.live.empty());
+    CHECK(first.retired.size() == 1);
+    CHECK(engine.takeLaneStats().retired.empty());
 }
 
 TEST_CASE("a failed source request leaves no lane")

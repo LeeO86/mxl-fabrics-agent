@@ -103,6 +103,8 @@ public:
     std::uint64_t callCount() const;
     // Delivery timing of the lane (a copy, refreshed by its thread about every 100 ms).
     LaneStats stats() const;
+    // The counts up to now, read on the lane's thread (for a lane that goes).
+    LaneStats finalStats();
 
     std::vector<FabricRow> rows() const;
 

@@ -172,11 +172,28 @@ bool ReplicationEngine::dropIfIdle(std::string const& path, std::string const& f
         {
             dropped = std::move(it->second);
             domains_.erase(it);
+            retiring_.push_back(dropped);
         }
     }
     lane.reset();
-    // The lane's thread stops here, outside the lock.
-    return dropped != nullptr;
+    if (!dropped)
+    {
+        return false;
+    }
+    retire({std::move(dropped)}); // the lane's thread stops there, outside the lock
+    return true;
+}
+
+void ReplicationEngine::retire(std::vector<std::shared_ptr<FabricDomain>> lanes)
+{
+    for (auto& lane : lanes)
+    {
+        auto final = lane->finalStats();
+        std::lock_guard const lock{mu_};
+        retiring_.erase(std::remove(retiring_.begin(), retiring_.end(), lane), retiring_.end());
+        retired_.push_back(std::move(final));
+    }
+    lanes.clear();
 }
 
 std::size_t ReplicationEngine::sweepIdleLanes()
@@ -203,13 +220,20 @@ std::size_t ReplicationEngine::laneCount() const
     return domains_.size();
 }
 
-std::vector<LaneStats> ReplicationEngine::laneStats() const
+LaneStatsSnapshot ReplicationEngine::takeLaneStats()
 {
-    std::vector<LaneStats> out;
-    for (auto const& lane : lanes())
+    // In one step against retire: a lane that goes is in exactly one of the two lists.
+    LaneStatsSnapshot out;
+    std::lock_guard const lock{mu_};
+    for (auto const& [_, lane] : domains_)
     {
-        out.push_back(lane->stats());
+        out.live.push_back(lane->stats());
     }
+    for (auto const& lane : retiring_)
+    {
+        out.live.push_back(lane->stats());
+    }
+    out.retired.swap(retired_);
     return out;
 }
 
@@ -236,6 +260,7 @@ void ReplicationEngine::releaseDomain(std::string const& path)
             if (it->first.compare(0, prefix.size(), prefix) == 0)
             {
                 dropped.push_back(std::move(it->second));
+                retiring_.push_back(dropped.back());
                 it = domains_.erase(it);
             }
             else
@@ -244,6 +269,7 @@ void ReplicationEngine::releaseDomain(std::string const& path)
             }
         }
     }
+    retire(std::move(dropped));
 }
 
 void ReplicationEngine::releaseAll(bool keepFlows)

@@ -103,15 +103,28 @@ private:
     std::array<Slot, kSeconds> slots_{};
 };
 
-// Delivery timing of one lane, counted on its thread and handed out as a copy. Keys: "sample_age:origin",
-// "sample_age:sent", "sample_age:delivered", "delivery_gap", "sample_transfer", "grain_transfer", "stall:<task>".
+// What a lane counts (an index, so the lane thread builds no key per observation).
+enum class LaneMetric : std::size_t
+{
+    SampleAgeOrigin,    // continuous source: the origin head when a transfer is posted
+    SampleAgeSent,      // continuous source: the newest sample of a transfer when it is posted
+    SampleAgeDelivered, // continuous destination: the newest sample of a batch when it is committed
+    DeliveryGap,        // continuous destination: time between two passes that committed samples
+    SampleTransfer,     // continuous source: one transfer from post to completion
+    GrainTransfer,      // discrete source: one grain from transfer to completion
+    Count
+};
+inline constexpr std::size_t kLaneMetrics = static_cast<std::size_t>(LaneMetric::Count);
+
+// Delivery timing of one lane, counted on its thread and handed out as a copy.
 struct LaneStats
 {
     std::string flowId;
-    std::string provider; // of the source's initiator (sample_transfer)
-    std::map<std::string, LaneHistogram> histograms;
-    std::map<std::string, double> maxes; // rolling maximum of the last RollingMax::kSeconds, same keys
-    std::uint64_t lateDeliveries = 0;    // delivery gaps longer than lateGapSeconds(expected period)
+    std::string provider; // of the source's initiator (sample and grain transfers)
+    std::array<LaneHistogram, kLaneMetrics> histograms{};
+    std::array<double, kLaneMetrics> maxes{}; // rolling maximum of the last RollingMax::kSeconds
+    std::map<std::string, LaneHistogram> stalls; // by the task that held the thread ("pass": none)
+    std::uint64_t lateDeliveries = 0;    // delivery gaps that lateGap counts
 };
 
 // A delivery gap counts as late when it is longer than twice the lane's usual gap (a moving average of
@@ -123,6 +136,7 @@ inline bool lateGap(double gapSeconds, double usualSeconds)
 }
 
 // Bucket bounds (seconds). The default ones are those of grain_transfer_seconds since 1.0.
+std::vector<double> const& laneBounds(LaneMetric metric);
 inline std::vector<double> const& defaultBounds()
 {
     static std::vector<double> const bounds{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0};
@@ -151,5 +165,17 @@ inline std::vector<double> const& stallBounds()
 {
     static std::vector<double> const bounds{0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0};
     return bounds;
+}
+inline std::vector<double> const& laneBounds(LaneMetric metric)
+{
+    switch (metric)
+    {
+    case LaneMetric::SampleAgeOrigin:
+    case LaneMetric::SampleAgeSent:
+    case LaneMetric::SampleAgeDelivered: return sampleAgeBounds();
+    case LaneMetric::DeliveryGap: return deliveryGapBounds();
+    case LaneMetric::SampleTransfer: return sampleTransferBounds();
+    default: return defaultBounds();
+    }
 }
 } // namespace mfa

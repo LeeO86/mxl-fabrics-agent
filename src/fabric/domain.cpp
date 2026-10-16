@@ -14,6 +14,7 @@
 #include <mxl/time.h>
 #include <rdma/fabric.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -850,15 +851,27 @@ public:
     }
 
     // Counted on this thread, handed out by statsSnapshot.
-    void note(std::string const& key, std::vector<double> const& bounds, double value)
+    void note(LaneMetric metric, double value)
     {
-        auto& histogram = stats_.histograms[key];
+        auto const i = static_cast<std::size_t>(metric);
+        auto& histogram = stats_.histograms[i];
         if (histogram.bounds.empty())
         {
-            histogram.bounds = bounds;
+            histogram.bounds = laneBounds(metric);
         }
         histogram.observe(value);
-        maxes_[key].observe(value, steadySecond());
+        maxes_[i].observe(value, steadySecond());
+    }
+
+    // A stall of the lane's thread (rare: a string key is fine here).
+    void noteStall(char const* task, double seconds)
+    {
+        auto& histogram = stats_.stalls[task];
+        if (histogram.bounds.empty())
+        {
+            histogram.bounds = stallBounds();
+        }
+        histogram.observe(seconds);
     }
 
     LaneStats statsSnapshot(std::string const& flowId) const
@@ -866,13 +879,9 @@ public:
         auto out = stats_;
         out.flowId = flowId;
         auto const second = steadySecond();
-        for (auto const& [key, max] : maxes_)
+        for (std::size_t i = 0; i < kLaneMetrics; ++i)
         {
-            out.maxes[key] = max.value(second);
-        }
-        for (auto const& [_, slot] : initiators_)
-        {
-            out.provider = slot.provider;
+            out.maxes[i] = maxes_[i].value(second);
         }
         return out;
     }
@@ -1113,12 +1122,14 @@ private:
         if (std::exchange(slot.inFlight, false))
         {
             slot.completedAt = now;
-            note("sample_transfer", sampleTransferBounds(), std::chrono::duration<double>(now - slot.sampleSentAt).count());
+            stats_.provider = slot.provider; // kept after the initiator goes (the series' label)
+            note(LaneMetric::SampleTransfer, std::chrono::duration<double>(now - slot.sampleSentAt).count());
         }
         slot.progressAt = now;
         if (slot.awaitingCompletion)
         {
-            note("grain_transfer", defaultBounds(), std::chrono::duration<double>(now - slot.transferStart).count());
+            stats_.provider = slot.provider;
+            note(LaneMetric::GrainTransfer, std::chrono::duration<double>(now - slot.transferStart).count());
             slot.awaitingCompletion = false;
         }
         auto const errorsBefore = slot.errors;
@@ -1287,8 +1298,8 @@ private:
             auto const& rate = slot.info.common.grainRate;
             if (auto const now = mxlGetCurrentIndex(&rate); now != MXL_UNDEFINED_INDEX)
             {
-                note("sample_age:origin", sampleAgeBounds(), indexSeconds(now, runtime.headIndex, rate));
-                note("sample_age:sent", sampleAgeBounds(), indexSeconds(now, slot.sampleHead, rate));
+                note(LaneMetric::SampleAgeOrigin, indexSeconds(now, runtime.headIndex, rate));
+                note(LaneMetric::SampleAgeSent, indexSeconds(now, slot.sampleHead, rate));
             }
         }
     }
@@ -1366,7 +1377,7 @@ private:
                 auto const& rate = writer->second.info.common.grainRate;
                 if (auto const now = mxlGetCurrentIndex(&rate); now != MXL_UNDEFINED_INDEX)
                 {
-                    note("sample_age:delivered", sampleAgeBounds(), indexSeconds(now, item.head, rate));
+                    note(LaneMetric::SampleAgeDelivered, indexSeconds(now, item.head, rate));
                 }
             }
             if (committed > 0)
@@ -1375,7 +1386,7 @@ private:
                 if (slot.deliveredAt != std::chrono::steady_clock::time_point{})
                 {
                     auto const gap = std::chrono::duration<double>(passStart - slot.deliveredAt).count();
-                    note("delivery_gap", deliveryGapBounds(), gap);
+                    note(LaneMetric::DeliveryGap, gap);
                     if (slot.usualGap > 0 && lateGap(gap, slot.usualGap))
                     {
                         stats_.lateDeliveries += 1;
@@ -1521,7 +1532,7 @@ private:
     std::vector<FabricRow> rows_;
     bool keepFlows_ = false;
     LaneStats stats_;
-    std::map<std::string, RollingMax> maxes_;
+    std::array<RollingMax, kLaneMetrics> maxes_{};
 };
 
 struct Task
@@ -1633,7 +1644,7 @@ struct FabricDomain::Impl
     void noteStall(char const* task, std::chrono::steady_clock::duration gap, std::chrono::steady_clock::duration took,
         std::chrono::steady_clock::time_point now, std::chrono::steady_clock::time_point& lastLog, std::uint64_t& unlogged)
     {
-        session.note(std::string("stall:") + task, stallBounds(), std::chrono::duration<double>(gap).count());
+        session.noteStall(task, std::chrono::duration<double>(gap).count());
         // At most one line per second and lane; the counter has every one.
         if (now - lastLog < std::chrono::seconds(1))
         {
@@ -1829,6 +1840,13 @@ bool FabricDomain::idle(std::uint64_t* seq)
 std::uint64_t FabricDomain::callCount() const
 {
     return impl_->calls.load();
+}
+
+LaneStats FabricDomain::finalStats()
+{
+    LaneStats out;
+    impl_->call("final_stats", [&](Session& session) { out = session.statsSnapshot(flowId_); });
+    return out;
 }
 
 LaneStats FabricDomain::stats() const

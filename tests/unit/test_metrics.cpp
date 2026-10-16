@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "ops/lanemetrics.hpp"
 #include "ops/metrics.hpp"
 
 using namespace mfa;
@@ -95,4 +96,75 @@ TEST_CASE("lane histograms merge only with the same bounds")
     other.observe(0.001);
     a.merge(other);
     CHECK(a.count == 3);
+}
+
+namespace
+{
+LaneStats laneWith(int transfers, int stalls, int gaps, std::uint64_t late)
+{
+    LaneStats lane;
+    lane.flowId = "f1";
+    lane.provider = "verbs";
+    auto& transfer = lane.histograms[static_cast<std::size_t>(LaneMetric::GrainTransfer)];
+    transfer.bounds = defaultBounds();
+    for (int i = 0; i < transfers; ++i)
+    {
+        transfer.observe(0.002);
+    }
+    auto& gap = lane.histograms[static_cast<std::size_t>(LaneMetric::DeliveryGap)];
+    gap.bounds = deliveryGapBounds();
+    for (int i = 0; i < gaps; ++i)
+    {
+        gap.observe(0.003);
+    }
+    lane.lateDeliveries = late;
+    for (int i = 0; i < stalls; ++i)
+    {
+        auto& stall = lane.stalls["pass"];
+        stall.bounds = stallBounds();
+        stall.observe(0.03);
+    }
+    return lane;
+}
+
+bool has(std::string const& text, std::string const& line)
+{
+    return text.find(line + "\n") != std::string::npos;
+}
+} // namespace
+
+TEST_CASE("summed lane series never decrease when a lane goes")
+{
+    LaneMetrics lanes;
+    Metrics m;
+    lanes.render(m, {laneWith(3, 1, 5, 2)}, false);
+    auto text = m.render();
+    CHECK(has(text, "mxl_fabrics_agent_grain_transfer_seconds_count{provider=\"verbs\"} 3"));
+    CHECK(has(text, "mxl_fabrics_agent_replication_late_deliveries_total 2"));
+    // The lane goes with one more transfer counted since: its final stats are kept.
+    lanes.retire({laneWith(4, 1, 6, 2)}, false);
+    lanes.render(m, {}, false);
+    text = m.render();
+    CHECK(has(text, "mxl_fabrics_agent_grain_transfer_seconds_count{provider=\"verbs\"} 4"));
+    CHECK(has(text, "mxl_fabrics_agent_fabric_thread_stall_seconds_count{task=\"pass\"} 1"));
+    CHECK(has(text, "mxl_fabrics_agent_replication_delivery_gap_seconds_count 6"));
+    CHECK(has(text, "mxl_fabrics_agent_replication_late_deliveries_total 2"));
+    // A new lane for the flow adds to the total.
+    lanes.render(m, {laneWith(1, 0, 1, 1)}, false);
+    text = m.render();
+    CHECK(has(text, "mxl_fabrics_agent_grain_transfer_seconds_count{provider=\"verbs\"} 5"));
+    CHECK(has(text, "mxl_fabrics_agent_replication_late_deliveries_total 3"));
+}
+
+TEST_CASE("per-flow lane series go with their lane, the summed ones stay")
+{
+    LaneMetrics lanes;
+    Metrics m;
+    lanes.render(m, {laneWith(3, 0, 5, 1)}, true);
+    CHECK(has(m.render(), "mxl_fabrics_agent_replication_delivery_gap_seconds_count{flow_id=\"f1\"} 5"));
+    lanes.retire({laneWith(3, 0, 5, 1)}, true);
+    lanes.render(m, {}, true);
+    auto const text = m.render();
+    CHECK(text.find("flow_id=\"f1\"") == std::string::npos);
+    CHECK(has(text, "mxl_fabrics_agent_grain_transfer_seconds_count{provider=\"verbs\"} 3"));
 }

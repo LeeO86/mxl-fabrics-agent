@@ -1331,71 +1331,9 @@ void Controller::reportMirrorEvents(std::vector<MirrorEvent> const& events, int 
 
 void Controller::renderLaneMetrics(bool perFlow)
 {
-    using Labels = std::map<std::string, std::string>;
-    std::map<std::string, std::map<Labels, LaneHistogram>> histograms; // metric → labels → merged histogram
-    std::map<std::string, std::map<Labels, double>> maxes;
-    std::map<Labels, double> late;
-    for (auto const& lane : engine_.laneStats())
-    {
-        Labels flow;
-        if (perFlow)
-        {
-            flow["flow_id"] = lane.flowId;
-        }
-        auto add = [&](std::string const& metric, Labels const& labels, LaneHistogram const& histogram) {
-            histograms[metric][labels].merge(histogram);
-        };
-        for (auto const& [key, histogram] : lane.histograms)
-        {
-            auto labels = flow;
-            if (key.rfind("sample_age:", 0) == 0)
-            {
-                labels["stage"] = key.substr(11);
-                add("replication_sample_age_seconds", labels, histogram);
-                auto& max = maxes["replication_sample_age_max_seconds"][labels];
-                max = std::max(max, lane.maxes.count(key) != 0 ? lane.maxes.at(key) : 0.0);
-            }
-            else if (key == "delivery_gap")
-            {
-                add("replication_delivery_gap_seconds", labels, histogram);
-            }
-            else if (key == "sample_transfer")
-            {
-                labels["provider"] = lane.provider;
-                add("sample_transfer_seconds", labels, histogram);
-                auto& max = maxes["sample_transfer_max_seconds"][labels];
-                max = std::max(max, lane.maxes.count(key) != 0 ? lane.maxes.at(key) : 0.0);
-            }
-            else if (key == "grain_transfer")
-            {
-                add("grain_transfer_seconds", {{"provider", lane.provider}}, histogram);
-            }
-            else if (key.rfind("stall:", 0) == 0)
-            {
-                add("fabric_thread_stall_seconds", {{"task", key.substr(6)}}, histogram);
-            }
-        }
-        if (lane.histograms.count("delivery_gap") != 0)
-        {
-            late[flow] += static_cast<double>(lane.lateDeliveries);
-        }
-    }
-    for (auto const* metric : {"replication_sample_age_seconds", "replication_delivery_gap_seconds", "sample_transfer_seconds",
-             "grain_transfer_seconds", "fabric_thread_stall_seconds"})
-    {
-        std::vector<std::pair<Labels, LaneHistogram>> series;
-        for (auto const& [labels, histogram] : histograms[metric])
-        {
-            series.emplace_back(labels, histogram);
-        }
-        metrics_.setHistograms(metric, series);
-    }
-    for (auto const* metric : {"replication_sample_age_max_seconds", "sample_transfer_max_seconds"})
-    {
-        std::vector<std::pair<Labels, double>> series(maxes[metric].begin(), maxes[metric].end());
-        metrics_.setGauges(metric, series);
-    }
-    metrics_.setCounters("replication_late_deliveries_total", {late.begin(), late.end()});
+    auto snapshot = engine_.takeLaneStats();
+    laneMetrics_.retire(snapshot.retired, perFlow);
+    laneMetrics_.render(metrics_, snapshot.live, perFlow);
 }
 
 void Controller::renderMetrics()
