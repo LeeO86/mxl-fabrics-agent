@@ -1455,7 +1455,7 @@ void Controller::renderMetrics()
     metrics_.setGauge("tai_offset_seconds", tai_);
     setDemandGauges(metrics_, demand_.entries);
     auto const rows = engine_.status();
-    setReplicationGauges(metrics_, rows, cfg.metrics_per_flow);
+    setReplicationGauges(metrics_, rows, cfg.metrics_per_flow, replicationPairsSeen_);
     for (auto const& row : rows)
     {
         if (cfg.metrics_per_flow)

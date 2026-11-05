@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Gauges with one series per replication or state no longer keep the series of what has gone. `replication_lag_grains`, `replication_lag_ms`, `completion_queue_depth`, `replications_active` and `demand_entries` were set row by row and never removed: after a replication ended, its series stayed on `/metrics` with its last value until the agent restarted (a 740 ms lag for a replication long gone was seen). Each reconcile pass now publishes the full set of current series of these gauges (as `replication_state` already did), so a series goes away with its replication, and a `replications_active{role,provider}` or `demand_entries{state}` with no row left goes away instead of keeping its last count. The per-replication counters (`replication_grains_total` and the others) are unchanged.
+- Gauges with one series per replication or state no longer keep the series of what has gone. `replication_lag_grains`, `replication_lag_ms`, `completion_queue_depth`, `replications_active` and `demand_entries` were set row by row and never removed: after a replication ended, its series stayed on `/metrics` with its last value until the agent restarted (a 740 ms lag for a replication long gone was seen). Each reconcile pass now publishes the full set of current series of these gauges (as `replication_state` already did), so a series goes away with its replication, `replications_active{role,provider}` and `demand_entries{state}` are counts and stay at 0 instead of keeping their last count: every role/provider pair seen since the start, and every demand state (`replicating`, `unresolved`, `stale_reference`), also at 0 before the first entry. The per-replication counters (`replication_grains_total` and the others) are unchanged.
 
 ## 1.7.3
 

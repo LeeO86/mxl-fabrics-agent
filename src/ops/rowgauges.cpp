@@ -11,7 +11,8 @@ namespace
 using SeriesList = std::vector<std::pair<std::map<std::string, std::string>, double>>;
 }
 
-void setReplicationGauges(Metrics& metrics, std::vector<ReplicaView> const& rows, bool perFlow)
+void setReplicationGauges(Metrics& metrics, std::vector<ReplicaView> const& rows, bool perFlow,
+    std::set<std::pair<std::string, std::string>>& seenPairs)
 {
     std::map<std::pair<std::string, std::string>, int> active; // role, provider → count
     SeriesList states;
@@ -20,6 +21,7 @@ void setReplicationGauges(Metrics& metrics, std::vector<ReplicaView> const& rows
     SeriesList cqDepth;
     for (auto const& row : rows)
     {
+        seenPairs.insert({row.role, row.provider});
         if (row.state == "active" || row.state == "pending")
         {
             active[{row.role, row.provider}] += 1;
@@ -33,9 +35,9 @@ void setReplicationGauges(Metrics& metrics, std::vector<ReplicaView> const& rows
         }
     }
     SeriesList activeSeries;
-    for (auto const& [key, count] : active)
+    for (auto const& key : seenPairs)
     {
-        activeSeries.push_back({{{"role", key.first}, {"provider", key.second}}, static_cast<double>(count)});
+        activeSeries.push_back({{{"role", key.first}, {"provider", key.second}}, static_cast<double>(active[key])});
     }
     metrics.setGauges("replications_active", activeSeries);
     // One series per replication with its current state (1); a former state disappears.
@@ -47,7 +49,8 @@ void setReplicationGauges(Metrics& metrics, std::vector<ReplicaView> const& rows
 
 void setDemandGauges(Metrics& metrics, std::vector<DemandEntry> const& entries)
 {
-    std::map<std::string, int> byState;
+    // The states src/demand/derive.cpp sets, at 0 when no entry has them.
+    std::map<std::string, int> byState{{"replicating", 0}, {"unresolved", 0}, {"stale_reference", 0}};
     for (auto const& entry : entries)
     {
         byState[entry.state] += 1;
