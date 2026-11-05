@@ -3,6 +3,7 @@
 #include "fabric/qpcontrol.hpp"
 
 #include "mirror/lifecycle.hpp"
+#include "ops/rowgauges.hpp"
 #include "replication/policy.hpp"
 #include "util/httpclient.hpp"
 #include "util/jsonutil.hpp"
@@ -1452,29 +1453,13 @@ void Controller::renderMetrics()
     metrics_.setGauge("origin_conflicts", static_cast<double>(originConflicts_.size()));
     metrics_.setGauge("nmos_registry_up", nmos.registry_up ? 1 : 0);
     metrics_.setGauge("tai_offset_seconds", tai_);
-    std::map<std::string, int> demandStates;
-    for (auto const& entry : demand_.entries)
+    setDemandGauges(metrics_, demand_.entries);
+    auto const rows = engine_.status();
+    setReplicationGauges(metrics_, rows, cfg.metrics_per_flow, replicationPairsSeen_);
+    for (auto const& row : rows)
     {
-        demandStates[entry.state] += 1;
-    }
-    for (auto const& [state, count] : demandStates)
-    {
-        metrics_.setGauge("demand_entries", count, {{"state", state}});
-    }
-    std::map<std::string, int> reps;
-    std::vector<std::pair<std::map<std::string, std::string>, double>> states;
-    for (auto const& row : engine_.status())
-    {
-        if (row.state == "active" || row.state == "pending")
-        {
-            reps[row.role + "/" + row.provider] += 1;
-        }
         if (cfg.metrics_per_flow)
         {
-            states.push_back({{{"flow_id", row.flow_id}, {"peer", row.peer}, {"role", row.role}, {"state", row.state}}, 1});
-            metrics_.setGauge("replication_lag_grains", static_cast<double>(row.lag), {{"flow_id", row.flow_id}, {"peer", row.peer}});
-            metrics_.setGauge("replication_lag_ms", row.lag_ms, {{"flow_id", row.flow_id}, {"peer", row.peer}});
-            metrics_.setGauge("completion_queue_depth", row.cq_depth, {{"flow_id", row.flow_id}});
             // The totals live in the replication rows (they start again with a new replication).
             std::map<std::string, std::string> const labels{{"flow_id", row.flow_id}, {"peer", row.peer}, {"role", row.role}};
             metrics_.setCounter("replication_grains_total", static_cast<double>(row.grains), labels);
@@ -1490,13 +1475,6 @@ void Controller::renderMetrics()
             }
         }
     }
-    for (auto const& [key, count] : reps)
-    {
-        auto const slash = key.find('/');
-        metrics_.setGauge("replications_active", count, {{"role", key.substr(0, slash)}, {"provider", key.substr(slash + 1)}});
-    }
-    // One series per replication with its current state (1); a former state disappears.
-    metrics_.setGauges("replication_state", states);
     // Destination mirror flows: stale, state, age of the newest grain, rebuilds.
     std::map<std::string, MirrorHealth> health;
     {

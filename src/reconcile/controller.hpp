@@ -93,6 +93,7 @@ private:
     NmosObserver observer_;
     std::unique_ptr<NmosNode> node_;
     Metrics metrics_;
+    std::set<std::pair<std::string, std::string>> replicationPairsSeen_; // role, provider: replications_active stays at 0
     std::mutex mu_;
     std::condition_variable cv_;
     bool stop_ = false;

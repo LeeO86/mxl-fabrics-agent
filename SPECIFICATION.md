@@ -895,6 +895,10 @@ Tabs:
 Label cardinality: `flow_id` labels are allowed (PoC scale); a config switch
 `METRICS_PER_FLOW=false` drops per-flow labels (the `mirror_*` series then
 reduce to `mirrors_stale` and an unlabelled `mirror_rebuilds_total`).
+Gauges with one series per replication or mirror carry only the current rows:
+a series goes away with its replication. The counts stay at 0 instead:
+`demand_entries` has every state, `replications_active` every role/provider
+pair seen since the agent started.
 
 ### 12.4 Grafana dashboard
 

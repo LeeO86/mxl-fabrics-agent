@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(mxl-fabrics-agent VERSION 1.7.3 LANGUAGES CXX)
+project(mxl-fabrics-agent VERSION 1.7.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,6 +32,7 @@ set(MFA_CORE_SOURCES
     src/replication/policy.cpp
     src/ops/metrics.cpp
     src/ops/lanemetrics.cpp
+    src/ops/rowgauges.cpp
     src/ops/httpserver.cpp
     src/peer/manager.cpp
     src/nmos/observer.cpp
