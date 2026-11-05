@@ -6,6 +6,7 @@
 #include "fabric/qpsettings.hpp"
 #include "ops/lanemetrics.hpp"
 #include "ops/metrics.hpp"
+#include "ops/rowgauges.hpp"
 
 using namespace mfa;
 
@@ -312,4 +313,49 @@ TEST_CASE("ACK timeout: 4.096 us x 2^n; the stall threshold is fixed")
         CHECK(threshold < 0.054);
         CHECK(threshold < qp::ackTimeoutSeconds(qp::kDefaultAckTimeout));
     }
+}
+
+TEST_CASE("the series of a replication that ended go away")
+{
+    Metrics m;
+    ReplicaView a;
+    a.role = "destination";
+    a.flow_id = "a";
+    a.peer = "p";
+    a.provider = "tcp";
+    a.state = "active";
+    a.lag = 3;
+    a.lag_ms = 740;
+    a.cq_depth = 2;
+    ReplicaView b = a;
+    b.flow_id = "b";
+    b.lag_ms = 5;
+    setReplicationGauges(m, {a, b}, true);
+    CHECK(m.render().find("mxl_fabrics_agent_replication_lag_ms{flow_id=\"a\",peer=\"p\"} 740\n") != std::string::npos);
+    setReplicationGauges(m, {b}, true);
+    auto text = m.render();
+    CHECK(text.find("flow_id=\"a\"") == std::string::npos);
+    CHECK(text.find("mxl_fabrics_agent_replication_lag_ms{flow_id=\"b\",peer=\"p\"} 5\n") != std::string::npos);
+    CHECK(text.find("mxl_fabrics_agent_completion_queue_depth{flow_id=\"b\"} 2\n") != std::string::npos);
+    CHECK(text.find("mxl_fabrics_agent_replications_active{provider=\"tcp\",role=\"destination\"} 1\n") != std::string::npos);
+    setReplicationGauges(m, {}, true);
+    text = m.render();
+    for (auto const* name : {"replication_lag_grains", "replication_lag_ms", "completion_queue_depth", "replication_state", "replications_active"})
+    {
+        CHECK(text.find(std::string("mxl_fabrics_agent_") + name + "{") == std::string::npos);
+    }
+}
+
+TEST_CASE("a demand state no entry has any more goes away")
+{
+    Metrics m;
+    DemandEntry e;
+    e.state = "unresolved";
+    setDemandGauges(m, {e});
+    CHECK(m.render().find("mxl_fabrics_agent_demand_entries{state=\"unresolved\"} 1\n") != std::string::npos);
+    e.state = "replicating";
+    setDemandGauges(m, {e});
+    auto const text = m.render();
+    CHECK(text.find("state=\"unresolved\"") == std::string::npos);
+    CHECK(text.find("mxl_fabrics_agent_demand_entries{state=\"replicating\"} 1\n") != std::string::npos);
 }

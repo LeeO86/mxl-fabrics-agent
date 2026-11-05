@@ -895,6 +895,8 @@ Tabs:
 Label cardinality: `flow_id` labels are allowed (PoC scale); a config switch
 `METRICS_PER_FLOW=false` drops per-flow labels (the `mirror_*` series then
 reduce to `mirrors_stale` and an unlabelled `mirror_rebuilds_total`).
+Gauges with one series per replication, mirror or state carry only the current
+rows: a series goes away with its replication (or when no row has that state).
 
 ### 12.4 Grafana dashboard
 

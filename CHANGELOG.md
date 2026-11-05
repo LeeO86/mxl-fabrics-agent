@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Gauges with one series per replication or state no longer keep the series of what has gone. `replication_lag_grains`, `replication_lag_ms`, `completion_queue_depth`, `replications_active` and `demand_entries` were set row by row and never removed: after a replication ended, its series stayed on `/metrics` with its last value until the agent restarted (a 740 ms lag for a replication long gone was seen). Each reconcile pass now publishes the full set of current series of these gauges (as `replication_state` already did), so a series goes away with its replication, and a `replications_active{role,provider}` or `demand_entries{state}` with no row left goes away instead of keeping its last count. The per-replication counters (`replication_grains_total` and the others) are unchanged.
+
 ## 1.7.3
 
 The fix for 1.7.2's audio losses on small was outside the agent: E810's `roce_rtomin` 5 instead of 50 (platform, with 1.7.1, 29 min each: MXL read timeouts about 3790 → 0, FlowXer missing audio → 0, DeckLink audio stalls 7 → 0, gateway TX audio late 453/364 → 269/185). 1.7.3 makes the stalls visible (stall counters, a log line per queue pair) and sends no more audio transfers than 1.7.1.

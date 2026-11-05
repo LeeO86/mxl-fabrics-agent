@@ -32,6 +32,7 @@ set(MFA_CORE_SOURCES
     src/replication/policy.cpp
     src/ops/metrics.cpp
     src/ops/lanemetrics.cpp
+    src/ops/rowgauges.cpp
     src/ops/httpserver.cpp
     src/peer/manager.cpp
     src/nmos/observer.cpp
