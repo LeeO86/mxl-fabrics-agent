@@ -2,6 +2,10 @@
 
 Per-host agent that makes MXL flows on one machine readable on another. Media functions keep their own NMOS nodes. A controller connects a receiver with ordinary IS-05 (`mxl_domain_id`, `mxl_flow_id`). When that domain is not local, the agent on the receiver's host pulls the flow over the MXL 1.1 Fabrics API (`verbs` for RoCEv2, `tcp` as fallback) and writes a mirror domain next to the local ones.
 
+Part of [mxl-stack](https://github.com/LeeO86/mxl-stack), a collection of open-source MXL media functions with Docker Compose and Kubernetes examples.
+
+![mxl-fabrics-agent: local MXL domains and flows](docs/images/web-ui.png)
+
 The agent does not PATCH IS-05 and does not register senders or receivers. It registers one Node, with no devices, so other agents can find it.
 
 ```bash
@@ -47,8 +51,8 @@ Check the device with `ibv_devinfo`. Put the fabric addresses in the peer map. O
 
 ```json
 "PEERS": [
-  {"host_id": "node-b", "local_fabric_addr": "192.168.12.1", "remote_fabric_addr": "192.168.12.2", "provider": "verbs"},
-  {"host_id": "node-c", "local_fabric_addr": "192.168.13.1", "remote_fabric_addr": "192.168.13.3", "provider": "verbs"}
+  {"host_id": "node-b", "local_fabric_addr": "192.0.2.1", "remote_fabric_addr": "192.0.2.2", "provider": "verbs"},
+  {"host_id": "node-c", "local_fabric_addr": "198.51.100.1", "remote_fabric_addr": "198.51.100.3", "provider": "verbs"}
 ]
 ```
 
@@ -99,8 +103,8 @@ environment:
   MXL_ROOT: /Volumes/mxl
   DEFAULT_PROVIDER: verbs
   PEERS: |
-    [{"host_id":"node-b","local_fabric_addr":"192.168.12.1","remote_fabric_addr":"192.168.12.2","provider":"verbs"},
-     {"host_id":"node-c","local_fabric_addr":"192.168.13.1","remote_fabric_addr":"192.168.13.3","provider":"verbs"}]
+    [{"host_id":"node-b","local_fabric_addr":"192.0.2.1","remote_fabric_addr":"192.0.2.2","provider":"verbs"},
+     {"host_id":"node-c","local_fabric_addr":"198.51.100.1","remote_fabric_addr":"198.51.100.3","provider":"verbs"}]
 ```
 
 Host B swaps the local and remote addresses on the A link and adds its link to C. Activate a receiver on B with A's `mxl_domain_id` and `mxl_flow_id`:

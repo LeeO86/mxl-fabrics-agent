@@ -9,7 +9,7 @@ On the platform all three agents restarted together (agent 1.6.0, `verbs`). Abou
 host-01 agent died with SIGSEGV (exit 139) while it was accepting a peer's connection:
 
 ```
-[RCTarget.cpp:96] Accept connection from: fi_sockaddr_in://192.168.250.2:35714
+[RCTarget.cpp:96] Accept connection from: fi_sockaddr_in://192.0.2.2:35714
 [libfabric:ep_ctrl:verbs:1055] rdma_create_qp: Invalid argument (22)
 [libfabric:ep_ctrl:verbs:242] fi_control: Invalid argument (-22)
 [error] [fabrics.cpp:79] Failed to try for new samples: Failed to accept connection: Invalid argument, code -22
