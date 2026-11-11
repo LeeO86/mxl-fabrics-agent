@@ -4,6 +4,8 @@ Per-host agent that makes MXL flows on one machine readable on another. Media fu
 
 Part of [mxl-stack](https://github.com/LeeO86/mxl-stack), a collection of open-source MXL media functions with Docker Compose and Kubernetes examples.
 
+![mxl-fabrics-agent: local MXL domains and flows](docs/images/web-ui.png)
+
 The agent does not PATCH IS-05 and does not register senders or receivers. It registers one Node, with no devices, so other agents can find it.
 
 ```bash
